@@ -44,7 +44,7 @@ use arb_revm::api::default_ctx::ArbContext;
 use arb_revm::{ArbBuilder, ArbChainContext, ArbTransaction};
 use core::fmt::Debug;
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction, ResultAndState};
-use revm::context::{BlockEnv, Context, TxEnv};
+use revm::context::{BlockEnv, CfgEnv, Context, DBErrorMarker, TxEnv};
 use revm::handler::instructions::EthInstructions;
 use revm::inspector::NoOpInspector;
 use revm::interpreter::interpreter::EthInterpreter;
@@ -113,6 +113,10 @@ where
         &self.inner.0.ctx.block
     }
 
+    fn cfg_env(&self) -> &CfgEnv<Self::Spec> {
+        &self.inner.0.ctx.cfg
+    }
+
     fn chain_id(&self) -> u64 {
         self.inner.0.ctx.cfg.chain_id
     }
@@ -142,7 +146,7 @@ where
         self.inner.system_call_with_caller(caller, contract, data)
     }
 
-    fn finish(self) -> (Self::DB, EvmEnv<Self::Spec>) {
+    fn finish(self) -> (Self::DB, EvmEnv<Self::Spec, Self::BlockEnv>) {
         let Context { block: block_env, cfg: cfg_env, journaled_state, .. } = self.inner.0.ctx;
         (journaled_state.database, EvmEnv { block_env, cfg_env })
     }
@@ -184,7 +188,7 @@ impl ArbEvmFactory {
     /// by the `NUMBER` opcode — are populated from `ArbHeaderInfo` by `ConfigureEvm` in Stage D.
     /// For Stage B's transact-level proof a default chain context is sufficient (a value transfer
     /// never reads `NUMBER`).
-    fn build_ctx<DB: Database>(db: DB, evm_env: EvmEnv<ArbSpecId>) -> ArbContext<DB> {
+    fn build_ctx<DB: Database>(db: DB, evm_env: EvmEnv<ArbSpecId, BlockEnv>) -> ArbContext<DB> {
         Context::mainnet()
             .with_chain(ArbChainContext::default())
             .with_db(db)
@@ -198,7 +202,7 @@ impl EvmFactory for ArbEvmFactory {
     type Evm<DB: Database, I: Inspector<Self::Context<DB>>> = ArbEvm<DB, I>;
     type Context<DB: Database> = ArbContext<DB>;
     type Tx = ArbTx;
-    type Error<DBError: core::error::Error + Send + Sync + 'static> = ArbEvmError<DBError>;
+    type Error<DBError: core::error::Error + Send + Sync + 'static + DBErrorMarker> = ArbEvmError<DBError>;
     type HaltReason = HaltReason;
     type Spec = ArbSpecId;
     type BlockEnv = BlockEnv;
@@ -207,7 +211,7 @@ impl EvmFactory for ArbEvmFactory {
     fn create_evm<DB: Database>(
         &self,
         db: DB,
-        evm_env: EvmEnv<ArbSpecId>,
+        evm_env: EvmEnv<ArbSpecId, BlockEnv>,
     ) -> Self::Evm<DB, NoOpInspector> {
         // `create_evm` must return `Evm<DB, NoOpInspector>`, so build with an explicit
         // `NoOpInspector` (not the `()` default of `build_arb`). Swap the default `ArbPrecompiles`
@@ -223,7 +227,7 @@ impl EvmFactory for ArbEvmFactory {
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
         &self,
         db: DB,
-        evm_env: EvmEnv<ArbSpecId>,
+        evm_env: EvmEnv<ArbSpecId, BlockEnv>,
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let spec = evm_env.cfg_env.spec;

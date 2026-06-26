@@ -145,7 +145,7 @@ impl ArbEvmConfig {
         basefee: u64,
         difficulty: U256,
         prevrandao: Option<B256>,
-    ) -> EvmEnv<ArbSpecId> {
+    ) -> EvmEnv<ArbSpecId, BlockEnv> {
         let mut block = BlockEnv::default();
         block.number = U256::from(number);
         block.beneficiary = beneficiary;
@@ -200,7 +200,7 @@ impl ArbEvmConfig {
     ///
     /// The [`ArbSpecId`] is taken from the ArbOS version embedded in the header
     /// (`extra_data` + `mix_hash`, via [`ArbHeaderInfo`]).
-    pub fn evm_env(&self, header: &Header) -> EvmEnv<ArbSpecId> {
+    pub fn evm_env(&self, header: &Header) -> EvmEnv<ArbSpecId, BlockEnv> {
         let spec = spec_for_header(header);
         self.build_evm_env(
             spec,
@@ -220,7 +220,7 @@ impl ArbEvmConfig {
         &self,
         parent: &Header,
         attributes: &ArbNextBlockEnvAttributes,
-    ) -> EvmEnv<ArbSpecId> {
+    ) -> EvmEnv<ArbSpecId, BlockEnv> {
         let spec = ArbSpecId::from_arbos_version(attributes.arbos_format_version);
         self.build_evm_env(
             spec,
@@ -299,7 +299,7 @@ impl ConfigureEvm for ArbEvmConfig {
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnv<ArbSpecId>, Self::Error> {
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<ArbSpecId, BlockEnv>, Self::Error> {
         Ok(self.evm_env(header))
     }
 
@@ -307,7 +307,7 @@ impl ConfigureEvm for ArbEvmConfig {
         &self,
         parent: &Header,
         attributes: &ArbNextBlockEnvAttributes,
-    ) -> Result<EvmEnv<ArbSpecId>, Self::Error> {
+    ) -> Result<EvmEnv<ArbSpecId, BlockEnv>, Self::Error> {
         Ok(self.next_evm_env(parent, attributes))
     }
 

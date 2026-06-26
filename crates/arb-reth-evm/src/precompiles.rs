@@ -12,7 +12,7 @@ use arb_revm::ArbSpecId;
 use arb_revm::arb_journal::{ArbCall, ArbNodeCtx};
 use arb_revm::precompiles::{ArbPrecompilesEnum, arb_eth_precompiles};
 use revm::interpreter::{InstructionResult, InterpreterResult};
-use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult};
 
 /// Builds the Arbitrum [`PrecompilesMap`] for an ArbOS version: the spec's eth precompile set
 /// (Cancun+P256 below ArbOS 50, Osaka at/after — same selection as the in-EVM path) with the 16
@@ -44,6 +44,7 @@ fn arb_node_call(arb: ArbPrecompilesEnum, input: PrecompileInput<'_>) -> Precomp
         is_static,
         bytecode_address,
         mut internals,
+        reservoir,
         ..
     } = input;
     let call = ArbCall {
@@ -57,19 +58,19 @@ fn arb_node_call(arb: ArbPrecompilesEnum, input: PrecompileInput<'_>) -> Precomp
     // `PrecompileInput` carries no EVM call depth; default to top-level. Only `ArbSys.isTopLevelCall`
     // observes this, and it is a rare path — documented best-effort on the node path.
     let mut ctx = ArbNodeCtx::new(&mut internals, 1);
-    to_precompile_result(arb.run_dispatch(&mut ctx, &call))
+    to_precompile_result(arb.run_dispatch(&mut ctx, &call), reservoir)
 }
 
 /// Convert `arb_revm`'s `InterpreterResult` (the precompile call result) into alloy-evm's
 /// [`PrecompileResult`]. Gas spent maps to `gas_used`; a revert preserves its output bytes; any
-/// halt (out-of-gas etc.) maps to [`PrecompileError::OutOfGas`] (revm treats it as consuming all
+/// halt (out-of-gas etc.) maps to a halted [`PrecompileOutput`] (revm treats it as consuming all
 /// gas, matching the in-EVM CALL semantics).
-fn to_precompile_result(result: InterpreterResult) -> PrecompileResult {
-    let gas_used = result.gas.spent();
+fn to_precompile_result(result: InterpreterResult, reservoir: u64) -> PrecompileResult {
+    let gas_used = result.gas.total_gas_spent();
     match result.result {
-        InstructionResult::Return => Ok(PrecompileOutput::new(gas_used, result.output)),
-        InstructionResult::Revert => Ok(PrecompileOutput::new_reverted(gas_used, result.output)),
-        _ => Err(PrecompileError::OutOfGas),
+        InstructionResult::Return => Ok(PrecompileOutput::new(gas_used, result.output, reservoir)),
+        InstructionResult::Revert => Ok(PrecompileOutput::revert(gas_used, result.output, reservoir)),
+        _ => Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir)),
     }
 }
 

@@ -18,7 +18,6 @@
 
 use crate::tx::ArbTx;
 use crate::{ArbEvm, ArbEvmFactory};
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use alloy_consensus::{
     Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Eip658Value, Header, Receipt, ReceiptWithBloom,
@@ -27,11 +26,10 @@ use alloy_consensus::{
 use alloy_eips::{Encodable2718, Typed2718};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_evm::{
-    Database, Evm, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
+    Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
-        BlockExecutorFor, ExecutableTx, OnStateHook, StateChangePreBlockSource, StateChangeSource,
-        StateDB, TxResult,
+        ExecutableTx, GasOutput, StateDB, TxResult,
     },
 };
 use alloy_primitives::{Address, B256, Bytes, Log, U256, logs_bloom};
@@ -90,7 +88,7 @@ pub struct ArbTxResult<H> {
     pub tx_type: u8,
 }
 
-impl<H> TxResult for ArbTxResult<H> {
+impl<H: Send + 'static> TxResult for ArbTxResult<H> {
     type HaltReason = H;
 
     fn result(&self) -> &ResultAndState<Self::HaltReason> {
@@ -117,8 +115,6 @@ pub struct ArbBlockExecutor<E, H = DefaultArbExecutionHooks> {
     receipts: Vec<ArbReceiptEnvelope<Log>>,
     /// Cumulative gas used across all executed transactions.
     gas_used: u64,
-    /// Optional reth state hook, invoked after each committed state change.
-    state_hook: Option<Box<dyn OnStateHook>>,
 }
 
 impl<E, H> ArbBlockExecutor<E, H> {
@@ -131,14 +127,6 @@ impl<E, H> ArbBlockExecutor<E, H> {
             chain_id,
             receipts: Vec::new(),
             gas_used: 0,
-            state_hook: None,
-        }
-    }
-
-    /// Invokes the configured state hook, if any, with the given source + state delta.
-    fn notify_state(&mut self, source: StateChangeSource, state: &revm::state::EvmState) {
-        if let Some(hook) = self.state_hook.as_mut() {
-            hook.on_state(source, state);
         }
     }
 }
@@ -214,10 +202,6 @@ where
                 Bytes::copy_from_slice(self.ctx.parent_hash.as_slice()),
             )
             .map_err(|err| BlockExecutionError::evm(err, self.ctx.parent_hash))?;
-        self.notify_state(
-            StateChangeSource::PreBlock(StateChangePreBlockSource::BlockHashesContract),
-            &result.state,
-        );
         self.evm.db_mut().commit(result.state);
 
         // (2) Nitro's InternalTxStartBlock — built via `arb_revm`'s default hook so the
@@ -245,10 +229,6 @@ where
                 .evm
                 .transact_raw(start_block_tx)
                 .map_err(|err| BlockExecutionError::evm(err, B256::ZERO))?;
-            self.notify_state(
-                StateChangeSource::PreBlock(StateChangePreBlockSource::BlockHashesContract),
-                &result.state,
-            );
             self.evm.db_mut().commit(result.state);
         }
 
@@ -278,16 +258,14 @@ where
         })
     }
 
-    fn commit_transaction(&mut self, output: Self::Result) -> Result<u64, BlockExecutionError> {
+    fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
         let ArbTxResult {
             result: ResultAndState { result, state },
             gas_used_for_l1,
             tx_type,
         } = output;
 
-        self.notify_state(StateChangeSource::Transaction(self.receipts.len()), &state);
-
-        let gas_used = result.gas_used();
+        let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
 
         self.receipts.push(build_arb_receipt(
@@ -299,7 +277,7 @@ where
 
         self.evm.db_mut().commit(state);
 
-        Ok(gas_used)
+        GasOutput::new(gas_used)
     }
 
     fn finish(
@@ -319,10 +297,6 @@ where
                 blob_gas_used: 0,
             },
         ))
-    }
-
-    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
-        self.state_hook = hook;
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
@@ -404,12 +378,15 @@ impl<H> ArbBlockExecutorFactory<H> {
 
 impl<H> BlockExecutorFactory for ArbBlockExecutorFactory<H>
 where
-    H: ArbExecutionHooks + Clone + Debug + 'static,
+    H: ArbExecutionHooks + Clone + Debug + Send + 'static,
 {
     type EvmFactory = ArbEvmFactory;
+    type TxExecutionResult = ArbTxResult<<ArbEvmFactory as EvmFactory>::HaltReason>;
     type ExecutionCtx<'a> = ArbBlockExecutionCtx;
     type Transaction = ArbTxEnvelope;
     type Receipt = ArbReceiptEnvelope<Log>;
+    type Executor<'a, DB: StateDB, I: Inspector<<ArbEvmFactory as EvmFactory>::Context<DB>>> =
+        ArbBlockExecutor<ArbEvm<DB, I>, H>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
@@ -419,10 +396,10 @@ where
         &'a self,
         mut evm: ArbEvm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: StateDB + 'a,
-        I: Inspector<ArbContext<DB>> + 'a,
+        DB: StateDB,
+        I: Inspector<ArbContext<DB>>,
     {
         // Thread the block's L1 block number into the Arbitrum chain context, so the `NUMBER`
         // opcode (which `arb_revm` overrides to read `chain().l1_block_number`) returns the L1
@@ -466,7 +443,7 @@ where
 
     fn assemble_block(
         &self,
-        input: BlockAssemblerInput<'_, '_, F>,
+        input: BlockAssemblerInput<'_, '_, F, Header>,
     ) -> Result<Self::Block, BlockExecutionError> {
         let BlockAssemblerInput {
             evm_env,
@@ -508,6 +485,10 @@ where
             blob_gas_used: None,
             excess_blob_gas: None,
             requests_hash: None,
+            // EIP-7928 (Amsterdam): not used on Arbitrum — set to None.
+            block_access_list_hash: None,
+            // EIP-7928 slot number: not used on Arbitrum — set to None.
+            slot_number: None,
         };
 
         Ok(Block::new(

@@ -21,16 +21,16 @@ revm = { workspace = true }
 arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth"] }
 
 # reth v2.0.0 -> revm 36 (verified). Git-pinned to the release tag for cross-crate coherence.
-reth-evm = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.0.0" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
 # Stage B: wrap arb_revm's ArbOS EVM as reth's EvmFactory + Evm. alloy-evm 0.30.0 pins revm 36.0.0
 # (exact match for arb_revm), so this adds no new revm in the graph. reth-primitives-traits 0.1.1
 # carries the NodePrimitives/SignedTransaction surface arb-alloy's `reth` feature satisfies.
-alloy-evm = { version = "0.30", default-features = false }
-reth-primitives-traits = { version = "0.1.1", default-features = false }
+alloy-evm = { version = "0.37", default-features = false }
+reth-primitives-traits = { version = "0.5.0", default-features = false }
 
 # alloy consensus traits (Transaction / SignerRecoverable / Encodable2718) used to lower an
 # ArbTxEnvelope into the revm tx env. Pulled in via arb-alloy's already-unified alloy 1.8.3.
-alloy-consensus = { version = "1", default-features = false }
-alloy-eips = { version = "1", default-features = false }
+alloy-consensus = { version = "2.0", default-features = false }
+alloy-eips = { version = "2.0", default-features = false }
 alloy-primitives = { version = "1", default-features = false }
