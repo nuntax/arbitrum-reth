@@ -15,19 +15,45 @@ authors.workspace = true
 # Reuses the validated pieces already in the tree:
 #   - arb_revm::executor::digest_message        (Stage E: feed message -> ArbExecutionInput)
 #   - arb_revm::executor::execute_message        (the STF; returns write-set + receipts data)
-#   - arb_revm state-root math (alloy_trie HashBuilder, mainnet-validated via the witness corpus)
 #   - arb-reth-evm: ArbEvmConfig / ArbBlockExecutor / ArbBlockAssembler (Stages C/D.1)
 #   - arb-reth-derive: L1-inbox derivation -> DerivedMessage (Stage F, chain-validated)
 
 [dependencies]
-arb-revm = { path = "../../../arb_revm/crates/arb-revm" }
+arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth"] }
 arb-reth-evm = { path = "../arb-reth-evm" }
-arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false }
-arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false }
+arb-revm = { path = "../../../arb_revm/crates/arb-revm" }
 
-alloy-primitives = "1"
+alloy-primitives = { version = "1", default-features = false }
 alloy-consensus = { version = "2.0", default-features = false }
+alloy-eips = { version = "2.0", default-features = false }
+alloy-rpc-types-engine = { version = "2.0", default-features = false, features = ["serde"] }
 eyre = "0.6.12"
+serde = { version = "1", default-features = false, features = ["derive"] }
+
+# reth node types + storage surface
+reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["db-api"] }
+reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-primitives-traits = { version = "0.5.0", default-features = false }
+
+# D.2.2: persist primitive — trie, chain-state, execution types, provider write path
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+revm = { workspace = true }
+revm-database = "41.0.0"
+
+# D.2.3: driver — reth BlockBuilder + revm State<StateProviderDatabase>
+reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["test-utils"] }
+reth-db = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+revm-state = "41.0.0"
+arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth", "k256"] }
