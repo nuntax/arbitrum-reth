@@ -1,0 +1,23 @@
+[package]
+name = "arb-reth-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Stage F: L1 inbox derivation. Decodes SequencerInbox batches (blob + calldata)
+# into the canonical MessageWithMetadata stream — the half arbitrum-reth lacks.
+# Pure offline decoder (no network I/O). See docs/stage-f-handoff.md.
+
+[dependencies]
+# Reuse the Arbitrum message types (L1IncomingMessage, MessageWithMetadata, ...)
+# from arb-alloy rather than redefining them. alloy unifies upward to reth's 1.8.3.
+arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false }
+alloy-primitives = "1"
+alloy-rlp = { workspace = true }
+# Same C brotli as Nitro (and arb-revm's L1 cost) — guarantees decompression parity.
+# `cc_brotli` builds the C brotli from source (matches arb-revm).
+brotli = { path = "../../../nitro/crates/brotli", features = ["cc_brotli"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

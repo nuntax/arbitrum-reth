@@ -1,0 +1,20 @@
+{
+  "chain": "arbitrum-one",
+  "batch_seq": 1277861,
+  "l1_tx": "0x20eae1f4954809bb609ab11724c26742e3ca08073ff881f52da44c39784eaf81",
+  "l1_block": 25398052,
+  "l1_block_hash": "0x9936dd1f89eabd1a02b335090439f24d8ff2396c94fbd1197c4c5973d7fe44bb",
+  "delayed_free": true,
+  "after_delayed_messages": 2484028,
+  "time_bounds": {
+    "min_timestamp": 1782345239,
+    "max_timestamp": 1782432407,
+    "min_l1_block": 25390852,
+    "max_l1_block": 25398116
+  },
+  "blob_versioned_hashes": [
+    "0x013b8fb7e8bd74d1e36856556b643d1f0aef18ab66b56a216481121e491aeed8",
+    "0x014a6cc6614ad762335f1e04d5c66829955689e2ad2b91e277e0558eab2e4c40",
+    "0x0157a4ce2d8a9f3a8b375768a6cd6324b239725df5eb7e250976c2089bd303dc"
+  ]
+}

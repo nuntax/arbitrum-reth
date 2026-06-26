@@ -1,0 +1,187 @@
+{
+  "chain": "arbitrum-one",
+  "bridge": "0x8315177ab297ba92a06054ce80a67ed4dbd7ed3a",
+  "note": "consecutive MessageDelivered run for accumulator-chain validation",
+  "messages": [
+    {
+      "index": 2484042,
+      "before_inbox_acc": "0x7e7deb5a1d06642243a203cbd4752b7a02d6926a5005c12cb4475f9f310a6d5c",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x7a972c9081c0bd40cd6a0dc7b3e8edc5a7427ffd37d17b0bd43487d2212aa6ec",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000007bd279f",
+      "timestamp": 1782432035,
+      "l1_block": 25398085
+    },
+    {
+      "index": 2484043,
+      "before_inbox_acc": "0xfdd3be31dc7c13a2cde63226e932539dc364f217cf8b6543004d7ac218915220",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x0a105ede9303ee2a716f1be7a57a3f98a5ed36cb585586c5271265694e66bdbf",
+      "base_fee_l1": "0x00000000000000000000000000000000000000000000000000000000086cd2a0",
+      "timestamp": 1782432095,
+      "l1_block": 25398090
+    },
+    {
+      "index": 2484044,
+      "before_inbox_acc": "0x36c67349bd395b5bf5855ddb506f039dc64a934f5d9194c9c5917802cf4eb2f9",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x63fdb2a2ec7beb9af4ff4ac7d5bc7fe5cb2b275d155ef0bc61db3a9123b42436",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000008103518",
+      "timestamp": 1782432167,
+      "l1_block": 25398096
+    },
+    {
+      "index": 2484045,
+      "before_inbox_acc": "0x49d9d1fb089d7be45b05ad78ae190f4e7fbc52c7357ea29e131338d1ee360317",
+      "kind": 9,
+      "sender": "0xb4b8b6f88361f48403514059f1f16c8e78d61ffd",
+      "message_data_hash": "0xdbd76a5cd8b5ff83990ea71df56bdd8f2ee7172880cdccfbafc1c96347e39952",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000008429bf0",
+      "timestamp": 1782432191,
+      "l1_block": 25398098
+    },
+    {
+      "index": 2484046,
+      "before_inbox_acc": "0xf0cf84687709bf0616b40151175616c772810d9c50e991833d3287837bedb3a5",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x026b61ff416c34dfec4aa18788b0e31dbdd495331fdcf0e98428a551a38cbd90",
+      "base_fee_l1": "0x000000000000000000000000000000000000000000000000000000000c0053f0",
+      "timestamp": 1782432251,
+      "l1_block": 25398103
+    },
+    {
+      "index": 2484047,
+      "before_inbox_acc": "0x4b1ff7771e4d6bbfbe75f81e6f441808b219a6faa8b65e73a8fe95136c4e20e4",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x880edcfe79fca92bdc01a3951972307a912d4a174c6ea2709af6118a32af8afe",
+      "base_fee_l1": "0x000000000000000000000000000000000000000000000000000000000bf65b0c",
+      "timestamp": 1782432335,
+      "l1_block": 25398110
+    },
+    {
+      "index": 2484048,
+      "before_inbox_acc": "0xd98cbb13ff5636dce09fa87f82ee31d0078dc950505d421eff3d402e0720bc2c",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0xfde2fd4f208b52c0ed1b6a825d3cd237bdcdaba94a7711a039f6ee9cfe6c4fd7",
+      "base_fee_l1": "0x000000000000000000000000000000000000000000000000000000000a389a38",
+      "timestamp": 1782432419,
+      "l1_block": 25398117
+    },
+    {
+      "index": 2484049,
+      "before_inbox_acc": "0xec6d3296e50119316651b43a20f03f66f7505e7c7ae104fec776fedaa88617bd",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x761b9841636f2e5662fa7d4a6873ffc563af6463c1f413affc4ed3bb7f43376c",
+      "base_fee_l1": "0x00000000000000000000000000000000000000000000000000000000086ef435",
+      "timestamp": 1782432515,
+      "l1_block": 25398125
+    },
+    {
+      "index": 2484050,
+      "before_inbox_acc": "0x52254c653068b5cd1d5db69bd67f7909aa62dab39c36998d81fa37e6ff3ad39a",
+      "kind": 9,
+      "sender": "0x2342deb6f5749ef6ce6943a275a1d3e7486f5fbf",
+      "message_data_hash": "0xf83f9f3511b059b3429a6d793e8c545edbb8980c7799505ef67c7c7d126b0a40",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000007eb38ab",
+      "timestamp": 1782432539,
+      "l1_block": 25398127
+    },
+    {
+      "index": 2484051,
+      "before_inbox_acc": "0x3e3393ce8a53fdcc7bebacb641e7e0a7f9d53c83b3c3594a165f2cd61d18a72f",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x59c65acbec3ea4ff02f75dd73d886093040086c888631e219d4c4fd182ba9347",
+      "base_fee_l1": "0x00000000000000000000000000000000000000000000000000000000071f1169",
+      "timestamp": 1782432587,
+      "l1_block": 25398131
+    },
+    {
+      "index": 2484052,
+      "before_inbox_acc": "0xd03ebf79fceaa601f658349ae1f342441eaa7ff959e8c68511389227660e51f6",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0xe3d7bda1014c1f033a6f02e93228158193d4e2e2f31c4fe517d7f8cfca5ccd9f",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000006956c58",
+      "timestamp": 1782432671,
+      "l1_block": 25398138
+    },
+    {
+      "index": 2484053,
+      "before_inbox_acc": "0xfd3c90c80c91b806dbbef6e5a7390d43078f54200b4ced36625bc1eaf38d1a34",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0xfd7414bf99a1c6e964b788ba296cecf5f555f9f09113cf7003012e231babeeda",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000006d2f910",
+      "timestamp": 1782432755,
+      "l1_block": 25398145
+    },
+    {
+      "index": 2484054,
+      "before_inbox_acc": "0xb9d9df88abe8da21de8f7100e3b7f534caf93b95c380b852125a0333ec8f0bc2",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0xfedfc905980fc0796f9fec29adeab992376b5000f87ccb401f26a98b56f3ea34",
+      "base_fee_l1": "0x00000000000000000000000000000000000000000000000000000000083fe1ab",
+      "timestamp": 1782432815,
+      "l1_block": 25398150
+    },
+    {
+      "index": 2484055,
+      "before_inbox_acc": "0x92921bb267680cd11bb6a0a0547b9ff923719d9ee94d54566175f098e21debc2",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x6177e29b413324a773f46f9b4347db324e86f46e87698049075b2e229b44a404",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000007c7d894",
+      "timestamp": 1782432911,
+      "l1_block": 25398158
+    },
+    {
+      "index": 2484056,
+      "before_inbox_acc": "0x8b82deabd731c1646abed68fca7516ce0eacf2f964b951785d7eeebd05a9f9e5",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x03f5074f86d3d70ceff0161dfafd55882c226bfa599796f4491fd5ff69a39da3",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000007173277",
+      "timestamp": 1782432983,
+      "l1_block": 25398164
+    },
+    {
+      "index": 2484057,
+      "before_inbox_acc": "0xfdd9558494be2e6792e4d8b3baf3f14d734bde22d4f9c86367ab8c49f2e5f193",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x9a28bae86f0cc7e403e534d7346db078544f58676dfebb285854a17e3a329f83",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000007dded24",
+      "timestamp": 1782433055,
+      "l1_block": 25398170
+    },
+    {
+      "index": 2484058,
+      "before_inbox_acc": "0xfc8261bd62d4f5be5b2be2f894ed9c3ad1f7136a92a2f027fde6c4588c797c01",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0x26d0572c4f3262b6101c9ed45803487c2f2e76eb06d2c3681c9fa1ce5a8c8d1e",
+      "base_fee_l1": "0x000000000000000000000000000000000000000000000000000000000899a420",
+      "timestamp": 1782433127,
+      "l1_block": 25398176
+    },
+    {
+      "index": 2484059,
+      "before_inbox_acc": "0x0d63a8262884043edb69c99853aa1da7ebed3751d6a3e037319494b2bff83f3d",
+      "kind": 13,
+      "sender": "0xc1b634853cb333d3ad8663715b08f41a3aec47cc",
+      "message_data_hash": "0xf9077577f404653e00652edd29d020c9b0cf5a3a142a619bdef2ba65cee6b06e",
+      "base_fee_l1": "0x0000000000000000000000000000000000000000000000000000000009c557fa",
+      "timestamp": 1782433199,
+      "l1_block": 25398182
+    }
+  ]
+}
