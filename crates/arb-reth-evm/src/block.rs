@@ -23,8 +23,8 @@ use alloy_consensus::{
     Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Eip658Value, Header, Receipt, ReceiptWithBloom,
     TxReceipt, proofs,
 };
-use alloy_eips::{Encodable2718, Typed2718};
 use alloy_eips::merge::BEACON_NONCE;
+use alloy_eips::{Encodable2718, Typed2718};
 use alloy_evm::{
     Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
@@ -37,7 +37,9 @@ use arb_alloy_consensus::receipt::{ArbReceipt, ArbReceiptEnvelope};
 use arb_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_revm::api::default_ctx::ArbContext;
 use arb_revm::constants::{ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS};
-use arb_revm::executor::hooks::{ArbExecutionHooks, ArbStartBlockDerived, DefaultArbExecutionHooks};
+use arb_revm::executor::hooks::{
+    ArbExecutionHooks, ArbStartBlockDerived, DefaultArbExecutionHooks,
+};
 use arb_revm::executor::{ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader};
 use arb_revm::{ArbExecCfg, ArbTransaction};
 use core::fmt::Debug;
@@ -152,7 +154,10 @@ fn build_arb_receipt<H>(
         },
         gas_used_for_l1,
     };
-    let rwb = ReceiptWithBloom { receipt, logs_bloom };
+    let rwb = ReceiptWithBloom {
+        receipt,
+        logs_bloom,
+    };
     receipt_envelope_for_type(tx_type, rwb)
 }
 
@@ -449,10 +454,9 @@ where
             evm_env,
             execution_ctx: ctx,
             transactions,
-            output:
-                BlockExecutionResult {
-                    receipts, gas_used, ..
-                },
+            output: BlockExecutionResult {
+                receipts, gas_used, ..
+            },
             state_root,
             ..
         } = input;
