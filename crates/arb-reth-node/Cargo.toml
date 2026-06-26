@@ -1,0 +1,33 @@
+[package]
+name = "arb-reth-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Stage D.2: the node skeleton. Arbitrum is execute-to-derive — a block's state root
+# only exists *after* execution — so this does NOT use reth's download-then-execute sync
+# pipeline (whose MerkleStage validates a computed root against an already-stored,
+# trustless header). Instead it follows reth's local/payload-block path: produce ->
+# execute -> compute state root over the trie -> seal -> persist via the provider's
+# block-writer (the `ExecutedBlock` / `save_blocks` route the engine uses), Nitro-style.
+#
+# Reuses the validated pieces already in the tree:
+#   - arb_revm::executor::digest_message        (Stage E: feed message -> ArbExecutionInput)
+#   - arb_revm::executor::execute_message        (the STF; returns write-set + receipts data)
+#   - arb_revm state-root math (alloy_trie HashBuilder, mainnet-validated via the witness corpus)
+#   - arb-reth-evm: ArbEvmConfig / ArbBlockExecutor / ArbBlockAssembler (Stages C/D.1)
+#   - arb-reth-derive: L1-inbox derivation -> DerivedMessage (Stage F, chain-validated)
+
+[dependencies]
+arb-revm = { path = "../../../arb_revm/crates/arb-revm" }
+arb-reth-evm = { path = "../arb-reth-evm" }
+arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false }
+arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false }
+
+alloy-primitives = "1"
+alloy-consensus = { version = "2.0", default-features = false }
+eyre = "0.6.12"
+
+[dev-dependencies]
+serde_json = { workspace = true }
