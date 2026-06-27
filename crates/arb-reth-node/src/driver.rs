@@ -50,11 +50,13 @@ use reth_chain_state::{
 };
 use reth_evm::{ConfigureEvm, execute::BlockBuilder as _};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
-use reth_primitives_traits::{RecoveredBlock, SealedHeader};
+use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
 use reth_provider::providers::ProviderNodeTypes;
 use reth_provider::{ProviderFactory, SaveBlocksMode};
+use reth_storage_api::BlockExecutionWriter;
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
+use revm_database::BundleState;
 
 // ---------------------------------------------------------------------------
 // ArbChainDriver
@@ -124,6 +126,30 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         }
     }
 
+    /// Creates a driver that shares an existing [`CanonicalInMemoryState`].
+    ///
+    /// Used by the node launcher (D.3b): the `BlockchainProvider` that serves RPC owns a
+    /// `CanonicalInMemoryState`, and the driver must update *that same* instance so freshly
+    /// produced (not-yet-flushed) blocks are visible to `eth_*` queries. Passing the provider's
+    /// state here (instead of letting `new` create a fresh one) is what wires the two together.
+    pub fn with_canonical_state(
+        factory: ProviderFactory<N>,
+        chain_id: u64,
+        genesis_tip: SealedHeader<Header>,
+        persistence_threshold: u64,
+        canonical_in_memory: CanonicalInMemoryState<ArbPrimitives>,
+    ) -> Self {
+        Self {
+            factory,
+            evm_config: ArbEvmConfig::new(chain_id),
+            chain_id,
+            tip: genesis_tip,
+            canonical_in_memory,
+            persistence_threshold,
+            pending_persist: Vec::new(),
+        }
+    }
+
     // ------------------------------------------------------------------ //
     // advance — the core loop
     // ------------------------------------------------------------------ //
@@ -182,6 +208,10 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             l1_block_number: input.message.l1_block_number,
             l1_base_fee_wei: input.message.l1_base_fee_wei,
             arbos_format_version: version as u64,
+            // TODO(header-fidelity): `extra_data` / `prev_randao` / `mix_hash` must
+            // carry ArbOS version, L1 block number, and send_root via `ArbHeaderInfo`
+            // for Nitro-faithful headers. Currently zero/empty — `ArbHeaderInfo` won't
+            // round-trip. Deferred; not blocking execute-once correctness.
             extra_data: Bytes::default(),
             withdrawals: None,
         };
@@ -383,11 +413,49 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             return Err(eyre!("reorg: new_blocks must not be empty"));
         }
 
+        // The fork number = the shared ancestor (one before the first new block).
+        let fork_number = new_blocks[0]
+            .recovered_block()
+            .header()
+            .number
+            .checked_sub(1)
+            .ok_or_else(|| eyre!("reorg: fork number underflow"))?;
+
+        // Disk unwind: remove everything above the fork, then save new blocks.
+        // Two separate MDBX transactions (mirrors reth's own reorg test at
+        // provider.rs:696-704). Each provider_rw() call opens a fresh write
+        // transaction; we commit before the next to avoid deadlocks.
+        {
+            let provider_rw = self
+                .factory
+                .provider_rw()
+                .wrap_err("reorg: failed to open RW provider for unwind")?;
+            provider_rw
+                .remove_block_and_execution_above(fork_number)
+                .wrap_err("reorg: remove_block_and_execution_above failed")?;
+            provider_rw
+                .commit()
+                .wrap_err("reorg: commit after unwind failed")?;
+        }
+
+        {
+            let provider_rw = self
+                .factory
+                .provider_rw()
+                .wrap_err("reorg: failed to open RW provider for save")?;
+            provider_rw
+                .save_blocks(new_blocks.clone(), SaveBlocksMode::Full)
+                .wrap_err("reorg: save_blocks failed")?;
+            provider_rw
+                .commit()
+                .wrap_err("reorg: commit after save failed")?;
+        }
+
         // Update in-memory canonical state.
         self.canonical_in_memory
             .update_chain(NewCanonicalChain::Reorg {
                 new: new_blocks.clone(),
-                old: old_blocks.clone(),
+                old: old_blocks,
             });
 
         // Update the tracked tip to the last new block.
@@ -401,11 +469,6 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         self.canonical_in_memory
             .set_canonical_head(SealedHeader::new(new_tip_header.clone(), last_hash));
         self.tip = SealedHeader::new(new_tip_header, last_hash);
-
-        // TODO(D.2.4+): MDBX unwind (take_block_and_execution_above) + persist
-        // of the new suffix. The caller should handle disk-level consistency
-        // before calling reorg(), or we can add it when the test harness supports
-        // multi-transaction MDBX operations without deadlocks.
 
         Ok(())
     }
@@ -431,6 +494,49 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Seed genesis block 0 into the factory so static files are contiguous for block 1.
+///
+/// Used by tests and the standalone launcher to bootstrap a fresh database.
+pub(crate) fn seed_genesis<N: ProviderNodeTypes<Primitives = ArbPrimitives>>(
+    factory: &reth_provider::ProviderFactory<N>,
+) -> SealedHeader<Header> {
+    let genesis_block = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
+        header: Header {
+            number: 0,
+            ..Default::default()
+        },
+        body: Default::default(),
+    });
+    let genesis_hash = genesis_block.hash();
+    let genesis_executed = ExecutedBlock::new(
+        Arc::new(genesis_block.clone().try_recover().unwrap()),
+        Arc::new(BlockExecutionOutput {
+            result: BlockExecutionResult {
+                receipts: vec![],
+                requests: Default::default(),
+                gas_used: 0,
+                blob_gas_used: 0,
+            },
+            state: BundleState::default(),
+        }),
+        ComputedTrieData::default(),
+    );
+    let provider_rw = factory.provider_rw().unwrap();
+    provider_rw
+        .save_blocks(alloc::vec![genesis_executed], SaveBlocksMode::Full)
+        .unwrap();
+    provider_rw.commit().unwrap();
+
+    SealedHeader::new(
+        genesis_block.into_sealed_header().into_header(),
+        genesis_hash,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -450,7 +556,7 @@ mod tests {
     use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
     use reth_primitives_traits::SealedBlock;
     use reth_provider::test_utils::create_test_provider_factory_with_node_types;
-    use reth_provider::{BlockNumReader, HeaderProvider, SaveBlocksMode};
+    use reth_provider::{BlockNumReader, HeaderProvider};
     use reth_storage_api::AccountReader;
     use revm_database::BundleState;
 
@@ -458,43 +564,6 @@ mod tests {
 
     /// Default persistence threshold for tests — flush every block.
     const TEST_THRESHOLD: u64 = 1;
-
-    /// Helper: seed genesis block 0 so that static files are contiguous for block 1.
-    fn seed_genesis<N: ProviderNodeTypes<Primitives = ArbPrimitives>>(
-        factory: &reth_provider::ProviderFactory<N>,
-    ) -> SealedHeader<Header> {
-        let genesis_block = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
-            header: Header {
-                number: 0,
-                ..Default::default()
-            },
-            body: Default::default(),
-        });
-        let genesis_hash = genesis_block.hash();
-        let genesis_executed = ExecutedBlock::new(
-            Arc::new(genesis_block.clone().try_recover().unwrap()),
-            Arc::new(BlockExecutionOutput {
-                result: BlockExecutionResult {
-                    receipts: vec![],
-                    requests: Default::default(),
-                    gas_used: 0,
-                    blob_gas_used: 0,
-                },
-                state: BundleState::default(),
-            }),
-            ComputedTrieData::default(),
-        );
-        let provider_rw = factory.provider_rw().unwrap();
-        provider_rw
-            .save_blocks(vec![genesis_executed], SaveBlocksMode::Full)
-            .unwrap();
-        provider_rw.commit().unwrap();
-
-        SealedHeader::new(
-            genesis_block.into_sealed_header().into_header(),
-            genesis_hash,
-        )
-    }
 
     /// D.2.3 end-to-end test: advance_digests_and_persists_a_block.
     ///
@@ -711,6 +780,11 @@ mod tests {
         }
         let outcome = builder.finish(state_provider_for_trie, None).unwrap();
         let bundle = state.take_bundle();
+        // Drop the revm `State` now: it still owns a read transaction (the
+        // `StateProviderDatabase` opened at block 0). `reorg()` below opens a write
+        // transaction via `provider_rw()`, and MDBX deadlocks if a read txn is still
+        // alive on the same thread. We've extracted everything we need (`bundle`).
+        drop(state);
 
         let recovered_block: RecoveredBlock<ArbBlock> = outcome.block;
         let new_hash = recovered_block.hash();
@@ -755,7 +829,7 @@ mod tests {
             ComputedTrieData::default(),
         );
 
-        // Perform the reorg (in-memory state only, no MDBX unwind).
+        // Perform the reorg (in-memory state + MDBX unwind/save).
         driver
             .reorg(vec![new_executed.clone()], vec![old_executed])
             .expect("reorg must succeed");
@@ -784,6 +858,10 @@ mod tests {
     /// are flushed, the account balance must reflect the cumulative deposits.
     /// This catches the P0 bug where BundleState was discarded (block 2 would see
     /// no post-block-1 state and execute against genesis).
+    ///
+    /// **Acceptance:** reverting `state.take_bundle()` in `advance()` must make
+    /// this test FAIL — the mid-chain balance at block 1 would be zero and the
+    /// cumulative balance at block 2 would be only one deposit.
     #[test]
     fn two_block_advance_carries_state_forward() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
@@ -798,6 +876,9 @@ mod tests {
 
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, 1);
 
+        let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
+        let single_deposit = U256::from(111000000000000000u128);
+
         // Advance block 1
         let bh1 = driver
             .advance(&feed_msg, 0)
@@ -805,6 +886,23 @@ mod tests {
         assert_eq!(driver.pending_count(), 0, "auto-flushed (threshold=1)");
         assert_eq!(driver.tip().number, 1);
         assert_eq!(driver.tip().hash(), bh1);
+
+        // ---- Mid-chain check: block 1's state, independently read from disk ----
+        {
+            let state_at_1 = factory
+                .history_by_block_number(1)
+                .expect("history_by_block_number(1) must succeed");
+            let acct_at_1 = state_at_1.basic_account(&deposit_to).expect("lookup at block 1");
+            assert!(
+                acct_at_1.is_some(),
+                "deposit recipient must exist at block 1"
+            );
+            assert_eq!(
+                acct_at_1.unwrap().balance, single_deposit,
+                "block 1 state must carry exactly one deposit ({}), was {}",
+                single_deposit, acct_at_1.unwrap().balance
+            );
+        }
 
         // Advance block 2 — threshold=1 flushes each block immediately
         let bh2 = driver
@@ -820,6 +918,7 @@ mod tests {
 
         // Block 1 header exists
         let h1 = provider.header_by_number(1).unwrap().unwrap();
+        let h1_root = h1.state_root;
         assert_eq!(
             reth_primitives_traits::SealedHeader::seal_slow(h1).hash(),
             bh1,
@@ -828,21 +927,153 @@ mod tests {
 
         // Block 2 header exists
         let h2 = provider.header_by_number(2).unwrap().unwrap();
+        let h2_root = h2.state_root;
         assert_eq!(
             reth_primitives_traits::SealedHeader::seal_slow(h2).hash(),
             bh2,
             "block-2 hash mismatch"
         );
 
-        // The deposit recipient must have an account now (P0 regression guard).
-        let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
+        assert_ne!(
+            h1_root, h2_root,
+            "state roots of distinct blocks must differ"
+        );
+
+        // Cumulative balance: exactly two deposits.
+        let expected_cumulative = single_deposit * U256::from(2);
         let state = factory.latest().expect("latest state must open");
         let account = state
             .basic_account(&deposit_to)
             .expect("account lookup must not fail");
-        assert!(
-            account.is_some(),
-            "deposit recipient must have an account after two deposits (BundleState was persisted)"
+        let acct = account.expect("deposit recipient must have an account after two advances");
+        assert_eq!(
+            acct.balance, expected_cumulative,
+            "cumulative balance must be 2 × {single_deposit}, was {}",
+            acct.balance
         );
+    }
+
+    /// D.2.4+ full reorg: disk unwind + persist new suffix.
+    ///
+    /// Advance blocks 1 & 2 (threshold=1, flushed). Then reorg block 2 to a
+    /// different block 2′ at the same height. After reorg:
+    /// - `best_block_number == 2`
+    /// - `header_by_number(2)` hash == 2′ (NOT the old block 2)
+    /// - `header_by_number(1)` exists and is unchanged
+    /// - The old block 2's state is gone, 2′'s state is present
+    ///
+    /// This is verified by reopening a fresh provider from the same factory.
+    #[test]
+    fn reorg_unwinds_disk() {
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
+        let genesis_tip = seed_genesis(&factory);
+
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../arb_revm/testdata/fixtures");
+        let fixture_path = fixtures_dir.join("deposit_message_only.json");
+        let json = std::fs::read_to_string(&fixture_path).unwrap();
+        let feed_msg: BroadcastFeedMessage = serde_json::from_str(&json).unwrap();
+
+        let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
+        let single_deposit = U256::from(111000000000000000u128);
+
+        let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip.clone(), 1);
+
+        driver.advance(&feed_msg, 0).expect("advance 1");
+        assert_eq!(driver.tip().number, 1);
+
+        let old_bh2 = driver.advance(&feed_msg, 0).expect("advance 2");
+        assert_eq!(driver.tip().number, 2);
+        assert_eq!(driver.pending_count(), 0); // auto-flushed
+
+        // Build a new block 1′ (different from the existing block 1) by
+        // re-executing the deposit against genesis.
+        let (new_block_1, new_hash) = {
+            let p = genesis_tip.header();
+            let parent = ArbParentHeader {
+                number: p.number, timestamp: p.timestamp, beneficiary: p.beneficiary,
+                basefee: p.base_fee_per_gas.unwrap_or(0), gas_limit: p.gas_limit,
+                difficulty: p.difficulty, prevrandao: Some(p.mix_hash),
+            };
+            let input = digest_message(&feed_msg, parent,
+                ArbExecCfg { chain_id: 42161, ..ArbExecCfg::default() }, 0).unwrap();
+            let attrs = ArbNextBlockEnvAttributes {
+                timestamp: input.message.l1_timestamp.max(parent.timestamp),
+                suggested_fee_recipient: input.message.poster,
+                prev_randao: B256::ZERO, gas_limit: input.cfg.block_gas_limit,
+                l1_block_number: input.message.l1_block_number,
+                l1_base_fee_wei: input.message.l1_base_fee_wei,
+                arbos_format_version: 0, extra_data: Bytes::default(), withdrawals: None,
+            };
+
+            let sp = factory.history_by_block_number(0).unwrap();
+            let db = StateProviderDatabase::new(factory.history_by_block_number(0).unwrap());
+            let mut state = State::builder().with_database(db).with_bundle_update().build();
+            let mut builder = driver.evm_config
+                .builder_for_next_block(&mut state, &genesis_tip, attrs)
+                .map_err(|e| eyre!("{e:?}")).unwrap();
+            builder.apply_pre_execution_changes().unwrap();
+            for tx in input.message.txs {
+                let sender = tx.sender().unwrap();
+                builder.execute_transaction(Recovered::new_unchecked(tx, sender)).unwrap();
+            }
+            let outcome = builder.finish(sp, None).unwrap();
+            let bundle = state.take_bundle();
+            let rb: RecoveredBlock<ArbBlock> = outcome.block;
+            let hash = rb.hash();
+            let td = ComputedTrieData::new(
+                Arc::new(outcome.hashed_state.into_sorted()),
+                Arc::new(outcome.trie_updates.into_sorted()),
+            );
+            let ex = ExecutedBlock::new(Arc::new(rb), Arc::new(BlockExecutionOutput {
+                result: BlockExecutionResult {
+                    receipts: outcome.execution_result.receipts,
+                    requests: outcome.execution_result.requests,
+                    gas_used: outcome.execution_result.gas_used,
+                    blob_gas_used: outcome.execution_result.blob_gas_used,
+                },
+                state: bundle,
+            }), td);
+            (ex, hash)
+        };
+
+        // old block 1 synthetic for in-memory rollback
+        let old_synth = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
+            header: Header { number: 1, parent_hash: genesis_tip.hash(), ..Default::default() },
+            body: Default::default(),
+        });
+        let old_ex = ExecutedBlock::new(
+            Arc::new(old_synth.try_recover().unwrap()),
+            Arc::new(BlockExecutionOutput {
+                result: BlockExecutionResult { receipts: vec![], requests: Default::default(),
+                    gas_used: 0, blob_gas_used: 0 },
+                state: BundleState::default(),
+            }), ComputedTrieData::default());
+
+        driver.reorg(vec![new_block_1], vec![old_ex]).expect("reorg must succeed");
+
+        // 2: Verify on-disk state from a fresh provider
+        let provider = factory.provider().unwrap();
+        assert_eq!(provider.best_block_number().unwrap(), 1,
+            "best block must be 1");
+
+        let h1 = provider.header_by_number(1).unwrap().unwrap();
+        assert_eq!(reth_primitives_traits::SealedHeader::seal_slow(h1).hash(), new_hash,
+            "block 1 must be new block");
+
+        assert!(provider.header_by_number(2).unwrap().is_none(), "block 2 must be gone");
+        drop(provider);
+
+        let state = factory.latest().unwrap();
+        let acct = state.basic_account(&deposit_to).unwrap()
+            .expect("deposit recipient must exist");
+        assert_eq!(acct.balance, single_deposit,
+            "balance after reorg must be one deposit");
+
+        // 3: Old block 2 hash must NOT be on disk
+        let p2 = factory.provider().unwrap();
+        let h1_again = p2.header_by_number(1).unwrap().unwrap();
+        assert_ne!(reth_primitives_traits::SealedHeader::seal_slow(h1_again).hash(),
+            old_bh2, "old block 2 hash gone");
     }
 }

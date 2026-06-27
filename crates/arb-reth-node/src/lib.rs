@@ -36,11 +36,20 @@ pub use persist::persist_executed_block;
 pub mod driver;
 pub use driver::ArbChainDriver;
 
-pub mod pooled;
-pub use pooled::ArbPooledTransaction;
+pub mod node;
+pub use node::run as run_node;
+
+pub mod launcher;
+pub use launcher::{ArbLauncher, ArbNodeHandle};
 
 pub mod executor;
 pub use executor::ArbExecutorBuilder;
+
+pub mod pooled;
+pub use pooled::ArbPooledTransaction;
+
+pub mod rpc;
+pub use rpc::{ArbReceiptConverter, serve_rpc};
 
 use alloy_consensus::Header;
 use alloy_eips::eip4895::Withdrawal;
@@ -282,30 +291,36 @@ impl NodeTypes for ArbNode {
 }
 
 // ---------------------------------------------------------------------------
-// ArbNetworkPrimitives — NetworkPrimitives for Arbitrum
-//
-// D.3: ties our node primitives together for the noop network builder.
+// ArbNetworkPrimitives — NetworkPrimitives for Arbitrum (for the noop network builder)
 // ---------------------------------------------------------------------------
 
-/// Network primitives for Arbitrum — used by [`NoopNetworkBuilder`].
+/// Network primitives for Arbitrum — used by the noop network builder.
 ///
-/// `BroadcastedTransaction = ArbTxEnvelope` (our signed tx).
-/// `PooledTransaction = ArbTxEnvelope` (noop network never serves pooled txs).
+/// `BroadcastedTransaction = ArbTxEnvelope`; `PooledTransaction = ArbTxEnvelope`
+/// (the noop network never serves pooled txs — Arbitrum has no p2p tx gossip).
 pub type ArbNetworkPrimitives =
     reth_eth_wire_types::BasicNetworkPrimitives<ArbPrimitives, ArbTxEnvelope>;
 
 // ---------------------------------------------------------------------------
-// impl Node<N> for ArbNode — D.3 full NodeBuilder integration
+// impl Node<N> for ArbNode — D.3b NodeBuilder integration.
 //
-// Wires ArbNode into reth's NodeBuilder using noop components for pool,
-// network, consensus, and payload. Only the executor is custom.
+// This is required so `builder.node(ArbNode)` produces the
+// `NodeBuilderWithComponents` our custom `ArbLauncher` (a `LaunchNode`) consumes.
+// The components are NOOP except the executor: Arbitrum is an execute-to-derive
+// producer (no tx gossip, no p2p, no fork-choice engine), so pool/network/
+// consensus/payload are noop stand-ins and `ArbExecutorBuilder` supplies the
+// ArbOS `ConfigureEvm`. The actual block production is NOT reth's engine — our
+// `ArbLauncher` reuses reth's `LaunchContext` for DB/provider/blockchain-db/tasks
+// but skips the engine pipeline/orchestrator and spawns `ArbChainDriver` instead,
+// standing up `eth_*` RPC manually (so `AddOns = ()` — no engine-coupled
+// `RpcAddOns`). See `launcher.rs` (D.3b) and `docs/stage-d2-handoff.md` §12.
 // ---------------------------------------------------------------------------
 
-use reth_node_builder::{FullNodeTypes, Node};
 use reth_node_builder::components::{
-    ComponentsBuilder, NoopConsensusBuilder, NoopNetworkBuilder,
-    NoopPayloadBuilder, NoopTransactionPoolBuilder,
+    ComponentsBuilder, NoopConsensusBuilder, NoopNetworkBuilder, NoopPayloadBuilder,
+    NoopTransactionPoolBuilder,
 };
+use reth_node_builder::{FullNodeTypes, Node};
 
 impl<N> Node<N> for ArbNode
 where
@@ -332,9 +347,7 @@ where
             .noop_consensus()
     }
 
-    fn add_ons(&self) -> Self::AddOns {
-        ()
-    }
+    fn add_ons(&self) -> Self::AddOns {}
 }
 
 // ---------------------------------------------------------------------------

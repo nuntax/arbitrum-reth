@@ -37,6 +37,10 @@ pub use config::{
     ARB_ONE_CHAIN_ID, ArbEvmConfig, ArbEvmConfigError, ArbNextBlockEnvAttributes,
 };
 
+/// RPC compatibility impls (TryIntoTxEnv for ArbTransactionRequest → ArbTx).
+#[cfg(feature = "rpc")]
+pub mod rpc;
+
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory, IntoTxEnv};
 use alloy_primitives::{Address, Bytes};

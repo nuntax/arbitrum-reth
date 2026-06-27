@@ -34,3 +34,12 @@ reth-primitives-traits = { version = "0.5.0", default-features = false }
 alloy-consensus = { version = "2.0", default-features = false }
 alloy-eips = { version = "2.0", default-features = false }
 alloy-primitives = { version = "1", default-features = false }
+
+# rpc feature: TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest
+# and BuildPendingEnv<Header> for ArbNextBlockEnvAttributes.
+arb-alloy-rpc-types = { path = "../../../arb-alloy/crates/rpc-types", optional = true }
+alloy-rpc-types-eth = { version = "2.0", default-features = false, optional = true }
+reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", optional = true }
+
+[features]
+rpc = ["arb-alloy-rpc-types", "alloy-rpc-types-eth", "alloy-evm/rpc", "reth-rpc-eth-api"]
