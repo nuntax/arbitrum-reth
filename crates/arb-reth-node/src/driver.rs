@@ -779,25 +779,22 @@ mod tests {
     ///
     /// Hermetic: depends only on vendored fixtures, not a live testnode.
     ///
-    /// ## Proven range: blocks 1..=14 (root AND hash exact)
+    /// ## FULL parity: every captured block 1..=17 (root AND hash exact)
     ///
-    /// Blocks 1..=14 — L1→L2 deposits + auto-redeemed retryables (seq 1..9), then sequencer
-    /// batches deploying the rollup/token-bridge contracts (seq 10..14) — match the real testnode
-    /// **byte-for-byte** (state root and block hash). This validates: the Arbitrum header port
+    /// All 17 blocks match the real testnode **byte-for-byte** (state root and block hash):
+    /// - seq 1..9: L1→L2 deposits + auto-redeemed retryables
+    /// - seq 10..14: sequencer batches deploying the rollup/token-bridge contracts
+    /// - seq 15: the chain owner registering a Stylus CacheManager (`ArbOwner.addWasmCacheManager`)
+    /// - seq 16..17: further sequencer batches
+    ///
+    /// This validates the full pipeline end-to-end: the Arbitrum header port
     /// (difficulty/nonce/extra_data/mix_hash incl. post-state Blockhashes L1 number + collectTips),
-    /// the ArbOS-scheduled auto-redeem handling, and the InternalTxStartBlock-as-first-block-tx.
-    ///
-    /// Block 15 is the first call to the **ArbOwner (0x70)** precompile (the chain owner setting a
-    /// fee account, selector `0xffdca515`). It diverges because arb_revm's ArbOwner precompile does
-    /// not emit Nitro's `OwnerActs` event (Nitro `precompiles/precompile.go` wraps every owner
-    /// method with `emitOwnerActs`) — a precompile-completeness gap in `arb_revm`, tracked
-    /// separately from this node/header milestone. `MATCHED_THROUGH` bounds the strict assertion;
-    /// raise it once the ArbOwner gap is closed.
+    /// the InternalTxStartBlock-as-first-block-tx, ArbOS-scheduled auto-redeems, the ArbOwner
+    /// `OwnerActs` event, and ArbOwner's zero-gas (`OwnerPrecompile` `ZeroGas`) accounting.
     #[test]
     fn replay_feed_matches_testnode_per_block() {
-        /// Highest block proven to match exactly. Block 15 needs the ArbOwner `OwnerActs` event
-        /// (arb_revm precompile gap) — see the test doc above.
-        const MATCHED_THROUGH: u64 = 14;
+        /// Highest captured block — all of 1..=17 match exactly.
+        const MATCHED_THROUGH: u64 = 17;
 
         use crate::genesis::arb_chain_spec;
         use arb_revm::arbos_init::ArbosInitConfig;
