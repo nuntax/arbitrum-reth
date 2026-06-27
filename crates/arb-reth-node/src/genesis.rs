@@ -244,3 +244,48 @@ mod tests {
         assert!(arbos_init_from_parsed(&p).is_err());
     }
 }
+
+#[cfg(test)]
+mod testnode_genesis_parity {
+    use super::*;
+    use arb_revm::arbos_init::ArbosInitConfig;
+    use revm::primitives::{Address, U256};
+    use std::str::FromStr;
+
+    /// The nitro-testnode's L2 chain config (ArbOS v40, debug precompiles on), vendored verbatim
+    /// from its `config` docker volume (`l2_chain_config.json`). Its byte content is stored in the
+    /// ArbOS `chainConfig` subspace, so it must match Nitro's exactly for genesis parity.
+    const TESTNODE_CHAIN_CONFIG: &[u8] =
+        include_bytes!("../tests/fixtures/testnode_l2_chain_config.json");
+
+    /// GENESIS PARITY: our ArbOS genesis must reproduce the real nitro-testnode's L2 block-0 state
+    /// root exactly. The expected root was captured from a live nitro-testnode (nitro v3.9.6) via
+    /// `eth_getBlockByNumber("0x0").stateRoot`; the ArbOS storage was additionally verified
+    /// slot-for-slot against the live node (`eth_getStorageAt`, 49/49 match).
+    ///
+    /// This locks in the ArbOS genesis init (Stage G.1/G.2) including the two parity fixes found
+    /// by this very comparison: the v6 firstTime pricing overrides (equilibrationUnits=160e6,
+    /// speedLimit=7e6, perBlockGasLimit=32e6) and the ArbOS-state-account nonce=1. The L2 genesis
+    /// state is exactly the ArbOS accounts (prefunded EOAs in the testnode's `geth_genesis.json`
+    /// belong to the L1 chain; L2 accounts are funded by deposits in later blocks).
+    #[test]
+    fn matches_real_testnode_genesis_state_root() {
+        let init = ArbosInitConfig {
+            initial_arbos_version: 40,
+            initial_chain_owner: Address::from_str("0x5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927")
+                .unwrap(),
+            chain_id: U256::from(412346u64),
+            genesis_block_number: 0,
+            initial_l1_base_fee: U256::from(147u64), // the testnode's InitialL1BaseFee
+            serialized_chain_config: TESTNODE_CHAIN_CONFIG.to_vec(),
+            debug_precompiles: true,
+        };
+        let spec = arb_chain_spec(&init).expect("build ArbOS chain spec");
+        let root = spec.genesis_header().state_root;
+        assert_eq!(
+            format!("{root:#x}"),
+            "0xff8927407d6cd2703a5e65285970bd4da3b3b20b48861a62583a159795dc37bf",
+            "ArbOS genesis state root must match the real nitro-testnode L2 block 0"
+        );
+    }
+}
