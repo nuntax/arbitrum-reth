@@ -30,6 +30,9 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
+pub mod genesis;
+pub use genesis::{arb_chain_spec, arbos_init_from_chain_config_json, arbos_init_from_parsed};
+
 pub mod persist;
 pub use persist::persist_executed_block;
 

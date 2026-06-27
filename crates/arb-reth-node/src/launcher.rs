@@ -312,7 +312,7 @@ impl ArbLauncher {
             let handle = serve_rpc(
                 rpc_provider,
                 ArbNoopPool::new(),
-                ArbNoopNetwork::default(),
+                ArbNoopNetwork::default().with_chain_id(chain_id),
                 arb_evm_config,
                 addr,
                 runtime,

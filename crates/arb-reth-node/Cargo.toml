@@ -28,8 +28,10 @@ alloy-consensus = { version = "2.0", default-features = false }
 alloy-eips = { version = "2.0", default-features = false }
 alloy-rpc-types-eth = { version = "2.0", default-features = false }
 alloy-rpc-types-engine = { version = "2.0", default-features = false, features = ["serde"] }
+alloy-genesis = { version = "2", default-features = false }
 eyre = "0.6.12"
 serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { workspace = true }
 
 # reth node types + storage surface
 reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
@@ -68,6 +70,13 @@ reth-db = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b08767269
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
 
+# D.3b.4: bin/arb-reth — CLI entrypoint (clap), reth runtime/ctrl-c harness,
+# tracing, node-core (NodeConfig datadir args + on-disk DB open).
+clap = { version = "4", features = ["derive"] }
+reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+
 # D.5: eth_* RPC layer — receipt converter + serve_rpc helper
 arb-alloy-network = { path = "../../../arb-alloy/crates/network" }
 arb-alloy-rpc-types = { path = "../../../arb-alloy/crates/rpc-types", features = ["reth-compat"] }
@@ -86,7 +95,6 @@ serde_json = { workspace = true }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["test-utils"] }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["test-utils"] }
-reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 revm-state = "41.0.0"
 tempfile = "3"
 arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth", "k256"] }
