@@ -98,3 +98,5 @@ reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "22
 revm-state = "41.0.0"
 tempfile = "3"
 arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth", "k256"] }
+# Per-block replay-parity test: seed the real ArbOS genesis block into the test factory.
+reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }

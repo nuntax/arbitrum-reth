@@ -62,6 +62,7 @@ impl<H: AlloyBlockHeader> BuildPendingEnv<H> for ArbNextBlockEnvAttributes {
             l1_block_number: 0,
             l1_base_fee_wei: alloy_primitives::U256::ZERO,
             arbos_format_version: 0,
+            delayed_messages_read: parent.nonce().map(|n| u64::from_be_bytes(n.0)).unwrap_or(0),
             extra_data: alloy_primitives::Bytes::default(),
             withdrawals: None,
         }

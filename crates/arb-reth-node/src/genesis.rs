@@ -280,6 +280,33 @@ mod testnode_genesis_parity {
     /// speedLimit=7e6, perBlockGasLimit=32e6) and the ArbOS-state-account nonce=1. The L2 genesis
     /// state is exactly the ArbOS accounts (prefunded EOAs in the testnode's `geth_genesis.json`
     /// belong to the L1 chain; L2 accounts are funded by deposits in later blocks).
+    /// Same as below, but for the 2026-06-27 capture instance used by the per-block replay-parity
+    /// test (`driver::tests::replay_feed_matches_testnode_per_block`). That testnode init read a
+    /// live L1 base fee of 167 wei (not 147), giving a different genesis — this locks the genesis
+    /// inputs that the per-block fixtures depend on.
+    #[test]
+    fn matches_capture_instance_genesis() {
+        let init = ArbosInitConfig {
+            initial_arbos_version: 40,
+            initial_chain_owner: Address::from_str("0x5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927")
+                .unwrap(),
+            chain_id: U256::from(412346u64),
+            genesis_block_number: 0,
+            initial_l1_base_fee: U256::from(167u64),
+            serialized_chain_config: TESTNODE_CHAIN_CONFIG.to_vec(),
+            debug_precompiles: true,
+        };
+        let spec = arb_chain_spec(&init).expect("build ArbOS chain spec");
+        assert_eq!(
+            format!("{:#x}", spec.genesis_header().state_root),
+            "0xbff172125e1230f576de2d8bc223af9371bb4dfe1020203cefc21149dd81f23a",
+        );
+        assert_eq!(
+            format!("{:#x}", spec.genesis_hash()),
+            "0x300d0b71fac429fbb9dd25a7473637522a9d5bfd3b927a5a5b7a33f66738f936",
+        );
+    }
+
     #[test]
     fn matches_real_testnode_genesis_state_root() {
         let init = ArbosInitConfig {

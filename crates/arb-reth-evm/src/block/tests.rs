@@ -209,6 +209,8 @@ fn block_ctx() -> ArbBlockExecutionCtx {
         time_last_block: L1_TIMESTAMP.saturating_sub(PARENT_TIMESTAMP),
         sequence_number: Some(7),
         poster: POSTER,
+        delayed_messages_read: 0,
+        header_info_out: Default::default(),
     }
 }
 
@@ -228,11 +230,17 @@ fn block_executor_matches_execute_message() {
 
     executor
         .apply_pre_execution_changes()
-        .expect("pre-execution (StartBlock + EIP-2935)");
+        .expect("pre-execution (EIP-2935)");
+
+    // The InternalTxStartBlock (0x6a) is now a real block tx — run it first, like the driver does
+    // (and like Nitro, where it is the block's first transaction with its own receipt).
+    let start_tx = executor.start_block_tx().expect("start-block tx");
+    let sb_sender = start_tx.sender().expect("start-block tx carries explicit from");
+    executor
+        .execute_transaction(&Recovered::new_unchecked(start_tx, sb_sender))
+        .expect("execute start-block tx");
 
     let txs = user_txs();
-    let mut stage_c_gas = Vec::new();
-    let mut stage_c_l1 = Vec::new();
     for tx in &txs {
         let sender = tx.sender().expect("unsigned tx carries explicit from");
         let recovered = Recovered::new_unchecked(tx.clone(), sender);
@@ -241,11 +249,9 @@ fn block_executor_matches_execute_message() {
             .expect("execute_transaction");
     }
 
-    let receipts = executor.receipts().to_vec();
-    for r in &receipts {
-        use alloy_consensus::TxReceipt;
-        stage_c_gas.push(r.cumulative_gas_used());
-        // gas_used_for_l1 lives on the inner ArbReceipt body (public envelope variant fields).
+    // Per-user-tx gas_used_for_l1, skipping the start-block receipt at index 0.
+    let mut stage_c_l1 = Vec::new();
+    for r in executor.receipts().iter().skip(1) {
         stage_c_l1.push(gas_used_for_l1(r));
     }
 
@@ -259,13 +265,25 @@ fn block_executor_matches_execute_message() {
     );
     assert_eq!(
         result.receipts.len(),
-        txs.len(),
-        "one receipt per user tx"
+        txs.len() + 1,
+        "one receipt per user tx, plus the start-block (0x6a) tx"
     );
 
-    // Cumulative gas in receipts -> per-tx gas. Compare per-tx gas_used + status.
-    let mut prev_cum = 0u64;
-    for (i, receipt) in result.receipts.iter().enumerate() {
+    // Receipt[0] is the start-block tx: internal (0x6a), uses zero gas, no logs.
+    {
+        use alloy_consensus::TxReceipt;
+        assert_eq!(
+            result.receipts[0].cumulative_gas_used(),
+            0,
+            "start-block tx uses zero gas"
+        );
+        assert_eq!(result.receipts[0].ty(), 0x6a, "first receipt is the internal start-block tx");
+    }
+
+    // Cumulative gas in receipts -> per-tx gas. Compare per-user-tx gas_used + status,
+    // skipping the start-block receipt at index 0.
+    let mut prev_cum = result.receipts[0].cumulative_gas_used();
+    for (i, receipt) in result.receipts.iter().skip(1).enumerate() {
         use alloy_consensus::TxReceipt;
         let cum = receipt.cumulative_gas_used();
         let gas_used = cum - prev_cum;

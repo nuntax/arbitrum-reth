@@ -79,6 +79,9 @@ pub struct ArbNextBlockEnvAttributes {
     pub l1_base_fee_wei: U256,
     /// ArbOS format version for the next block (selects the [`ArbSpecId`]).
     pub arbos_format_version: u64,
+    /// Cumulative count of delayed-inbox messages read as of this block — Nitro encodes it into
+    /// the header `nonce`.
+    pub delayed_messages_read: u64,
     /// Header `extra_data` (carries `send_root` on Arbitrum).
     pub extra_data: Bytes,
     /// Consensus-layer withdrawals (always empty on Arbitrum; kept for trait-surface parity).
@@ -251,6 +254,9 @@ impl ArbEvmConfig {
             time_last_block: 0,
             sequence_number: None,
             poster: header.beneficiary(),
+            // The header nonce holds the cumulative delayed-messages-read count (Nitro `EncodeNonce`).
+            delayed_messages_read: u64::from_be_bytes(header.nonce.0),
+            header_info_out: Default::default(),
         }
     }
 
@@ -270,6 +276,8 @@ impl ArbEvmConfig {
             time_last_block: attributes.timestamp.saturating_sub(parent.timestamp()),
             sequence_number: None,
             poster: attributes.suggested_fee_recipient,
+            delayed_messages_read: attributes.delayed_messages_read,
+            header_info_out: Default::default(),
         }
     }
 

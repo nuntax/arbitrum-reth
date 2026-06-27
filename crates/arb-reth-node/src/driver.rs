@@ -29,20 +29,23 @@
 //! One execution, the correct Nitro shape. Blocks are served from in-memory state immediately
 //! and flushed to MDBX in batches for throughput.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use alloy_consensus::Header;
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Typed2718;
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, Log};
 use arb_alloy_consensus::{
     ArbTxEnvelope,
     reth::{ArbBlock, ArbPrimitives},
 };
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
-use arb_revm::executor::{ArbExecCfg, ArbParentHeader, digest_message};
+use arb_revm::executor::{
+    ArbExecCfg, ArbParentHeader, digest_message, scheduled_retries_from_redeem_logs,
+};
 use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
 use eyre::{Context as _, eyre};
 use reth_chain_state::{
@@ -208,10 +211,12 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             l1_block_number: input.message.l1_block_number,
             l1_base_fee_wei: input.message.l1_base_fee_wei,
             arbos_format_version: version as u64,
-            // TODO(header-fidelity): `extra_data` / `prev_randao` / `mix_hash` must
-            // carry ArbOS version, L1 block number, and send_root via `ArbHeaderInfo`
-            // for Nitro-faithful headers. Currently zero/empty — `ArbHeaderInfo` won't
-            // round-trip. Deferred; not blocking execute-once correctness.
+            // Header fidelity (Stage G.6): the assembler now encodes the Arbitrum `HeaderInfo`
+            // (difficulty=1, nonce=delayedMessagesRead, extra_data=send_root, mix_hash=
+            // send_count|l1_block_number|arbos_version) from the post-execution ArbOS state, so
+            // `extra_data` here is unused for header construction. `delayed_messages_read` flows
+            // into the header nonce.
+            delayed_messages_read: input.message.delayed_messages_read,
             extra_data: Bytes::default(),
             withdrawals: None,
         };
@@ -256,17 +261,51 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             .wrap_err("apply_pre_execution_changes failed")?;
 
         // ------------------------------------------------------------------ //
-        // 7. Execute each transaction from the digested message.
+        // 7. Execute each transaction from the digested message, plus any ArbOS
+        //    scheduled retries (auto-redeems) they trigger — mirroring
+        //    `execute_message`'s loop (run.rs). A successful SubmitRetryable or
+        //    `ArbRetryableTx.redeem` emits a `RedeemScheduled` log; ArbOS then runs
+        //    the corresponding redeem tx *within the same block*. These auto-redeem
+        //    txs are real block transactions (own receipt + tx-root entry), so they
+        //    must go through the builder too, or blocks containing retryables/deposits
+        //    diverge from Nitro in gas, state root, and tx/receipt roots.
         // ------------------------------------------------------------------ //
-        let txs: Vec<ArbTxEnvelope> = input.message.txs;
-        for tx in txs {
+        let mut queue: VecDeque<ArbTxEnvelope> = input.message.txs.into_iter().collect();
+
+        // Nitro's `InternalTxStartBlock` (0x6a) is the first transaction of every L2 block — a real
+        // block tx with its own receipt (contributes to the transactions/receipts roots). The
+        // executor builds it from this block's start-block inputs; we run it through the normal
+        // execute path ahead of the user txs (EIP-2935 already ran in apply_pre_execution_changes).
+        if let Some(start_block_tx) = builder.executor().start_block_tx() {
+            queue.push_front(start_block_tx);
+        }
+
+        while let Some(tx) = queue.pop_front() {
             let sender: Address = tx
                 .sender()
                 .map_err(|e| eyre!("failed to determine sender for tx {}: {e}", tx.ty()))?;
             let recovered = Recovered::new_unchecked(tx, sender);
+
+            let mut tx_logs: Vec<Log> = Vec::new();
+            let mut tx_success = false;
             builder
-                .execute_transaction(recovered)
+                .execute_transaction_with_result_closure(recovered, |res| {
+                    tx_success = res.result.result.is_success();
+                    tx_logs = res.result.result.logs().to_vec();
+                })
                 .wrap_err("execute_transaction failed")?;
+
+            // Schedule auto-redeems from this tx's RedeemScheduled logs (only on success,
+            // matching run.rs). Newly-scheduled retries are appended and processed in turn,
+            // so a retry that itself schedules another is handled.
+            if tx_success {
+                let retries = scheduled_retries_from_redeem_logs(
+                    builder.evm_mut().ctx_mut(),
+                    &tx_logs,
+                    self.chain_id,
+                );
+                queue.extend(retries);
+            }
         }
 
         // ------------------------------------------------------------------ //
@@ -659,6 +698,232 @@ mod tests {
         }
     }
 
+    /// Stage G.6 (part A): the assembled header must carry Arbitrum's `HeaderInfo` encoding,
+    /// not a plain Ethereum header. After advancing one message we decode the produced block-1
+    /// header and assert the Arbitrum-specific fields:
+    ///   - `difficulty == 1` (Nitro `createNewHeader`)
+    ///   - `extra_data` is exactly 32 bytes = `send_root`
+    ///   - `mix_hash` decodes to `send_count | l1_block_number | arbos_version`
+    ///   - `nonce == delayedMessagesRead`
+    ///
+    /// The test factory boots from an empty (non-ArbOS) genesis, so the post-execution ArbOS
+    /// state is empty: `send_root == 0`, `send_count == 0`, `arbos_version == 0`. The header
+    /// `nonce` must equal the digested message's `delayedMessagesRead` (an exact, plumbed value,
+    /// not faked). Exact `l1_block_number` parity (which comes from post-state Blockhashes and
+    /// requires a real ArbOS genesis) is validated against the live testnode in Stage G.6 part B.
+    #[test]
+    fn produced_header_carries_arbitrum_header_info() {
+        use arb_alloy_consensus::header::ArbHeaderInfo;
+
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
+        let genesis_tip = seed_genesis(&factory);
+
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../arb_revm/testdata/fixtures");
+        let fixture_path = fixtures_dir.join("deposit_message_only.json");
+        let json = std::fs::read_to_string(&fixture_path).unwrap();
+        let feed_msg: BroadcastFeedMessage = serde_json::from_str(&json).unwrap();
+
+        // Digest the message independently to learn the values that must reach the header.
+        let parent = ArbParentHeader {
+            number: genesis_tip.header().number,
+            timestamp: genesis_tip.header().timestamp,
+            beneficiary: genesis_tip.header().beneficiary,
+            basefee: genesis_tip.header().base_fee_per_gas.unwrap_or(0),
+            gas_limit: genesis_tip.header().gas_limit,
+            difficulty: genesis_tip.header().difficulty,
+            prevrandao: Some(genesis_tip.header().mix_hash),
+        };
+        let input = digest_message(
+            &feed_msg,
+            parent,
+            ArbExecCfg { chain_id: 42161, ..ArbExecCfg::default() },
+            0,
+        )
+        .unwrap();
+        let expected_delayed = input.message.delayed_messages_read;
+
+        let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, 1);
+        driver.advance(&feed_msg, 0).expect("advance must succeed");
+
+        let provider = factory.provider().unwrap();
+        let header = provider.header_by_number(1).unwrap().expect("block-1 header");
+
+        assert_eq!(header.difficulty, U256::from(1u64), "L2 block difficulty must be 1");
+        assert_eq!(header.extra_data.len(), 32, "extra_data must be a 32-byte send_root");
+        assert_eq!(
+            u64::from_be_bytes(header.nonce.0),
+            expected_delayed,
+            "header nonce must encode delayedMessagesRead"
+        );
+
+        let info = ArbHeaderInfo::decode_header(&header).expect("header must decode as Arbitrum info");
+        assert_eq!(info.send_root, B256::ZERO, "empty state ⇒ zero send_root");
+        assert_eq!(info.send_count, 0, "empty state ⇒ zero send_count");
+        assert_eq!(info.arbos_format_version, 0, "empty (non-ArbOS) genesis ⇒ version 0");
+        assert!(!info.collect_tips, "empty state ⇒ collect_tips off");
+    }
+
+    /// Stage G.6: full per-block parity against a real nitro-testnode.
+    ///
+    /// Replays a genesis-contiguous sequencer-feed capture (seq 0..17, captured 2026-06-27 from a
+    /// fresh `nitro-testnode` run with `--batchposters 0` so the broadcaster backlog retained seq 0)
+    /// through the actual node pipeline — real ArbOS genesis (built from the same chain config +
+    /// InitialL1BaseFee=167 the testnode used) → `ArbChainDriver::advance` per message → produced
+    /// block — and asserts each produced block's **state root AND hash** equals the testnode's.
+    ///
+    /// This is the end-to-end proof of Stage G.6: state-root parity = execution correctness, and
+    /// hash parity = the Arbitrum header port (difficulty/nonce/extra_data/mix_hash via
+    /// `ArbHeaderInfo` from post-execution ArbOS state). The genesis is independently locked by
+    /// `genesis::testnode_genesis_parity::matches_capture_instance_genesis`.
+    ///
+    /// Hermetic: depends only on vendored fixtures, not a live testnode.
+    ///
+    /// ## Proven range: blocks 1..=14 (root AND hash exact)
+    ///
+    /// Blocks 1..=14 — L1→L2 deposits + auto-redeemed retryables (seq 1..9), then sequencer
+    /// batches deploying the rollup/token-bridge contracts (seq 10..14) — match the real testnode
+    /// **byte-for-byte** (state root and block hash). This validates: the Arbitrum header port
+    /// (difficulty/nonce/extra_data/mix_hash incl. post-state Blockhashes L1 number + collectTips),
+    /// the ArbOS-scheduled auto-redeem handling, and the InternalTxStartBlock-as-first-block-tx.
+    ///
+    /// Block 15 is the first call to the **ArbOwner (0x70)** precompile (the chain owner setting a
+    /// fee account, selector `0xffdca515`). It diverges because arb_revm's ArbOwner precompile does
+    /// not emit Nitro's `OwnerActs` event (Nitro `precompiles/precompile.go` wraps every owner
+    /// method with `emitOwnerActs`) — a precompile-completeness gap in `arb_revm`, tracked
+    /// separately from this node/header milestone. `MATCHED_THROUGH` bounds the strict assertion;
+    /// raise it once the ArbOwner gap is closed.
+    #[test]
+    fn replay_feed_matches_testnode_per_block() {
+        /// Highest block proven to match exactly. Block 15 needs the ArbOwner `OwnerActs` event
+        /// (arb_revm precompile gap) — see the test doc above.
+        const MATCHED_THROUGH: u64 = 14;
+
+        use crate::genesis::arb_chain_spec;
+        use arb_revm::arbos_init::ArbosInitConfig;
+
+        const CHAIN_CONFIG: &[u8] =
+            include_bytes!("../tests/fixtures/testnode_l2_chain_config.json");
+        const FEED: &str = include_str!("../tests/fixtures/testnode_feed_seq0_17.ndjson");
+        const BLOCKS: &str = include_str!("../tests/fixtures/testnode_blocks_0_17.json");
+
+        let init = ArbosInitConfig {
+            initial_arbos_version: 40,
+            initial_chain_owner: address!("5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927"),
+            chain_id: U256::from(412346u64),
+            genesis_block_number: 0,
+            initial_l1_base_fee: U256::from(167u64),
+            serialized_chain_config: CHAIN_CONFIG.to_vec(),
+            debug_precompiles: true,
+        };
+        let spec = Arc::new(arb_chain_spec(&init).expect("build ArbOS chain spec"));
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(spec);
+        reth_db_common::init::init_genesis(&factory).expect("init ArbOS genesis block 0");
+
+        // Expected testnode blocks, keyed by number.
+        let expected: Vec<serde_json::Value> = serde_json::from_str(BLOCKS).unwrap();
+
+        // Genesis (block 0) must already match — guards the parent chain for block 1.
+        let genesis_tip = {
+            let p = factory.provider().unwrap();
+            let h = p.sealed_header(0).unwrap().expect("genesis header");
+            drop(p);
+            h
+        };
+        assert_eq!(
+            format!("{:#x}", genesis_tip.hash()),
+            expected[0]["hash"].as_str().unwrap(),
+            "genesis (block 0) hash must match the testnode"
+        );
+
+        let mut driver = ArbChainDriver::new(factory.clone(), 412346, genesis_tip, 1);
+
+        let msgs: Vec<BroadcastFeedMessage> = FEED
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("parse feed message"))
+            .collect();
+
+        let mut mismatches: Vec<String> = Vec::new();
+        let mut last_ok = 0u64;
+        for m in &msgs {
+            // seq 0 is the Initialize message (produces genesis, already seeded). seq N → block N.
+            if m.sequence_number == 0 {
+                continue;
+            }
+            let bn = m.sequence_number;
+            // Only the proven contiguous range is asserted; stop once past it (block 15+ depends on
+            // the arb_revm ArbOwner `OwnerActs` gap, after which state diverges and cascades).
+            if bn > MATCHED_THROUGH {
+                break;
+            }
+            if let Err(e) = driver.advance(m, 40) {
+                mismatches.push(format!("block {bn} advance ERROR: {e:?}"));
+                break;
+            }
+
+            let provider = factory.provider().unwrap();
+            let header = provider
+                .header_by_number(bn)
+                .unwrap()
+                .unwrap_or_else(|| panic!("produced block {bn} missing"));
+            let hash = reth_primitives_traits::SealedHeader::seal_slow(header.clone()).hash();
+            drop(provider);
+
+            let exp = &expected[bn as usize];
+            let got_root = format!("{:#x}", header.state_root);
+            let exp_root = exp["stateRoot"].as_str().unwrap();
+            let got_hash = format!("{hash:#x}");
+            let exp_hash = exp["hash"].as_str().unwrap();
+            let root_ok = got_root == exp_root;
+            let hash_ok = got_hash == exp_hash;
+            eprintln!(
+                "block {bn:2}: root {} hash {}",
+                if root_ok { "OK " } else { "BAD" },
+                if hash_ok { "OK " } else { "BAD" },
+            );
+            if !root_ok {
+                mismatches.push(format!("block {bn} stateRoot: got {got_root} want {exp_root}"));
+            }
+            if !hash_ok {
+                mismatches.push(format!(
+                    "block {bn} hash: got {got_hash} want {exp_hash}\n      \
+                     got  diff={} nonce={:#x} extra={} mix={} miner={:#x} base={:?} gas={} ts={}\n      \
+                     want nonce={} extra={} mix={} miner={} base={:?} gas={} ts={}",
+                    header.difficulty,
+                    u64::from_be_bytes(header.nonce.0),
+                    alloy_primitives::hex::encode_prefixed(&header.extra_data),
+                    header.mix_hash,
+                    header.beneficiary,
+                    header.base_fee_per_gas,
+                    header.gas_used,
+                    header.timestamp,
+                    exp["nonce"].as_str().unwrap(),
+                    exp["extraData"].as_str().unwrap(),
+                    exp["mixHash"].as_str().unwrap(),
+                    exp["miner"].as_str().unwrap(),
+                    exp["baseFeePerGas"].as_str(),
+                    exp["gasUsed"].as_str().unwrap(),
+                    exp["timestamp"].as_str().unwrap(),
+                ));
+            }
+            if root_ok && hash_ok {
+                last_ok = bn;
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "per-block parity: matched blocks 1..={last_ok}; {} issue(s):\n  {}",
+            mismatches.len(),
+            mismatches.join("\n  ")
+        );
+        assert_eq!(
+            last_ok, MATCHED_THROUGH,
+            "expected blocks 1..={MATCHED_THROUGH} to all match exactly (got 1..={last_ok})"
+        );
+    }
+
     // ------------------------------------------------------------------ //
     // D.2.4 tests
     // ------------------------------------------------------------------ //
@@ -754,6 +1019,7 @@ mod tests {
             l1_block_number: input.message.l1_block_number,
             l1_base_fee_wei: input.message.l1_base_fee_wei,
             arbos_format_version: 0,
+            delayed_messages_read: input.message.delayed_messages_read,
             extra_data: Bytes::default(),
             withdrawals: None,
         };
@@ -1003,7 +1269,9 @@ mod tests {
                 prev_randao: B256::ZERO, gas_limit: input.cfg.block_gas_limit,
                 l1_block_number: input.message.l1_block_number,
                 l1_base_fee_wei: input.message.l1_base_fee_wei,
-                arbos_format_version: 0, extra_data: Bytes::default(), withdrawals: None,
+                arbos_format_version: 0,
+                delayed_messages_read: input.message.delayed_messages_read,
+                extra_data: Bytes::default(), withdrawals: None,
             };
 
             let sp = factory.history_by_block_number(0).unwrap();

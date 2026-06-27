@@ -35,6 +35,7 @@ fn arb_header() -> Header {
         send_count: 7,
         l1_block_number: L1_BLOCK_NUMBER,
         arbos_format_version: ARBOS_VERSION,
+        collect_tips: false,
     };
     let mut header = Header {
         number: L2_BLOCK_NUMBER,
@@ -274,6 +275,7 @@ fn next_block_env_and_ctx_use_attributes() {
         l1_block_number: L1_BLOCK_NUMBER + 1,
         l1_base_fee_wei: U256::from(7u64),
         arbos_format_version: ARBOS_VERSION,
+        delayed_messages_read: 0,
         extra_data: Bytes::new(),
         withdrawals: None,
     };

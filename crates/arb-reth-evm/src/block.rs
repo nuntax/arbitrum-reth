@@ -23,8 +23,8 @@ use alloy_consensus::{
     Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Eip658Value, Header, Receipt, ReceiptWithBloom,
     TxReceipt, proofs,
 };
-use alloy_eips::merge::BEACON_NONCE;
 use alloy_eips::{Encodable2718, Typed2718};
+use std::sync::{Arc, Mutex};
 use alloy_evm::{
     Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
@@ -32,21 +32,23 @@ use alloy_evm::{
         ExecutableTx, GasOutput, StateDB, TxResult,
     },
 };
-use alloy_primitives::{Address, B256, Bytes, Log, U256, logs_bloom};
+use alloy_primitives::{Address, B64, B256, Bytes, Log, U256, logs_bloom};
+use arb_alloy_consensus::header::ArbHeaderInfo;
 use arb_alloy_consensus::receipt::{ArbReceipt, ArbReceiptEnvelope};
 use arb_alloy_consensus::transactions::ArbTxEnvelope;
+use arb_alloy_consensus::transactions::internal::ArbInternalTx;
 use arb_revm::api::default_ctx::ArbContext;
-use arb_revm::constants::{ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS};
+use arb_revm::constants::{BATCH_POSTER_ADDRESS, HISTORY_STORAGE_ADDRESS};
 use arb_revm::executor::hooks::{
     ArbExecutionHooks, ArbStartBlockDerived, DefaultArbExecutionHooks,
 };
 use arb_revm::executor::{ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader};
-use arb_revm::{ArbExecCfg, ArbTransaction};
+use arb_revm::{ArbBlockHeaderInfo, ArbExecCfg, ArbosState};
 use core::fmt::Debug;
 use reth_evm::execute::{BlockAssembler, BlockAssemblerInput};
-use revm::context::{Block as _, TxEnv, result::ResultAndState};
+use revm::context::{Block as _, ContextTr, result::ResultAndState};
 use revm::handler::SYSTEM_ADDRESS;
-use revm::{DatabaseCommit, Inspector, context::result::ExecutionResult, primitives::TxKind};
+use revm::{DatabaseCommit, Inspector, context::result::ExecutionResult};
 
 /// Block-execution context for an Arbitrum block, beyond what the EVM env carries.
 ///
@@ -73,6 +75,17 @@ pub struct ArbBlockExecutionCtx {
     pub sequence_number: Option<u64>,
     /// Batch poster / coinbase for the block (`message.poster`); receives the L1 poster fee.
     pub poster: Address,
+    /// Cumulative count of delayed-inbox messages read as of this block. Nitro encodes this into
+    /// the header `nonce` (`EncodeNonce(delayedMessagesRead)`).
+    pub delayed_messages_read: u64,
+    /// Shared cell the executor's [`finish`](BlockExecutor::finish) writes the post-execution
+    /// [`ArbBlockHeaderInfo`] into, for the [`ArbBlockAssembler`] to read when sealing the header.
+    ///
+    /// This is the only channel from the executor to the assembler in reth's block-builder flow:
+    /// [`BasicBlockBuilder`](reth_evm::execute) hands the assembler the *builder's* `ctx`, not the
+    /// executor's EVM. Because `create_executor` is given `ctx.clone()` and `Arc` clones share the
+    /// inner cell, a value the executor stores here is visible to the assembler via its `ctx`.
+    pub header_info_out: Arc<Mutex<Option<ArbBlockHeaderInfo>>>,
 }
 
 /// Result of executing one Arbitrum transaction through the block executor.
@@ -195,10 +208,16 @@ where
     type Result = ArbTxResult<<ArbEvm<DB, I> as Evm>::HaltReason>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        // Mirror `execute_message`'s prelude. (1) EIP-2935 / Nitro ProcessParentBlockHash: write the
-        // parent block hash into the history-storage contract under SYSTEM_ADDRESS. On pre-v40
-        // chains where the contract is not installed this is a no-op state transition (and is also
-        // what `execute_message` does). We commit it just like a system call.
+        // EIP-2935 / Nitro ProcessParentBlockHash: write the parent block hash into the
+        // history-storage contract under SYSTEM_ADDRESS. On pre-v40 chains where the contract is not
+        // installed this is a no-op state transition (matching `execute_message`). We commit it just
+        // like a system call. This is a pure system call — it has no block transaction or receipt.
+        //
+        // Nitro's `InternalTxStartBlock` (0x6a) is NOT run here: it is a real *block transaction*
+        // (the first tx of every L2 block, with its own receipt), so the caller drives it through
+        // `execute_transaction` like any other tx (see `ArbChainDriver::advance` /
+        // `block::build_start_block_tx`). Running it here instead would keep it out of the block's
+        // transactions/receipts roots and diverge the block hash from Nitro.
         let result = self
             .evm
             .transact_system_call(
@@ -208,34 +227,6 @@ where
             )
             .map_err(|err| BlockExecutionError::evm(err, self.ctx.parent_hash))?;
         self.evm.db_mut().commit(result.state);
-
-        // (2) Nitro's InternalTxStartBlock — built via `arb_revm`'s default hook so the
-        // `ArbosActs.startBlock(l1BaseFee, l1BlockNumber, l2BlockNumber, timeLastBlock)` calldata is
-        // byte-identical to the `execute_message` path. Driven as a typed internal tx (0x6a).
-        let l2_block_number = self.evm.block().number().saturating_to::<u64>();
-        let derived = ArbStartBlockDerived {
-            l2_block_number,
-            time_last_block: self.ctx.time_last_block,
-        };
-        let input = self.start_block_input(l2_block_number);
-        if let Some(call) = self.hooks.start_block_prelude(&input, derived) {
-            let mut tx = TxEnv::default();
-            tx.tx_type = ARBITRUM_INTERNAL_TX_TYPE;
-            tx.caller = call.caller;
-            tx.kind = TxKind::Call(call.target);
-            tx.data = call.data;
-            tx.gas_limit = 0;
-            tx.gas_price = 0;
-            tx.nonce = 0;
-            tx.chain_id = Some(self.chain_id);
-            let start_block_tx = ArbTx(ArbTransaction::new(tx));
-
-            let result = self
-                .evm
-                .transact_raw(start_block_tx)
-                .map_err(|err| BlockExecutionError::evm(err, B256::ZERO))?;
-            self.evm.db_mut().commit(result.state);
-        }
 
         Ok(())
     }
@@ -286,8 +277,19 @@ where
     }
 
     fn finish(
-        self,
+        mut self,
     ) -> Result<(Self::Evm, BlockExecutionResult<Self::Receipt>), BlockExecutionError> {
+        // Read the post-execution ArbOS header info (send-Merkle root/count, the possibly-upgraded
+        // ArbOS version, the L2 base fee) and hand it to the assembler via the shared ctx cell.
+        // All txs have been committed by now, so the journal loads the committed values straight
+        // from state (it holds the same `&mut State` the commits wrote to). This mirrors what
+        // Nitro's `FinalizeBlock`/`createNewHeader` pull from `arbosState` for the block header.
+        let header_info = ArbosState::read_block_header_info(self.evm.ctx_mut().journal_mut())
+            .map_err(|e| BlockExecutionError::msg(format!("read ArbOS block header info: {e}")))?;
+        if let Ok(mut slot) = self.ctx.header_info_out.lock() {
+            *slot = Some(header_info);
+        }
+
         let gas_used = self
             .receipts
             .last()
@@ -340,6 +342,32 @@ impl<E, H> ArbBlockExecutor<E, H> {
                 ..ArbExecCfg::default()
             },
         )
+    }
+}
+
+impl<DB, I, H> ArbBlockExecutor<ArbEvm<DB, I>, H>
+where
+    DB: Database + DatabaseCommit + StateDB,
+    I: Inspector<ArbContext<DB>>,
+    H: ArbExecutionHooks,
+{
+    /// Builds Nitro's `InternalTxStartBlock` (0x6a) for this block — the first transaction of every
+    /// L2 block, carrying the `ArbosActs.startBlock(l1BaseFee, l1BlockNumber, l2BlockNumber,
+    /// timeLastBlock)` calldata. Returns `None` if the hook yields no prelude.
+    ///
+    /// The caller runs this through the normal [`execute_transaction`](reth_evm::execute::BlockBuilder)
+    /// path (NOT in `apply_pre_execution_changes`) so it appears in the block's transactions and
+    /// receipts — matching Nitro, where the start-block tx is a real block transaction with its own
+    /// receipt and contributes to the transactions/receipts roots.
+    pub fn start_block_tx(&self) -> Option<ArbTxEnvelope> {
+        let l2_block_number = self.evm.block().number().saturating_to::<u64>();
+        let derived = ArbStartBlockDerived {
+            l2_block_number,
+            time_last_block: self.ctx.time_last_block,
+        };
+        let input = self.start_block_input(l2_block_number);
+        let call = self.hooks.start_block_prelude(&input, derived)?;
+        Some(ArbTxEnvelope::from(ArbInternalTx::new(self.chain_id, call.data)))
     }
 }
 
@@ -467,6 +495,31 @@ where
         let receipts_root = proofs::calculate_receipt_root(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
 
+        // Arbitrum header metadata (Nitro `HeaderInfo`): the executor stored the post-execution
+        // send-Merkle root/count + ArbOS version into the shared ctx cell during `finish`. Combine
+        // with the block's L1 block number to encode `extra_data` (= send_root) and `mix_hash`
+        // (= send_count | l1_block_number | arbos_version). Falls back to zeros if unset (e.g. a
+        // non-Arbitrum/genesis probe), which decodes back as a non-Arbitrum header.
+        let computed = ctx
+            .header_info_out
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or_default();
+        // Delayed-message blocks (coinbase != batch poster) never collect tips, regardless of the
+        // chain-wide setting (Nitro `block_processor.go`); all txs in a block share the coinbase.
+        let collect_tips =
+            computed.collect_tips && evm_env.block_env.beneficiary() == BATCH_POSTER_ADDRESS;
+        let arb_info = ArbHeaderInfo {
+            send_root: computed.send_root,
+            send_count: computed.send_count,
+            // The L1 block number ArbOS *recorded* for this block (post-state Blockhashes), which
+            // is what Nitro packs into `mix_hash` — not the raw message `l1BlockNumber` in `ctx`.
+            l1_block_number: computed.l1_block_number,
+            arbos_format_version: computed.arbos_version,
+            collect_tips,
+        };
+
         let header = Header {
             parent_hash: ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -476,15 +529,18 @@ where
             receipts_root,
             withdrawals_root: None,
             logs_bloom,
-            difficulty: evm_env.block_env.difficulty(),
+            // Nitro sets every L2 block's difficulty to 1 (`createNewHeader`).
+            difficulty: U256::from(1u64),
             number: evm_env.block_env.number().saturating_to(),
             gas_limit: evm_env.block_env.gas_limit(),
             gas_used: *gas_used,
             timestamp,
-            mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
-            nonce: BEACON_NONCE.into(),
+            // `mix_hash` carries send_count/l1_block_number/arbos_version; `extra_data` is send_root.
+            mix_hash: arb_info.encode_mix_hash(),
+            // Nitro encodes `delayedMessagesRead` into the header nonce (`EncodeNonce`).
+            nonce: B64::new(ctx.delayed_messages_read.to_be_bytes()),
             base_fee_per_gas: Some(evm_env.block_env.basefee()),
-            extra_data: ctx.extra_data,
+            extra_data: arb_info.encode_extra_data(),
             parent_beacon_block_root: None,
             blob_gas_used: None,
             excess_blob_gas: None,
