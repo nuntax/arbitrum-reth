@@ -11,15 +11,14 @@
 //! - [`arbos_init_from_parsed`] — extract from a [`ParsedInitMessage`] that has
 //!   already been decoded from an L1 Initialize message.
 //!
-//! # Genesis header fields
+//! # Genesis header
 //!
-//! The produced [`reth_chainspec::ChainSpec`] uses `gas_limit = 1 << 32` and
-//! `timestamp = 0` for the genesis header. These values are placeholders; exact
-//! testnode-genesis-hash parity requires the testnode's real header values which
-//! may differ from these defaults.
-//! // TODO(testnode-parity): wire real genesis header (gas_limit, timestamp,
-//! //   extra_data, coinbase, difficulty, mix_hash) from the testnode genesis JSON
-//! //   to achieve byte-for-byte state-root parity.
+//! [`arb_chain_spec`] reproduces Nitro's `arbosState.MakeGenesisBlock` header exactly (London
+//! format, nonce=1, gasLimit=1<<50, baseFee=0.1gwei, difficulty=1, extraData=32 zero bytes,
+//! mixHash encoding the ArbOS version) so both the genesis state root AND the genesis block hash
+//! match the real chain — validated byte-for-byte against the nitro-testnode (block 0 hash
+//! `0xb88471…`, state root `0xff8927…`). The genesis timestamp is currently 0 (testnode);
+//! Arbitrum One uses its Nitro-migration time (see TODO in `arb_chain_spec`).
 
 use std::collections::BTreeMap;
 
@@ -57,13 +56,15 @@ pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
         })
         .collect();
 
-    // Activate all EVM hard-forks at genesis so reth derives a Prague-class spec.
-    // terminal_total_difficulty = 0 signals that the chain is post-merge from block 0.
-    // TODO(testnode-parity): use real genesis header values for state-root parity.
+    // Arbitrum's geth chain config is LONDON-format: forks activate through london only, with NO
+    // shanghai/cancun/prague (those would make reth add withdrawalsRoot / blob / requests fields to
+    // the genesis header, diverging from Nitro's London-format header). The post-london EVM features
+    // are gated on the ArbOS version (decoded from the header mixHash by `ArbEvmConfig`), not on
+    // these chainspec forks — so a London-only config is both correct for execution and required for
+    // genesis block-hash parity. Mirrors the testnode's `l2_chain_config.json`.
     let config = ChainConfig {
         chain_id: init.chain_id.to::<u64>(),
         homestead_block: Some(0),
-        dao_fork_block: None,
         dao_fork_support: false,
         eip150_block: Some(0),
         eip155_block: Some(0),
@@ -75,23 +76,34 @@ pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
         muir_glacier_block: Some(0),
         berlin_block: Some(0),
         london_block: Some(0),
-        arrow_glacier_block: Some(0),
-        gray_glacier_block: Some(0),
-        merge_netsplit_block: Some(0),
-        terminal_total_difficulty: Some(U256::ZERO),
-        terminal_total_difficulty_passed: true,
-        shanghai_time: Some(0),
-        cancun_time: Some(0),
-        prague_time: Some(0),
         ..Default::default()
     };
 
-    // L2 gas limit: 4 GiB (Arbitrum One default).
-    // TODO(testnode-parity): set to testnode's genesis gas_limit for hash parity.
+    // Genesis header — reproduces Nitro `arbosState.MakeGenesisBlock` exactly so the block hash
+    // matches (validated against the nitro-testnode genesis, 0xb88471…). All values are Nitro
+    // constants except the ArbOS version (encoded into mixHash) and the timestamp.
+    //   - nonce      = 1  (EncodeNonce(1): "the genesis block reads the init message")
+    //   - gasLimit   = l2pricing.GethBlockGasLimit = 1 << 50
+    //   - baseFee    = l2pricing.InitialBaseFeeWei = 0.1 gwei
+    //   - difficulty = 1
+    //   - extraData  = SendRoot = 32 zero bytes at genesis (HeaderInfo.extra())
+    //   - mixHash    = pack(SendCount=0[0:8], L1BlockNumber=0[8:16], ArbOSFormatVersion[16:24])
+    //     (HeaderInfo.mixDigest()); ArbEvmConfig reads the version back out of bytes [16:24].
+    // TODO(arb-one): Arbitrum One's genesis timestamp is the Nitro-migration time, not 0.
+    let mut mix = [0u8; 32];
+    mix[16..24].copy_from_slice(&init.initial_arbos_version.to_be_bytes());
+
     let genesis = Genesis {
         config,
         alloc,
-        gas_limit: 1 << 32,
+        nonce: 1,
+        timestamp: 0,
+        gas_limit: 1 << 50,
+        difficulty: U256::from(1u64),
+        mix_hash: B256::from(mix),
+        coinbase: Address::ZERO,
+        extra_data: alloy_primitives::Bytes::from(vec![0u8; 32]),
+        base_fee_per_gas: Some(100_000_000),
         ..Default::default()
     };
 
@@ -286,6 +298,15 @@ mod testnode_genesis_parity {
             format!("{root:#x}"),
             "0xff8927407d6cd2703a5e65285970bd4da3b3b20b48861a62583a159795dc37bf",
             "ArbOS genesis state root must match the real nitro-testnode L2 block 0"
+        );
+        // Full block-hash parity: the genesis header (London format, nonce=1, gasLimit=1<<50,
+        // baseFee=0.1gwei, difficulty=1, extraData=32 zeros, mixHash encoding ArbOS v40) must hash
+        // to the testnode's actual block-0 hash.
+        let hash = spec.genesis_hash();
+        assert_eq!(
+            format!("{hash:#x}"),
+            "0xb88471684cde5f972dcf47e3fae8f87a5bb690c6b05873843e8549eee18eecf0",
+            "ArbOS genesis block hash must match the real nitro-testnode L2 block 0"
         );
     }
 }
