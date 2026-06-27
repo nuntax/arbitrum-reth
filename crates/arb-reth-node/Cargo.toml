@@ -50,6 +50,14 @@ reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b0876726
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network" }
 
+# D.3: NodeBuilder integration — noop pool/network/consensus/payload + Node<N> impl
+reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+alloy-rlp = { workspace = true }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["test-utils"] }

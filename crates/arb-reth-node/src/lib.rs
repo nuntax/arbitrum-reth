@@ -36,6 +36,12 @@ pub use persist::persist_executed_block;
 pub mod driver;
 pub use driver::ArbChainDriver;
 
+pub mod pooled;
+pub use pooled::ArbPooledTransaction;
+
+pub mod executor;
+pub use executor::ArbExecutorBuilder;
+
 use alloy_consensus::Header;
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Bytes, U256};
@@ -273,6 +279,62 @@ impl NodeTypes for ArbNode {
     /// Minimal payload-types stub.  The execute-once driver never builds engine payloads;
     /// this type exists solely to satisfy the `NodeTypes::Payload` bound.
     type Payload = ArbPayloadTypes;
+}
+
+// ---------------------------------------------------------------------------
+// ArbNetworkPrimitives — NetworkPrimitives for Arbitrum
+//
+// D.3: ties our node primitives together for the noop network builder.
+// ---------------------------------------------------------------------------
+
+/// Network primitives for Arbitrum — used by [`NoopNetworkBuilder`].
+///
+/// `BroadcastedTransaction = ArbTxEnvelope` (our signed tx).
+/// `PooledTransaction = ArbTxEnvelope` (noop network never serves pooled txs).
+pub type ArbNetworkPrimitives =
+    reth_eth_wire_types::BasicNetworkPrimitives<ArbPrimitives, ArbTxEnvelope>;
+
+// ---------------------------------------------------------------------------
+// impl Node<N> for ArbNode — D.3 full NodeBuilder integration
+//
+// Wires ArbNode into reth's NodeBuilder using noop components for pool,
+// network, consensus, and payload. Only the executor is custom.
+// ---------------------------------------------------------------------------
+
+use reth_node_builder::{FullNodeTypes, Node};
+use reth_node_builder::components::{
+    ComponentsBuilder, NoopConsensusBuilder, NoopNetworkBuilder,
+    NoopPayloadBuilder, NoopTransactionPoolBuilder,
+};
+
+impl<N> Node<N> for ArbNode
+where
+    N: FullNodeTypes<Types = Self>,
+{
+    type ComponentsBuilder = ComponentsBuilder<
+        N,
+        NoopTransactionPoolBuilder<ArbPooledTransaction>,
+        NoopPayloadBuilder,
+        NoopNetworkBuilder<ArbNetworkPrimitives>,
+        ArbExecutorBuilder,
+        NoopConsensusBuilder,
+    >;
+
+    type AddOns = ();
+
+    fn components_builder(&self) -> Self::ComponentsBuilder {
+        ComponentsBuilder::<(), (), (), (), (), ()>::default()
+            .node_types::<N>()
+            .executor(ArbExecutorBuilder::new(ARB_ONE_CHAIN_ID))
+            .noop_pool::<ArbPooledTransaction>()
+            .noop_payload()
+            .noop_network::<ArbNetworkPrimitives>()
+            .noop_consensus()
+    }
+
+    fn add_ons(&self) -> Self::AddOns {
+        ()
+    }
 }
 
 // ---------------------------------------------------------------------------
