@@ -1,0 +1,33 @@
+[package]
+name = "arb-reth-l1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Stage F: the L1-derivation fetch layer. Reads SequencerInbox batches (and, later,
+# the delayed inbox) from an L1 RPC and feeds the decoders in arb-reth-derive.
+
+[dependencies]
+arb-reth-derive = { path = "../arb-reth-derive" }
+
+alloy-primitives = { version = "1", default-features = false }
+alloy-consensus = { version = "2.0", default-features = false }
+alloy-eips = { version = "2.0", default-features = false }
+alloy-sol-types = "1.6"
+alloy-provider = { version = "2.0", default-features = false }
+alloy-rpc-types-eth = { version = "2.0", default-features = false }
+
+# Beacon REST client for blob sidecars (consensus layer; no JSON-RPC).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = "0.22"
+# Feed message type, so derived messages can be fed to the validated digest+executor path.
+arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
+# ArbTxEnvelope::tx_hash for the digest-path equivalence test.
+arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth", "std"] }

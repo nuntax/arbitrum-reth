@@ -11,7 +11,7 @@ authors.workspace = true
 
 [dependencies]
 # Arbitrum message types from arb-alloy; alloy version unifies with reth's workspace.
-arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false }
+arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false, features = ["std"] }
 alloy-primitives = "1"
 alloy-rlp = { workspace = true }
 # C brotli from Nitro; `cc_brotli` builds from source for decompression parity.
