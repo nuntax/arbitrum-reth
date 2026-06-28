@@ -317,6 +317,18 @@ fn write_head_blocks(
         count += 1;
     }
 
+    // Initialize the Transactions + Receipts static-file segments to the head block. Without
+    // this, reth's launch `check_consistency` sees those segments empty (highest block None)
+    // while the stage checkpoints say `head_num`, and unwinds to block 0. The head block has no
+    // txs/receipts, so the segments stay empty — only the block range needs setting. Mirrors
+    // reth `init_genesis`'s non-zero-genesis path (db-common init.rs).
+    sfp.get_writer(head_num, StaticFileSegment::Receipts)?
+        .user_header_mut()
+        .set_block_range(head_num, head_num);
+    sfp.get_writer(head_num, StaticFileSegment::Transactions)?
+        .user_header_mut()
+        .set_block_range(head_num, head_num);
+
     // Mark every stage complete at the head so reth treats the DB as synced to that block.
     let cp = StageCheckpoint::new(head_num);
     for stage in StageId::ALL {

@@ -83,8 +83,9 @@ pub struct ArbLauncher {
     pub chain_id: u64,
     /// Flush every `persistence_threshold` blocks (1 = flush every block).
     pub persistence_threshold: u64,
-    /// Feed channel; each item is `(message, arbos_format_version)`.
-    pub messages: tokio::sync::mpsc::Receiver<(BroadcastFeedMessage, u8)>,
+    /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
+    /// tip, so no per-message version is carried.
+    pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
     /// Optional HTTP bind address for the `eth_*` RPC server (`None` disables RPC).
     pub rpc_addr: Option<SocketAddr>,
 }
@@ -210,8 +211,8 @@ impl ArbLauncher {
             "arb-chain-driver",
             async move {
                 let res: eyre::Result<()> = async {
-                    while let Some((msg, version)) = messages_rx.recv().await {
-                        driver.advance(&msg, version)?;
+                    while let Some(msg) = messages_rx.recv().await {
+                        driver.advance(&msg)?;
                     }
                     driver.flush()?;
                     Ok(())
@@ -270,9 +271,9 @@ mod tests {
 
         let task_executor = Runtime::test();
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<(BroadcastFeedMessage, u8)>(4);
-        tx.send((feed_msg.clone(), 0)).await.unwrap();
-        tx.send((feed_msg.clone(), 0)).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+        tx.send(feed_msg.clone()).await.unwrap();
+        tx.send(feed_msg.clone()).await.unwrap();
         drop(tx);
 
         let datadir = reth_db::test_utils::tempdir_path();

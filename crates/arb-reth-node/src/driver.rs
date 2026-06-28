@@ -145,8 +145,18 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
     /// Pre-execution runs EIP-2935 `ProcessParentBlockHash` and Nitro `InternalTxStartBlock`
     /// (exactly mirroring `execute_message`). Timestamp is `max(l1_timestamp, parent.timestamp)`
     /// per Nitro's `createNewHeader` rule.
-    pub fn advance(&mut self, feed_msg: &BroadcastFeedMessage, version: u8) -> eyre::Result<B256> {
+    pub fn advance(&mut self, feed_msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
         let parent_header = self.tip.header();
+
+        // ArbOS version for this block is the one the parent ran at, encoded in the parent
+        // header's mix_hash (Arbitrum `HeaderInfo`). It only selects BatchPostingReport decoding
+        // (legacy < 50 vs tokenized >= 50) and advances automatically across ArbOS upgrades, so it
+        // is read from the chain rather than supplied by the caller. A non-Arbitrum/default header
+        // (mix_hash all-zero) decodes to version 0.
+        let version = arb_alloy_consensus::header::ArbHeaderInfo::decode_header(parent_header)
+            .map(|i| i.arbos_format_version as u8)
+            .unwrap_or(0);
+
         let parent = ArbParentHeader {
             number: parent_header.number,
             timestamp: parent_header.timestamp,
@@ -532,7 +542,7 @@ mod tests {
         }
 
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, TEST_THRESHOLD);
-        let block_hash = driver.advance(&feed_msg, 0).expect("advance must succeed");
+        let block_hash = driver.advance(&feed_msg).expect("advance must succeed");
 
         assert_eq!(
             driver.pending_count(),
@@ -622,7 +632,7 @@ mod tests {
         let expected_delayed = input.message.delayed_messages_read;
 
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, 1);
-        driver.advance(&feed_msg, 0).expect("advance must succeed");
+        driver.advance(&feed_msg).expect("advance must succeed");
 
         let provider = factory.provider().unwrap();
         let header = provider.header_by_number(1).unwrap().expect("block-1 header");
@@ -712,7 +722,7 @@ mod tests {
             if bn > MATCHED_THROUGH {
                 break;
             }
-            if let Err(e) = driver.advance(m, 40) {
+            if let Err(e) = driver.advance(m) {
                 mismatches.push(format!("block {bn} advance ERROR: {e:?}"));
                 break;
             }
@@ -794,7 +804,7 @@ mod tests {
 
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, u64::MAX); // never auto-flush
 
-        let block_hash = driver.advance(&feed_msg, 0).expect("advance must succeed");
+        let block_hash = driver.advance(&feed_msg).expect("advance must succeed");
         assert_eq!(
             driver.pending_count(),
             1,
@@ -832,7 +842,7 @@ mod tests {
 
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip.clone(), 1);
         let _first_hash = driver
-            .advance(&feed_msg, 0)
+            .advance(&feed_msg)
             .expect("first advance must succeed");
         assert_eq!(driver.pending_count(), 0); // auto-flushed
 
@@ -976,7 +986,7 @@ mod tests {
         let single_deposit = U256::from(111000000000000000u128);
 
         let bh1 = driver
-            .advance(&feed_msg, 0)
+            .advance(&feed_msg)
             .expect("block 1 advance must succeed");
         assert_eq!(driver.pending_count(), 0, "auto-flushed (threshold=1)");
         assert_eq!(driver.tip().number, 1);
@@ -1000,7 +1010,7 @@ mod tests {
         }
 
         let bh2 = driver
-            .advance(&feed_msg, 0)
+            .advance(&feed_msg)
             .expect("block 2 advance must succeed");
         assert_eq!(driver.pending_count(), 0, "auto-flushed");
         assert_eq!(driver.tip().number, 2);
@@ -1061,10 +1071,10 @@ mod tests {
 
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip.clone(), 1);
 
-        driver.advance(&feed_msg, 0).expect("advance 1");
+        driver.advance(&feed_msg).expect("advance 1");
         assert_eq!(driver.tip().number, 1);
 
-        let old_bh2 = driver.advance(&feed_msg, 0).expect("advance 2");
+        let old_bh2 = driver.advance(&feed_msg).expect("advance 2");
         assert_eq!(driver.tip().number, 2);
         assert_eq!(driver.pending_count(), 0); // auto-flushed
 

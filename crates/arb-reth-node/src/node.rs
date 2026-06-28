@@ -20,12 +20,12 @@ use crate::driver::ArbChainDriver;
 pub async fn run<N: ProviderNodeTypes<Primitives = ArbPrimitives>>(
     factory: ProviderFactory<N>,
     genesis_tip: SealedHeader<Header>,
-    mut messages: tokio::sync::mpsc::Receiver<(BroadcastFeedMessage, u8)>,
+    mut messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
 ) -> eyre::Result<()> {
     let mut driver = ArbChainDriver::new(factory, crate::ARB_ONE_CHAIN_ID, genesis_tip, 1);
 
-    while let Some((msg, version)) = messages.recv().await {
-        driver.advance(&msg, version)?;
+    while let Some(msg) = messages.recv().await {
+        driver.advance(&msg)?;
     }
 
     driver.flush()?; // defensive; should be empty with threshold=1
@@ -58,9 +58,9 @@ mod tests {
         let json = std::fs::read_to_string(&fixture_path).unwrap();
         let feed_msg: BroadcastFeedMessage = serde_json::from_str(&json).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<(BroadcastFeedMessage, u8)>(4);
-        tx.send((feed_msg.clone(), 0)).await.unwrap();
-        tx.send((feed_msg.clone(), 0)).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+        tx.send(feed_msg.clone()).await.unwrap();
+        tx.send(feed_msg.clone()).await.unwrap();
         drop(tx);
 
         run(factory.clone(), genesis_tip, rx)

@@ -13,12 +13,14 @@
 //! * [`extract_calldata_payload`] / [`decode_batch_messages`] - the pure decode glue
 //!   bridging recovered calldata to the derive pipeline.
 
+pub mod assemble;
 pub mod batch_serialize;
 pub mod beacon;
 pub mod contracts;
 pub mod delayed;
 pub mod feed;
 pub mod reader;
+pub mod sync;
 
 use alloy_sol_types::SolCall;
 use arb_reth_derive::batch::{self, data_location, BatchError};
@@ -27,8 +29,14 @@ use arb_reth_derive::message::DerivedMessage;
 use arb_reth_derive::multiplexer::{extract_messages, MultiplexerError};
 
 pub use beacon::BeaconClient;
-pub use contracts::{BRIDGE_MAINNET, SEQUENCER_INBOX_MAINNET};
-pub use batch_serialize::{batch_data_hash, batch_data_stats, report_data_hash, serialize_batch};
+pub use contracts::{
+    BRIDGE_MAINNET, NITRO_GENESIS_BLOCK_MAINNET, SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET,
+    SEQUENCER_INBOX_MAINNET,
+};
+pub use assemble::{assemble_feed_messages, assemble_feed_messages_with_seed, batch_to_feed_messages};
+pub use batch_serialize::{
+    batch_data_hash, batch_data_stats, report_batch_num, report_data_hash, serialize_batch,
+};
 pub use delayed::{verify_accumulator_chain, DelayedInboxReader};
 pub use feed::{derived_to_feed_message, derived_to_feed_message_with_stats};
 pub use reader::{BatchPayload, DeliveredBatch, SequencerInboxReader};
@@ -119,8 +127,18 @@ pub fn decode_payload_messages(
     before_delayed_count: u64,
     delayed: &dyn DelayedSource,
 ) -> Result<Vec<DerivedMessage>, L1Error> {
-    let seg_bytes = batch::decompress_payload(payload).map_err(L1Error::Batch)?;
-    let segments = batch::parse_segments(&seg_bytes).map_err(L1Error::Batch)?;
+    // An empty payload is a valid empty sequencer message (Nitro `ParseSequencerMessage`
+    // logs "empty sequencer message" and returns zero segments rather than erroring).
+    // Early Arbitrum One batches do this — batch 0 is a `SeparateBatchEvent` with empty
+    // data. The multiplexer still runs so any delayed messages this batch reads
+    // (force-inclusion: `afterDelayedMessages > before_delayed_count`) are emitted; only
+    // the segment list is empty.
+    let segments = if payload.is_empty() {
+        Vec::new()
+    } else {
+        let seg_bytes = batch::decompress_payload(payload).map_err(L1Error::Batch)?;
+        batch::parse_segments(&seg_bytes).map_err(L1Error::Batch)?
+    };
     extract_messages(header, &segments, before_delayed_count, delayed).map_err(L1Error::Mux)
 }
 

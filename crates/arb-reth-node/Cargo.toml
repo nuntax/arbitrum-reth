@@ -46,6 +46,10 @@ reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b0876726
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network" }
 
+# Stage F.3c: L1-derivation catch-up runtime (SequencerInbox + delayed inbox -> feed).
+arb-reth-l1 = { path = "../arb-reth-l1" }
+alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
+
 # D.3b: NodeBuilder integration (Node<N> + noop components + custom LaunchNode)
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }

@@ -24,6 +24,8 @@
 
 use std::{fs, net::IpAddr, path::PathBuf};
 
+use alloy_provider::ProviderBuilder;
+use arb_reth_l1::SequencerInboxReader;
 use arb_reth_node::{
     arb_chain_spec, arbos_init_from_chain_config_json, ArbNode, ARB_ONE_CHAIN_ID,
 };
@@ -96,9 +98,40 @@ struct Args {
     #[arg(long = "replay-feed", value_name = "PATH")]
     replay_feed: Option<PathBuf>,
 
-    /// ArbOS format version to tag replay-feed messages with (default 0).
-    #[arg(long = "replay-version", default_value_t = 0)]
-    replay_version: u8,
+
+    /// L1 execution-layer RPC endpoint. When set, the node runs trustless L1-derivation
+    /// catch-up: it reads SequencerInbox batches + the delayed inbox and feeds the
+    /// derived messages to the block driver. Requires an archive endpoint (historical
+    /// `getLogs`).
+    #[arg(long = "l1-rpc", value_name = "URL")]
+    l1_rpc: Option<String>,
+
+    /// L1 beacon (consensus-layer) REST endpoint for blob sidecars. Required to derive
+    /// post-Dencun blob batches; calldata-era ranges work without it.
+    #[arg(long = "l1-beacon", value_name = "URL")]
+    l1_beacon: Option<String>,
+
+    /// First L1 block to derive from. Optional override: for a genesis snapshot the resume point
+    /// is resolved from the chain (batch 0's delivery block), so it need not be supplied. Required
+    /// for a non-genesis snapshot until arbitrumdata-based auto-resume lands.
+    #[arg(long = "l1-start-block")]
+    l1_start_block: Option<u64>,
+
+    /// Last L1 block to derive (inclusive). Omit to follow the L1 head indefinitely.
+    #[arg(long = "l1-end-block")]
+    l1_end_block: Option<u64>,
+
+    /// Delayed cursor before the start block. Optional override: defaults to the snapshot tip
+    /// header's nonce (the L2 tip's `delayedMessagesRead`), so it need not be supplied.
+    #[arg(long = "l1-start-delayed")]
+    l1_start_delayed: Option<u64>,
+
+    /// Boot on a snapshot-imported datadir: path to the `reth-export --mode blocks` head stream
+    /// (`H <num> <hash> <headerRLP>`). The node builds its chain spec from that head header so the
+    /// genesis-hash check accepts the imported DB, and resumes from the snapshot's head block.
+    /// Use with `--datadir <imported-dir>` (do NOT pass `--chain`).
+    #[arg(long = "snapshot-head", value_name = "PATH")]
+    snapshot_head: Option<PathBuf>,
 }
 
 fn main() -> eyre::Result<()> {
@@ -114,10 +147,28 @@ fn main() -> eyre::Result<()> {
 async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
 
+    // --snapshot-head: boot on an imported snapshot DB by building the chain spec from its head
+    // header (so reth's genesis-hash check accepts the DB). Takes precedence over --chain.
     // When --chain is provided the chain id is derived from the JSON so eth_chainId and the
     // driver agree. When not provided, the mainnet placeholder is used with --chain-id.
-    let (chain_spec, effective_chain_id) = match &args.chain_config {
-        Some(path) => {
+    // `snapshot_delayed` carries the L2 tip's `delayedMessagesRead` (the header nonce) so the
+    // L1-sync delayed cursor defaults to it without a manual flag.
+    let mut snapshot_delayed: Option<u64> = None;
+    let mut snapshot_tip: Option<u64> = None;
+    let (chain_spec, effective_chain_id) = match (&args.snapshot_head, &args.chain_config) {
+        (Some(head_path), _) => {
+            let (num, hash, header) = arb_reth_node::read_head_header(head_path)?;
+            snapshot_delayed = Some(u64::from_be_bytes(header.nonce.0));
+            snapshot_tip = Some(num);
+            info!(
+                target: "arb-reth",
+                head_block = num, %hash, chain_id = args.chain_id,
+                delayed_messages_read = snapshot_delayed.unwrap(),
+                "booting on snapshot head header",
+            );
+            (arb_reth_node::arb_chain_spec_with_header(args.chain_id, header, hash), args.chain_id)
+        }
+        (None, Some(path)) => {
             let json = fs::read(path)
                 .map_err(|e| eyre::eyre!("failed to read chain config file {:?}: {}", path, e))?;
             let init = arbos_init_from_chain_config_json(&json)?;
@@ -131,7 +182,7 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
             let spec = std::sync::Arc::new(arb_chain_spec(&init)?);
             (spec, derived_chain_id)
         }
-        None => (MAINNET.clone(), args.chain_id),
+        (None, None) => (MAINNET.clone(), args.chain_id),
     };
 
     let datadir_args = match args.datadir {
@@ -150,7 +201,7 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     let node_builder = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
     // The held sender keeps the driver parked (and the node alive) until SIGTERM.
-    let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<(BroadcastFeedMessage, u8)>(4096);
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
 
     let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
 
@@ -171,7 +222,6 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
 
     if let Some(feed_path) = args.replay_feed {
         let tx = feed_tx.clone();
-        let version = args.replay_version;
         task_executor.spawn_task(async move {
             let content = match fs::read_to_string(&feed_path) {
                 Ok(c) => c,
@@ -194,7 +244,7 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
                 }
                 match serde_json::from_str::<BroadcastFeedMessage>(line) {
                     Ok(msg) => {
-                        if tx.send((msg, version)).await.is_err() {
+                        if tx.send(msg).await.is_err() {
                             reth_tracing::tracing::warn!(
                                 target: "arb-reth",
                                 "feed channel closed before replay finished"
@@ -217,8 +267,75 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
         });
     }
 
+    // Stage F.3c.2: trustless L1-derivation catch-up. Runs as a feed producer on the
+    // same channel the driver drains, so derived blocks execute through the validated
+    // STF path. The held sender keeps the node alive even after a bounded run finishes.
+    if let Some(l1_rpc) = args.l1_rpc {
+        // Both the L1 start block and the delayed cursor are properties of the snapshot, not
+        // per-run inputs. The delayed cursor is the tip header's nonce. The start block is the
+        // resume point's batch boundary: for a genesis snapshot that is batch 0, whose L1 delivery
+        // block we resolve from the chain (anchored at the SequencerInbox deploy block) rather than
+        // assuming a literal. Flags override both; a non-genesis snapshot must supply the start
+        // block until arbitrumdata-based auto-resume lands.
+        let start_block = match args.l1_start_block {
+            Some(b) => b,
+            None => {
+                let tip = snapshot_tip.ok_or_else(|| {
+                    eyre::eyre!(
+                        "--l1-rpc without --l1-start-block needs --snapshot-head to resolve the \
+                         L1 resume point"
+                    )
+                })?;
+                if tip != arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET {
+                    return Err(eyre::eyre!(
+                        "non-genesis snapshot (L2 tip {tip}) carries no embedded L1 resume \
+                         position; pass --l1-start-block (the batch boundary the tip was built \
+                         from) [arbitrumdata-based auto-resume not yet implemented]"
+                    ));
+                }
+                // Genesis snapshot → resume from batch 0; resolve its delivery block on-chain.
+                let provider = ProviderBuilder::new().connect_http(
+                    l1_rpc.parse().map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?,
+                );
+                let reader =
+                    SequencerInboxReader::new(provider, arb_reth_l1::SEQUENCER_INBOX_MAINNET);
+                let block = reader
+                    .delivery_block_of_batch(
+                        0,
+                        arb_reth_l1::SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET,
+                        1_000,
+                    )
+                    .await
+                    .map_err(|e| eyre::eyre!("resolve batch 0 delivery block: {e}"))?
+                    .ok_or_else(|| {
+                        eyre::eyre!("batch 0 not found near the SequencerInbox deploy block")
+                    })?;
+                info!(
+                    target: "arb-reth",
+                    batch = 0, l1_block = block,
+                    "resolved genesis-snapshot L1 resume point",
+                );
+                block
+            }
+        };
+        let start_delayed = args
+            .l1_start_delayed
+            .or(snapshot_delayed)
+            .unwrap_or(0);
+        let mut sync_cfg = arb_reth_node::L1SyncConfig::mainnet(l1_rpc, start_block, start_delayed);
+        sync_cfg.l1_beacon = args.l1_beacon;
+        sync_cfg.end_block = args.l1_end_block;
+
+        let tx = feed_tx.clone();
+        task_executor.spawn_task(async move {
+            if let Err(e) = arb_reth_node::run_l1_sync(sync_cfg, tx).await {
+                reth_tracing::tracing::error!(target: "arb-reth", err = %e, "L1 sync failed");
+            }
+        });
+        info!(target: "arb-reth", start_block, start_delayed, "L1-derivation catch-up started");
+    }
+
     // Hold feed_tx alive so the driver parks on the channel rather than exiting.
-    // Stage F will hand this sender to the derivation pipeline.
     let _feed_tx = feed_tx;
     handle.wait_for_node_exit().await
 }

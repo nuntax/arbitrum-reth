@@ -142,6 +142,65 @@ pub fn arbos_init_from_parsed(p: &ParsedInitMessage) -> eyre::Result<ArbosInitCo
     })
 }
 
+/// Build a [`ChainSpec`] whose genesis header **is** an imported snapshot's head header.
+///
+/// A snapshot-imported DB has its head (e.g. the Arbitrum One Nitro-genesis block 22207817) as
+/// reth's "genesis"; for the node to open that DB, `chain_spec.genesis_hash()` must equal the
+/// stored head hash. We can't take the alloc-based [`arb_chain_spec`] path (we have hashed state,
+/// no preimage alloc), so we override the public `genesis_header` field directly. Mirrors
+/// `arb-snapshot-import`'s launch-gate spec.
+pub fn arb_chain_spec_with_header(
+    chain_id: u64,
+    header: alloy_consensus::Header,
+    hash: B256,
+) -> std::sync::Arc<ChainSpec> {
+    let config = ChainConfig {
+        chain_id,
+        homestead_block: Some(0),
+        dao_fork_support: false,
+        eip150_block: Some(0),
+        eip155_block: Some(0),
+        eip158_block: Some(0),
+        byzantium_block: Some(0),
+        constantinople_block: Some(0),
+        petersburg_block: Some(0),
+        istanbul_block: Some(0),
+        muir_glacier_block: Some(0),
+        berlin_block: Some(0),
+        london_block: Some(0),
+        ..Default::default()
+    };
+    let genesis = Genesis { config, number: Some(header.number), ..Default::default() };
+    let mut spec = ChainSpec::from_genesis(genesis);
+    spec.genesis_header = reth_primitives_traits::SealedHeader::new(header, hash);
+    std::sync::Arc::new(spec)
+}
+
+/// Read the highest-numbered `H <num> <hash> <headerRLP>` record (the head/genesis header) from a
+/// `reth-export --mode blocks` stream. Used to build the chain spec for booting on a snapshot DB.
+pub fn read_head_header(path: &std::path::Path) -> eyre::Result<(u64, B256, alloy_consensus::Header)> {
+    use alloy_rlp::Decodable;
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut best: Option<(u64, B256, alloy_consensus::Header)> = None;
+    for line in reader.lines() {
+        let line = line?;
+        let mut p = line.splitn(4, ' ');
+        if p.next() != Some("H") {
+            continue;
+        }
+        let num: u64 = p.next().ok_or_else(|| eyre::eyre!("H: missing number"))?.parse()?;
+        let hash: B256 = p.next().ok_or_else(|| eyre::eyre!("H: missing hash"))?.parse()?;
+        let rlp = alloy_primitives::hex::decode(p.next().ok_or_else(|| eyre::eyre!("H: missing headerRLP"))?)?;
+        let header = alloy_consensus::Header::decode(&mut rlp.as_slice())
+            .map_err(|e| eyre::eyre!("decode header {num}: {e}"))?;
+        if best.as_ref().map(|(n, ..)| num >= *n).unwrap_or(true) {
+            best = Some((num, hash, header));
+        }
+    }
+    best.ok_or_else(|| eyre::eyre!("no H records in {path:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

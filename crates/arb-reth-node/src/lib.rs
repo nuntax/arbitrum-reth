@@ -31,7 +31,10 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 pub mod genesis;
-pub use genesis::{arb_chain_spec, arbos_init_from_chain_config_json, arbos_init_from_parsed};
+pub use genesis::{
+    arb_chain_spec, arb_chain_spec_with_header, arbos_init_from_chain_config_json,
+    arbos_init_from_parsed, read_head_header,
+};
 
 pub mod hashed_db;
 pub use hashed_db::{HashedStateDb, account_by_address, code_of, storage_at};
@@ -41,6 +44,9 @@ pub use persist::persist_executed_block;
 
 pub mod driver;
 pub use driver::ArbChainDriver;
+
+pub mod l1_sync;
+pub use l1_sync::{run_l1_sync, L1SyncConfig};
 
 pub mod node;
 pub use node::run as run_node;

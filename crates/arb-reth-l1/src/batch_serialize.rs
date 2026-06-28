@@ -60,7 +60,15 @@ pub fn batch_data_stats(serialized: &[u8]) -> BatchDataStats {
 }
 
 /// Extract the `data_hash` field (`keccak256(serialized)`) from a `BatchPostingReport`
-/// message body: fixed-width `[timestamp(32), poster(20), data_hash(32), ...]`.
+/// message body: fixed-width `[timestamp(32), poster(20), data_hash(32), batchNum(32),
+/// l1BaseFee(32), extraGas(8)?]`.
 pub fn report_data_hash(body: &[u8]) -> Option<B256> {
     body.get(52..84).map(B256::from_slice)
+}
+
+/// Extract the reported batch's sequence number (`batchNum`, big-endian word at
+/// `[84..116]`) from a `BatchPostingReport` body.
+pub fn report_batch_num(body: &[u8]) -> Option<u64> {
+    let word = body.get(84..116)?;
+    Some(u64::from_be_bytes(word[24..32].try_into().unwrap()))
 }

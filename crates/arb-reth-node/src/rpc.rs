@@ -351,9 +351,9 @@ mod tests {
             serde_json::from_str(&json).expect("parse BroadcastFeedMessage");
 
         let task_executor = Runtime::test();
-        let (tx, rx) = tokio::sync::mpsc::channel::<(BroadcastFeedMessage, u8)>(4);
-        tx.send((feed_msg.clone(), 0)).await.unwrap();
-        tx.send((feed_msg.clone(), 0)).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+        tx.send(feed_msg.clone()).await.unwrap();
+        tx.send(feed_msg.clone()).await.unwrap();
         drop(tx);
 
         let datadir = reth_db::test_utils::tempdir_path();

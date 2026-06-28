@@ -14,6 +14,19 @@ use alloy_sol_types::sol;
 pub const SEQUENCER_INBOX_MAINNET: Address =
     address!("0x1c479675ad559dc151f6ec7ed3fbf8cee79582b6");
 
+/// L1 block where the Arbitrum One `SequencerInbox` was deployed and posted batch 0
+/// (verified: first block with code == first `SequencerBatchDelivered` seq 0). This is
+/// the chain's L1-derivation lower bound — the deployment block from Nitro `chaininfo`.
+/// Used only as the *anchor* for resolving a resume point's batch on-chain, not as a
+/// literal start block (see `SequencerInboxReader::delivery_block_of_batch`).
+pub const SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET: u64 = 15_411_056;
+
+/// L2 block number of the Arbitrum One Nitro genesis (the classic→Nitro migration
+/// block). A snapshot whose tip equals this is a genesis snapshot, whose L1 resume
+/// point is batch 0; any other tip needs its resume position from `arbitrumdata` or an
+/// explicit `--l1-start-block`.
+pub const NITRO_GENESIS_BLOCK_MAINNET: u64 = 22_207_817;
+
 /// Arbitrum One `Bridge` proxy. Sole emitter of `MessageDelivered` for this chain;
 /// the authoritative source of delayed-message metadata and index numbering.
 /// (Other Arbitrum deployments share the event signature, so pin to this address.)
@@ -39,6 +52,13 @@ sol! {
         TimeBounds timeBounds,
         uint8 dataLocation
     );
+
+    /// Emitted by `SequencerInbox` when a batch's payload is stored in a separate event
+    /// (`dataLocation == SeparateBatchEvent`) instead of the posting tx calldata. The
+    /// `data` argument is the header-flagged batch payload; the indexed sequence number
+    /// matches the batch's `SequencerBatchDelivered`. Used by early Arbitrum One batches
+    /// (incl. batch 0).
+    event SequencerBatchData(uint256 indexed batchSequenceNumber, bytes data);
 
     /// Emitted by `Bridge` when a delayed message enters the delayed inbox. Carries
     /// the message metadata; the body arrives via `InboxMessageDelivered`.
