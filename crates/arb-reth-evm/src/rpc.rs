@@ -1,11 +1,9 @@
-//! RPC compatibility impls for `arb-reth-evm` types.
+//! RPC compatibility impls for `arb-reth-evm` types (gated behind the `rpc` feature).
 //!
-//! Gated behind the `rpc` feature. Provides:
-//! - `TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest` — satisfies the
-//!   `TxEnvConverter<ArbTransactionRequest, ArbEvmConfig>` blanket so `()` works as the
-//!   `TxEnv` parameter in `RpcConverter<Arbitrum, ArbEvmConfig, ArbReceiptConverter<_>>`.
-//! - `BuildPendingEnv<Header> for ArbNextBlockEnvAttributes` — satisfies the
-//!   `PendingEnvBuilder<ArbEvmConfig>` blanket for `()` so `EthApiBuilder::build()` compiles.
+//! - `TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest`: satisfies the
+//!   `TxEnvConverter<ArbTransactionRequest, ArbEvmConfig>` blanket.
+//! - `BuildPendingEnv<Header> for ArbNextBlockEnvAttributes`: satisfies the
+//!   `PendingEnvBuilder<ArbEvmConfig>` blanket so `EthApiBuilder::build()` compiles.
 
 use alloy_evm::{
     rpc::{EthTxEnvError, TryIntoTxEnv},
@@ -18,10 +16,6 @@ use crate::{ArbNextBlockEnvAttributes, ArbTx};
 use arb_revm::ArbSpecId;
 use revm::context::BlockEnv;
 
-// ---------------------------------------------------------------------------
-// TryIntoTxEnv impl
-// ---------------------------------------------------------------------------
-
 impl TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest {
     type Err = EthTxEnvError;
 
@@ -29,16 +23,11 @@ impl TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest {
         self,
         evm_env: &alloy_evm::EvmEnv<ArbSpecId, BlockEnv>,
     ) -> Result<ArbTx, EthTxEnvError> {
-        // Build a standard revm TxEnv from the inner TransactionRequest.
         let tx_env: revm::context::TxEnv = self.inner.try_into_tx_env(evm_env)?;
-        // Wrap in ArbTransaction (no retry_meta for RPC sim; encoded_2718 not needed).
+        // No retry_meta for RPC sim; encoded_2718 not needed.
         Ok(ArbTx(ArbTransaction::new(tx_env)))
     }
 }
-
-// ---------------------------------------------------------------------------
-// BuildPendingEnv impl
-// ---------------------------------------------------------------------------
 
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
@@ -51,9 +40,8 @@ impl<H: AlloyBlockHeader> BuildPendingEnv<H> for ArbNextBlockEnvAttributes {
         parent: &SealedHeader<H>,
         _block_overrides: Option<&BlockOverrides>,
     ) -> Self {
-        // For pending blocks in eth_call / eth_estimateGas, we fill in sensible defaults.
-        // l1_block_number and arbos_format_version are not available from the parent header —
-        // callers that need precise values should use a custom pending-env builder.
+        // `l1_block_number` and `arbos_format_version` are not available from the parent header.
+        // Callers that need precise values should use a custom pending-env builder.
         Self {
             timestamp: parent.timestamp().saturating_add(1),
             suggested_fee_recipient: parent.beneficiary(),

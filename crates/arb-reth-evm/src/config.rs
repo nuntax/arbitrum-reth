@@ -1,39 +1,31 @@
-//! `arb-reth-evm` Stage D.1 — [`ArbEvmConfig`]: reth's [`ConfigureEvm`] for Arbitrum.
+//! `arb-reth-evm` Stage D.1: [`ArbEvmConfig`], reth's [`ConfigureEvm`] for Arbitrum.
 //!
-//! This is the trait that lets reth drive Arbitrum execution from a block header. It ties together
-//! Stage B ([`ArbEvmFactory`]/[`ArbEvm`](crate::ArbEvm)) and Stage C
+//! Ties together Stage B ([`ArbEvmFactory`]/[`ArbEvm`](crate::ArbEvm)) and Stage C
 //! ([`ArbBlockExecutorFactory`]/[`ArbBlockExecutor`](crate::ArbBlockExecutor)/[`ArbBlockAssembler`]).
 //!
-//! Mirrors `OpEvmConfig` (`op-reth/crates/evm/src/lib.rs`) and `EthEvmConfig`. The structural
-//! difference from op: op derives its spec from a timestamp-keyed chain spec
-//! (`spec_by_timestamp_after_bedrock`), whereas Arbitrum's ArbOS version is carried **inside the
-//! header itself** ([`ArbHeaderInfo`] decodes it from `extra_data` + `mix_hash`). So
-//! [`ArbEvmConfig`] needs only the chain id to build a full [`EvmEnv`] from a header — the per-block
-//! spec and the L1 block number come from the header. The full timestamp/fork-keyed `ArbChainSpec`
-//! is Stage D.2 (the node skeleton); for Stage D.1 this self-contained config is the right altitude.
+//! Mirrors `OpEvmConfig`. Unlike OP (which keys spec from a timestamp-keyed chain spec),
+//! Arbitrum's ArbOS version is encoded in the header itself via [`ArbHeaderInfo`] (`extra_data` +
+//! `mix_hash`). [`ArbEvmConfig`] therefore needs only the chain id to build a full [`EvmEnv`] from
+//! a header; the per-block spec and L1 block number are decoded from each header.
 //!
-//! ## Threading the L1 block number (the Stage B/C deferral, now fixed)
+//! ## L1 block number threading
 //!
-//! On Arbitrum the EVM `NUMBER` opcode returns the **L1** block number, not the L2 one — `arb_revm`
-//! overrides `opNumber` to read `chain().l1_block_number`. Stage B's [`ArbEvmFactory::build_ctx`]
-//! defaulted that to 0 because the alloy [`EvmEnv`] has no slot for it. [`ArbEvmConfig`] resolves
-//! the deferral: [`evm_env`](ArbEvmConfig::evm_env) / [`context_for_block`](ArbEvmConfig::context_for_block)
-//! decode it from [`ArbHeaderInfo`] into [`ArbBlockExecutionCtx::l1_block_number`], and
+//! On Arbitrum the `NUMBER` opcode returns the L1 block number (not the L2 one). `arb_revm`
+//! overrides `opNumber` to read `chain().l1_block_number`. [`ArbEvmConfig`] resolves the deferral
+//! left by Stage B: [`evm_env`](ArbEvmConfig::evm_env) and
+//! [`context_for_block`](ArbEvmConfig::context_for_block) decode the L1 block number from
+//! [`ArbHeaderInfo`] into [`ArbBlockExecutionCtx::l1_block_number`], and
 //! [`ArbBlockExecutorFactory::create_executor`](crate::ArbBlockExecutorFactory) threads it into the
-//! chain context (see `block.rs`). So an executor built through this config sees the real L1 block
-//! number and `NUMBER` reads it.
+//! chain context. An executor built through this config sees the correct L1 block number.
 //!
-//! ## `impl ConfigureEvm` (the precompiles fork is resolved)
+//! ## `impl ConfigureEvm`
 //!
-//! reth's [`ConfigureEvm`](reth_evm::ConfigureEvm) bounds the inner `EvmFactory` with
-//! `Precompiles = PrecompilesMap` and `Tx: TransactionEnvMut`. Both now hold: `ArbTx` impls
-//! `TransactionEnvMut` (see `tx.rs`), and `ArbEvmFactory::Precompiles` is now `PrecompilesMap` —
-//! the ArbOS precompiles were re-homed onto alloy-evm's `DynPrecompile`/`EvmInternals` model
-//! (`arb_revm::arb_journal` + `crate::precompiles::arb_precompiles_map`), so the inner EVM executes
-//! through a `PrecompilesMap` while keeping `arb_revm`'s parity-validated precompile logic
-//! (`run_dispatch`). The [`ConfigureEvm`] impl is at the bottom of this file; the per-header logic
-//! lives in the inherent methods below (kept distinct so they stay directly unit-testable) and the
-//! trait methods delegate to them.
+//! reth's [`ConfigureEvm`](reth_evm::ConfigureEvm) requires `EvmFactory<Precompiles = PrecompilesMap,
+//! Tx: TransactionEnvMut>`. Both hold: `ArbTx` impls `TransactionEnvMut` (see `tx.rs`), and
+//! `ArbEvmFactory::Precompiles` is `PrecompilesMap` (ArbOS precompiles re-homed onto alloy-evm's
+//! `DynPrecompile`/`EvmInternals` model via `crate::precompiles::arb_precompiles_map`). The
+//! [`ConfigureEvm`] impl is at the bottom of this file; per-header logic lives in the inherent
+//! methods below, which the trait methods delegate to.
 
 use crate::block::{ArbBlockAssembler, ArbBlockExecutionCtx, ArbBlockExecutorFactory};
 use crate::ArbEvmFactory;
@@ -60,9 +52,8 @@ pub type ArbEvmConfigError = Infallible;
 /// Additional attributes needed to configure the next Arbitrum block, beyond what the parent header
 /// carries. Mirrors `OpNextBlockEnvAttributes` / reth's `NextBlockEnvAttributes`.
 ///
-/// On Arbitrum these come from the sequencer message being executed (Stage E will populate them
-/// from an `L1IncomingMessage`): the block timestamp, the batch poster (coinbase), the L1 block
-/// number observed for this L2 block, the L1 base fee, and the block gas limit.
+/// On Arbitrum these come from the sequencer message being executed. Stage E populates them from
+/// an `L1IncomingMessage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArbNextBlockEnvAttributes {
     /// Timestamp for the next block.
@@ -73,13 +64,13 @@ pub struct ArbNextBlockEnvAttributes {
     pub prev_randao: B256,
     /// Block gas limit for the next block.
     pub gas_limit: u64,
-    /// L1 block number ArbOS observes for this L2 block — the value the `NUMBER` opcode returns.
+    /// L1 block number ArbOS observes for this L2 block (the value the `NUMBER` opcode returns).
     pub l1_block_number: u64,
     /// L1 base fee (wei) for this block.
     pub l1_base_fee_wei: U256,
     /// ArbOS format version for the next block (selects the [`ArbSpecId`]).
     pub arbos_format_version: u64,
-    /// Cumulative count of delayed-inbox messages read as of this block — Nitro encodes it into
+    /// Cumulative count of delayed-inbox messages read as of this block. Nitro encodes this into
     /// the header `nonce`.
     pub delayed_messages_read: u64,
     /// Header `extra_data` (carries `send_root` on Arbitrum).
@@ -88,11 +79,11 @@ pub struct ArbNextBlockEnvAttributes {
     pub withdrawals: Option<Withdrawals>,
 }
 
-/// Arbitrum EVM configuration — implements reth's [`ConfigureEvm`], wiring Stage B + Stage C.
+/// Arbitrum EVM configuration: implements reth's [`ConfigureEvm`], wiring Stage B + Stage C.
 ///
 /// Holds the chain id plus the Stage C [`ArbBlockExecutorFactory`] and [`ArbBlockAssembler`].
-/// Mirrors `OpEvmConfig` but is parameterised only by the chain id (the per-block spec and L1 block
-/// number are decoded from each header via [`ArbHeaderInfo`], not from a chain spec).
+/// Mirrors `OpEvmConfig` but parameterised only by chain id (per-block spec and L1 block number
+/// are decoded from each header via [`ArbHeaderInfo`], not from a chain spec).
 #[derive(Debug, Clone)]
 pub struct ArbEvmConfig {
     /// Inner Stage C block-executor factory (wraps [`ArbEvmFactory`]).
@@ -125,9 +116,8 @@ impl ArbEvmConfig {
 
     /// Builds the [`CfgEnv`] for the given ArbOS-derived spec.
     ///
-    /// Mirrors the cfg `execute_message` / the Stage C test harness use for a fresh ArbOS state:
-    /// priority-fee check off (Arbitrum prices the tip via its own handler), EIP-7623 off (Arbitrum
-    /// prices calldata via the poster fee, not the floor), balance check on.
+    /// Priority-fee check is disabled (Arbitrum prices the tip via its own handler); EIP-7623 is
+    /// disabled (Arbitrum prices calldata via the poster fee, not the floor); balance check is on.
     fn cfg_env(&self, spec: ArbSpecId) -> CfgEnv<ArbSpecId> {
         let mut cfg = CfgEnv::new_with_spec(spec)
             .with_chain_id(self.chain_id)
@@ -161,13 +151,13 @@ impl ArbEvmConfig {
     }
 }
 
-/// Decodes the ArbOS format version from a header, defaulting to the current spec when the header
-/// is not an Arbitrum header (e.g. a genesis/default header reth may probe). Never errors — keeping
+/// Decodes the ArbOS format version from a header, falling back to the default spec when the header
+/// is not an Arbitrum header (e.g. a genesis or probe header). Never errors, keeping
 /// [`ConfigureEvm::evm_env`] infallible, matching `OpEvmConfig`.
 fn spec_for_header(header: &Header) -> ArbSpecId {
     match ArbHeaderInfo::decode_header(header) {
         Ok(info) if info.is_arbitrum() => ArbSpecId::from_arbos_version(info.arbos_format_version),
-        // Not an Arbitrum header (or decode failed): fall back to the default ArbOS spec.
+        // Not an Arbitrum header or decode failed: fall back to the default ArbOS spec.
         _ => ArbSpecId::default(),
     }
 }
@@ -182,11 +172,10 @@ fn l1_block_number_for_header(header: &Header) -> u64 {
         .unwrap_or(0)
 }
 
-/// Inherent methods mirroring the `ConfigureEvm` surface (signatures preserved exactly; see the
-/// module docs for why these are not yet the trait methods — the precompiles fork).
+/// Inherent methods mirroring the `ConfigureEvm` surface.
 ///
-/// `evm_env` is infallible (it defaults on non-Arbitrum headers, matching `OpEvmConfig::evm_env`),
-/// so the error type that `ConfigureEvm::Error` would take is [`Infallible`].
+/// `evm_env` is infallible (defaults on non-Arbitrum headers, matching `OpEvmConfig::evm_env`),
+/// so the error type is [`Infallible`].
 impl ArbEvmConfig {
     /// Returns a reference to the configured block-executor factory
     /// (`ConfigureEvm::block_executor_factory`).
@@ -240,16 +229,16 @@ impl ArbEvmConfig {
     /// Builds the [`ArbBlockExecutionCtx`] for a block from its header
     /// (`ConfigureEvm::context_for_block`).
     ///
-    /// This is where the **L1 block number** is decoded from [`ArbHeaderInfo`] and carried into the
-    /// execution ctx — the deferred fix: `ArbBlockExecutorFactory::create_executor` threads it into
-    /// the chain context so the `NUMBER` opcode returns it.
+    /// Decodes the L1 block number from [`ArbHeaderInfo`] and carries it into the execution ctx.
+    /// `ArbBlockExecutorFactory::create_executor` threads it into the chain context so the `NUMBER`
+    /// opcode returns the correct L1 block number.
     pub fn context_for_block(&self, header: &Header) -> ArbBlockExecutionCtx {
         ArbBlockExecutionCtx {
             parent_hash: header.parent_hash(),
             extra_data: header.extra_data().clone(),
             l1_block_number: l1_block_number_for_header(header),
-            // Block-scoped ArbOS startBlock inputs not representable in the consensus header are
-            // defaulted here; Stage E populates them from the sequencer `L1IncomingMessage`.
+            // Block-scoped ArbOS startBlock inputs not in the consensus header are defaulted here;
+            // Stage E populates them from the sequencer `L1IncomingMessage`.
             l1_base_fee_wei: U256::ZERO,
             time_last_block: 0,
             sequence_number: None,
@@ -287,11 +276,10 @@ impl ArbEvmConfig {
     }
 }
 
-/// reth's [`ConfigureEvm`] for Arbitrum — the entry point that lets reth drive ArbOS execution from
-/// a block header. Each method delegates to the equally-named inherent method above (inherent
-/// methods win method resolution, so `self.evm_env(header)` here is delegation, not recursion); the
-/// trait only adapts the surface (header→sealed-block, `Result` wrapping) and pins the associated
-/// types. `Error` is [`Infallible`] — header decoding falls back to defaults rather than erroring.
+/// reth's [`ConfigureEvm`] for Arbitrum. Each method delegates to the equally-named inherent method
+/// above (inherent methods win method resolution, so `self.evm_env(header)` here is delegation, not
+/// recursion). The trait adapts the surface (sealed-block wrapping, `Result` return) and pins the
+/// associated types. `Error` is [`Infallible`] since header decoding falls back to defaults.
 impl ConfigureEvm for ArbEvmConfig {
     type Primitives = ArbPrimitives;
     type Error = ArbEvmConfigError;
@@ -335,10 +323,9 @@ impl ConfigureEvm for ArbEvmConfig {
     }
 }
 
-// Compile-time proof that `ArbEvmConfig` satisfies the full reth `ConfigureEvm` bound — including
-// the `EvmFactory<Precompiles = PrecompilesMap, Tx: TransactionEnvMut + FromRecoveredTx + …>`
-// constraint that the precompiles re-home (#36) unblocked. If this stops compiling, the node's EVM
-// configuration surface has regressed.
+// Compile-time proof that `ArbEvmConfig` satisfies the full reth `ConfigureEvm` bound, including
+// `EvmFactory<Precompiles = PrecompilesMap, Tx: TransactionEnvMut + FromRecoveredTx + ...>`.
+// Regression guard: if this stops compiling, the node's EVM configuration surface has broken.
 const _: fn() = || {
     fn assert_configure_evm<T: ConfigureEvm>() {}
     assert_configure_evm::<ArbEvmConfig>();

@@ -1,10 +1,9 @@
 //! Stage D.1 exit proof for [`ArbEvmConfig`].
 //!
-//! 1. `evm_env(header)` derives the [`ArbSpecId`] from the ArbOS version embedded in the header
-//!    (via [`ArbHeaderInfo`]), and `context_for_block(header)` carries the header's L1 block number.
-//! 2. An executor built through the config path (`evm_env` + `context_for_block` →
-//!    `create_executor`) threads that L1 block number into the Arbitrum chain context, so a tx that
-//!    reads the `NUMBER` opcode gets the **L1** block number, not 0 — the Stage B/C deferral fixed.
+//! 1. `evm_env(header)` derives the [`ArbSpecId`] from the ArbOS version embedded in the header,
+//!    and `context_for_block(header)` carries the header's L1 block number.
+//! 2. An executor built through the config path threads that L1 block number into the chain context,
+//!    so a tx that reads `NUMBER` gets the L1 block number (not 0).
 
 use super::*;
 use crate::{ArbBlockExecutorFactory, ArbEvmFactory};
@@ -132,8 +131,7 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
     let block_ctx = config.context_for_block(&header);
     assert_eq!(block_ctx.l1_block_number, L1_BLOCK_NUMBER);
 
-    // Build the EVM + executor exactly as reth's `executor_for_block` default would:
-    // evm_factory().create_evm(db, evm_env) then block_executor_factory().create_executor(evm, ctx).
+    // Build EVM + executor as reth's `executor_for_block` would.
     let factory = ArbBlockExecutorFactory::new(ArbEvmFactory, CHAIN_ID);
     let mut state = State::builder()
         .with_database(funded_db())
@@ -141,13 +139,11 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
         .build();
     let evm = factory.evm_factory().create_evm(&mut state, evm_env);
 
-    // Sanity: the EVM block env carries the L2 number.
-    assert_eq!(evm.block().number, U256::from(L2_BLOCK_NUMBER));
+    assert_eq!(evm.block().number, U256::from(L2_BLOCK_NUMBER)); // block env carries L2 number
 
     let mut executor = factory.create_executor(evm, block_ctx);
-    // NOTE: deliberately do NOT run apply_pre_execution_changes (StartBlock) here — that mutates
-    // ArbOS state and is exercised in block/tests.rs. We only want to prove the NUMBER override
-    // reads the threaded l1_block_number, which `create_executor` set on the chain context.
+    // Skip apply_pre_execution_changes: that mutates ArbOS state and is exercised in block/tests.rs.
+    // This test only proves the NUMBER override reads the l1_block_number set by `create_executor`.
 
     // A type-0x65 unsigned tx that calls the NUMBER_READER contract.
     let tx = ArbTxEnvelope::from(TxUnsigned {
@@ -182,12 +178,9 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
     assert_ne!(returned, U256::ZERO, "must not be the defaulted 0");
 }
 
-/// Stage D validation: a whole block executes through reth's GENERIC high-level executor
-/// (`ConfigureEvm::executor(db).execute(&RecoveredBlock)`), proving our `impl ConfigureEvm` plugs
-/// into reth's block-execution machinery end-to-end — pre-execution changes (StartBlock InternalTx
-/// + EIP-2935) → per-tx execution → `finish` → `BlockExecutionOutput` — driven entirely from the
-/// header (spec + L1 block number decoded via `ArbHeaderInfo`), not the manual per-tx
-/// `execute_transaction` surface that Stage C's `block/tests.rs` covers.
+/// Stage D validation: a whole block executes through reth's generic high-level executor
+/// (`ConfigureEvm::executor(db).execute(&RecoveredBlock)`), proving `impl ConfigureEvm` plugs into
+/// reth's block-execution machinery end-to-end, driven entirely from the header.
 #[test]
 fn block_executes_through_reth_generic_executor() {
     use alloy_consensus::{BlockBody, TxReceipt};
@@ -204,9 +197,8 @@ fn block_executes_through_reth_generic_executor() {
     const XFER1: u128 = 500_000;
 
     let config = ArbEvmConfig::arbitrum_one();
-    let header = arb_header(); // ArbOS v51 + embedded L1 block number
+    let header = arb_header();
 
-    // Fund ALICE + BOB.
     let mut db = CacheDB::new(EmptyDB::default());
     for a in [ALICE, BOB] {
         db.insert_account_info(
@@ -215,7 +207,6 @@ fn block_executes_through_reth_generic_executor() {
         );
     }
 
-    // Two free (gas_fee_cap 0, basefee 0) value transfers: ALICE->BOB, BOB->CAROL.
     let mk = |from, nonce, to, value: u128| {
         ArbTxEnvelope::from(TxUnsigned {
             chain_id: U256::from(CHAIN_ID),
@@ -243,13 +234,10 @@ fn block_executes_through_reth_generic_executor() {
         .execute(&recovered)
         .expect("block executes through reth's generic Executor");
 
-    // One receipt per user tx (the StartBlock InternalTx is a pre-execution change, not a tx).
     assert_eq!(output.result.receipts.len(), 2, "one receipt per user tx");
     assert!(output.result.receipts.iter().all(TxReceipt::status), "both txs must succeed");
     assert!(output.result.gas_used > 0, "block must consume gas");
 
-    // Value actually moved through the full high-level path: CAROL (fresh) is credited XFER1, and
-    // BOB nets +XFER0-XFER1 (transfers are free at basefee 0 / gas_fee_cap 0).
     let balance_of = |addr: &Address| {
         output.state.account(addr).and_then(|a| a.info.as_ref()).map(|i| i.balance).unwrap_or_default()
     };
@@ -261,8 +249,8 @@ fn block_executes_through_reth_generic_executor() {
     );
 }
 
-/// `next_evm_env` derives spec from the next-block attributes' ArbOS version, and `context_for_next_block`
-/// carries the attributes' L1 block number.
+/// `next_evm_env` derives spec from the attributes' ArbOS version; `context_for_next_block` carries
+/// the attributes' L1 block number.
 #[test]
 fn next_block_env_and_ctx_use_attributes() {
     let config = ArbEvmConfig::arbitrum_one();

@@ -1,10 +1,8 @@
-//! D.3 — `ArbPooledTransaction`: Arbitrum pooled tx wrapping `EthPooledTransaction<ArbTxEnvelope>`.
+//! D.3: `ArbPooledTransaction` wraps `EthPooledTransaction<ArbTxEnvelope>`.
 //!
-//! The [`NoopTransactionPool`] rejects all txs, but `NodeBuilder` requires a
-//! [`PoolTransaction`] type that satisfies `EthPoolTransaction<Consensus = ArbTxEnvelope>`.
-//!
-//! Arbitrum does not have separate consensus/pooled tx variants (no blob sidecars),
-//! so `Consensus == Pooled == ArbTxEnvelope` with `TryFromConsensusError = Infallible`.
+//! [`NoopTransactionPool`] rejects all txs, but `NodeBuilder` requires a [`PoolTransaction`]
+//! satisfying `EthPoolTransaction<Consensus = ArbTxEnvelope>`. Arbitrum has no separate
+//! consensus/pooled tx variants, so `Consensus == Pooled == ArbTxEnvelope`.
 
 use core::convert::Infallible;
 
@@ -26,7 +24,7 @@ use reth_transaction_pool::{
 ///
 /// Delegates to the inner [`EthPooledTransaction`] for all Ethereum tx methods.
 /// Arbitrum-specific variants (Deposit, SubmitRetryable, etc.) go through the
-/// same path — the pool is a noop, so these never execute.
+/// same path; the pool is a noop, so these never execute.
 #[derive(Debug, Clone)]
 pub struct ArbPooledTransaction {
     inner: EthPooledTransaction<ArbTxEnvelope>,
@@ -45,29 +43,17 @@ impl From<ArbPooledTransaction> for Recovered<ArbTxEnvelope> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// InMemorySize
-// ---------------------------------------------------------------------------
-
 impl InMemorySize for ArbPooledTransaction {
     fn size(&self) -> usize {
         self.inner.size()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Typed2718
-// ---------------------------------------------------------------------------
-
 impl Typed2718 for ArbPooledTransaction {
     fn ty(&self) -> u8 {
         self.inner.ty()
     }
 }
-
-// ---------------------------------------------------------------------------
-// alloy_consensus::Transaction
-// ---------------------------------------------------------------------------
 
 impl Transaction for ArbPooledTransaction {
     fn chain_id(&self) -> Option<alloy_primitives::ChainId> {
@@ -139,10 +125,6 @@ impl Transaction for ArbPooledTransaction {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PoolTransaction
-// ---------------------------------------------------------------------------
-
 impl PoolTransaction for ArbPooledTransaction {
     type TryFromConsensusError = Infallible;
     type Consensus = ArbTxEnvelope;
@@ -185,10 +167,6 @@ impl PoolTransaction for ArbPooledTransaction {
         self.inner.encoded_length
     }
 }
-
-// ---------------------------------------------------------------------------
-// EthPoolTransaction
-// ---------------------------------------------------------------------------
 
 impl EthPoolTransaction for ArbPooledTransaction {
     fn take_blob(&mut self) -> EthBlobTransactionSidecar {

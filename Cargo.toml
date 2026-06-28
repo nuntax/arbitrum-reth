@@ -2,10 +2,8 @@
 members = ["crates/*"]
 resolver = "2"
 
-# arbitrum-reth — the reth-side of the stack: Arbitrum/ArbOS execution wired into reth's EVM,
-# block-executor and ConfigureEvm extension points (arb-reth-evm), and trustless L1-inbox
-# derivation (arb-reth-derive). The execution engine itself lives in the sibling `arb_revm`
-# workspace (pure revm/ArbOS, no reth deps); this workspace path-depends on it.
+# arbitrum-reth: Arbitrum/ArbOS execution wired into reth. Execution engine lives in the
+# sibling `arb_revm` workspace (no reth deps); this workspace path-depends on it.
 
 [workspace.package]
 authors = ["nun"]

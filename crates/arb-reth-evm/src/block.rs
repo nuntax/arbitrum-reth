@@ -1,20 +1,18 @@
-//! `arb-reth-evm` Stage C — block executor + assembler for Arbitrum.
+//! `arb-reth-evm` Stage C: block executor + assembler for Arbitrum.
 //!
-//! Adapts `arb_revm`'s existing block-execution machinery (`executor::run::execute_message`,
-//! `executor::hooks::ArbStartBlockDerived`) to reth v2.0.0's alloy-evm
+//! Adapts `arb_revm`'s block-execution machinery (`executor::run::execute_message`,
+//! `executor::hooks::ArbStartBlockDerived`) to reth's alloy-evm
 //! [`BlockExecutor`]/[`BlockExecutorFactory`]/[`BlockAssembler`] trait surface, built on the
 //! Stage B [`ArbEvm`](crate::ArbEvm)/[`ArbEvmFactory`](crate::ArbEvmFactory).
 //!
-//! Mirrors `alloy-op-evm`'s `OpBlockExecutor`/`OpBlockExecutorFactory` (the per-tx OP fee
-//! accounting lives in `op_revm`'s handler; ours lives in `arb_revm::handler`). So this layer
-//! does **not** re-implement the ArbOS gas/poster/tip math — it drives [`ArbEvm`] per tx (which
-//! routes through `ArbHandler` inside `transact`), reads the resulting `poster_gas` off the chain
-//! context for the receipt's `gas_used_for_l1`, and builds an [`ArbReceiptEnvelope`].
+//! Mirrors `alloy-op-evm`'s `OpBlockExecutor`/`OpBlockExecutorFactory`. Per-tx ArbOS gas/poster/tip
+//! math lives in `arb_revm::handler`; this layer drives [`ArbEvm`] per tx (routing through
+//! `ArbHandler` inside `transact`), reads `poster_gas` off the chain context for the receipt's
+//! `gas_used_for_l1`, and builds an [`ArbReceiptEnvelope`].
 //!
 //! Pre-execution mirrors `execute_message`'s prelude: the EIP-2935 history-storage parent-hash
-//! system call (ArbOS v40+; a no-op state transition before that) followed by Nitro's
-//! `InternalTxStartBlock` (typed internal tx `0x6a`), built via `arb_revm`'s
-//! [`DefaultArbExecutionHooks`] so the `ArbosActs.startBlock(...)` calldata is identical.
+//! system call (ArbOS v40+; a no-op before that) followed by Nitro's `InternalTxStartBlock`
+//! (typed internal tx `0x6a`), built via `arb_revm`'s [`DefaultArbExecutionHooks`].
 
 use crate::tx::ArbTx;
 use crate::{ArbEvm, ArbEvmFactory};
@@ -52,10 +50,10 @@ use revm::{DatabaseCommit, Inspector, context::result::ExecutionResult};
 
 /// Block-execution context for an Arbitrum block, beyond what the EVM env carries.
 ///
-/// This is the analogue of `OpBlockExecutionCtx`. It provides the inputs the StartBlock prelude
-/// (`InternalTxStartBlock`) and the EIP-2935 parent-hash system call need — values that are not
-/// representable in alloy's [`EvmEnv`](alloy_evm::EvmEnv): the L1 base fee / L1 block number / poster
-/// for this L2 block, and the parent block hash for the history-storage write.
+/// Analogue of `OpBlockExecutionCtx`. Provides the inputs that the StartBlock prelude
+/// (`InternalTxStartBlock`) and the EIP-2935 parent-hash system call need: values not representable
+/// in alloy's [`EvmEnv`](alloy_evm::EvmEnv) such as L1 base fee, L1 block number, poster, and the
+/// parent block hash for the history-storage write.
 ///
 /// Must be [`Clone`] (a [`BlockExecutorFactory`] requirement).
 #[derive(Debug, Default, Clone)]
@@ -64,9 +62,9 @@ pub struct ArbBlockExecutionCtx {
     pub parent_hash: B256,
     /// Parent block extra_data (carried through to the assembled header).
     pub extra_data: Bytes,
-    /// L1 base fee (wei) for this block — the `l1BaseFee` arg of `ArbosActs.startBlock`.
+    /// L1 base fee (wei) for this block (the `l1BaseFee` arg of `ArbosActs.startBlock`).
     pub l1_base_fee_wei: U256,
-    /// L1 block number for this L2 block — the `l1BlockNumber` arg of `ArbosActs.startBlock`,
+    /// L1 block number for this L2 block: the `l1BlockNumber` arg of `ArbosActs.startBlock`,
     /// and the value the EVM `NUMBER` opcode returns during execution.
     pub l1_block_number: u64,
     /// Seconds elapsed since the parent block (`timeLastBlock` arg of `ArbosActs.startBlock`).
@@ -81,23 +79,19 @@ pub struct ArbBlockExecutionCtx {
     /// Shared cell the executor's [`finish`](BlockExecutor::finish) writes the post-execution
     /// [`ArbBlockHeaderInfo`] into, for the [`ArbBlockAssembler`] to read when sealing the header.
     ///
-    /// This is the only channel from the executor to the assembler in reth's block-builder flow:
-    /// [`BasicBlockBuilder`](reth_evm::execute) hands the assembler the *builder's* `ctx`, not the
-    /// executor's EVM. Because `create_executor` is given `ctx.clone()` and `Arc` clones share the
-    /// inner cell, a value the executor stores here is visible to the assembler via its `ctx`.
+    /// This is the only channel from executor to assembler in reth's block-builder flow:
+    /// `BasicBlockBuilder` hands the assembler the builder's `ctx`, not the executor's EVM.
+    /// Because `create_executor` receives `ctx.clone()` and `Arc` clones share the inner cell,
+    /// a value stored here by the executor is visible to the assembler.
     pub header_info_out: Arc<Mutex<Option<ArbBlockHeaderInfo>>>,
 }
 
 /// Result of executing one Arbitrum transaction through the block executor.
-///
-/// Carries the `gas_used_for_l1` (the tx's ArbOS `poster_gas`, read off the chain context after
-/// `transact`), the tx type byte (which selects the [`ArbReceiptEnvelope`] variant), and the
-/// inner revm [`ResultAndState`].
 #[derive(Debug)]
 pub struct ArbTxResult<H> {
     /// Inner revm execution result + state delta.
     pub result: ResultAndState<H>,
-    /// ArbOS L1 poster gas for this tx — the receipt's `gas_used_for_l1`.
+    /// ArbOS L1 poster gas for this tx (the receipt's `gas_used_for_l1`).
     pub gas_used_for_l1: u64,
     /// Consensus tx type byte (selects the receipt envelope variant).
     pub tx_type: u8,
@@ -118,17 +112,11 @@ impl<H: Send + 'static> TxResult for ArbTxResult<H> {
 /// Block executor for Arbitrum. Mirrors `OpBlockExecutor`.
 #[allow(missing_debug_implementations)]
 pub struct ArbBlockExecutor<E, H = DefaultArbExecutionHooks> {
-    /// The EVM (Stage B [`ArbEvm`]) the executor drives, one tx at a time.
     evm: E,
-    /// Block-execution context (StartBlock prelude inputs, parent hash).
     ctx: ArbBlockExecutionCtx,
-    /// `arb_revm` start-block hook set (produces the identical `ArbosActs.startBlock` calldata).
     hooks: H,
-    /// Chain id (for the internal-tx env).
     chain_id: u64,
-    /// Receipts of executed transactions, in order.
     receipts: Vec<ArbReceiptEnvelope<Log>>,
-    /// Cumulative gas used across all executed transactions.
     gas_used: u64,
 }
 
@@ -148,8 +136,8 @@ impl<E, H> ArbBlockExecutor<E, H> {
 
 /// Builds an `ArbReceiptEnvelope<Log>` for a transaction of type `tx_type`.
 ///
-/// The bloom is computed from the logs (so receipt encoding / receipts-root are correct), and the
-/// Arbitrum-specific `gas_used_for_l1` (= the tx's `poster_gas`) is recorded on the receipt body.
+/// Bloom is computed from the logs, and `gas_used_for_l1` (= the tx's `poster_gas`) is recorded
+/// on the receipt body.
 fn build_arb_receipt<H>(
     tx_type: u8,
     result: ExecutionResult<H>,
@@ -209,15 +197,12 @@ where
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         // EIP-2935 / Nitro ProcessParentBlockHash: write the parent block hash into the
-        // history-storage contract under SYSTEM_ADDRESS. On pre-v40 chains where the contract is not
-        // installed this is a no-op state transition (matching `execute_message`). We commit it just
-        // like a system call. This is a pure system call — it has no block transaction or receipt.
+        // history-storage contract under SYSTEM_ADDRESS. On pre-v40 chains this is a no-op state
+        // transition (matching `execute_message`).
         //
-        // Nitro's `InternalTxStartBlock` (0x6a) is NOT run here: it is a real *block transaction*
-        // (the first tx of every L2 block, with its own receipt), so the caller drives it through
-        // `execute_transaction` like any other tx (see `ArbChainDriver::advance` /
-        // `block::build_start_block_tx`). Running it here instead would keep it out of the block's
-        // transactions/receipts roots and diverge the block hash from Nitro.
+        // `InternalTxStartBlock` (0x6a) is NOT run here. It is a real block transaction with its
+        // own receipt; the caller drives it through `execute_transaction` like any other tx. Running
+        // it here would exclude it from the transactions/receipts roots and diverge from Nitro.
         let result = self
             .evm
             .transact_system_call(
@@ -243,8 +228,8 @@ where
             .transact(tx_env)
             .map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
 
-        // The ArbOS handler set `chain().poster_gas` during pre_execution of this tx; it is the
-        // L2-gas equivalent of the L1 poster cost and is exactly the receipt's `gas_used_for_l1`.
+        // `chain().poster_gas` is set by the ArbOS handler during pre_execution; it is the
+        // L2-gas equivalent of the L1 poster cost, recorded as the receipt's `gas_used_for_l1`.
         let gas_used_for_l1 = self.evm.ctx().chain.poster_gas;
 
         Ok(ArbTxResult {
@@ -279,11 +264,10 @@ where
     fn finish(
         mut self,
     ) -> Result<(Self::Evm, BlockExecutionResult<Self::Receipt>), BlockExecutionError> {
-        // Read the post-execution ArbOS header info (send-Merkle root/count, the possibly-upgraded
-        // ArbOS version, the L2 base fee) and hand it to the assembler via the shared ctx cell.
-        // All txs have been committed by now, so the journal loads the committed values straight
-        // from state (it holds the same `&mut State` the commits wrote to). This mirrors what
-        // Nitro's `FinalizeBlock`/`createNewHeader` pull from `arbosState` for the block header.
+        // Read the post-execution ArbOS header info (send-Merkle root/count, ArbOS version, L2
+        // base fee) and write it to the shared ctx cell for the assembler. All txs are committed at
+        // this point, so the journal reads committed values. Mirrors what Nitro's `FinalizeBlock`/
+        // `createNewHeader` pull from `arbosState`.
         let header_info = ArbosState::read_block_header_info(self.evm.ctx_mut().journal_mut())
             .map_err(|e| BlockExecutionError::msg(format!("read ArbOS block header info: {e}")))?;
         if let Ok(mut slot) = self.ctx.header_info_out.lock() {
@@ -320,8 +304,8 @@ where
 }
 
 impl<E, H> ArbBlockExecutor<E, H> {
-    /// Reconstructs the `ArbExecutionInput` the `arb_revm` start-block hook expects, from the EVM
-    /// env + the block-execution ctx. Only the `message` fields the hook reads are meaningful.
+    /// Reconstructs the `ArbExecutionInput` the `arb_revm` start-block hook expects from the EVM
+    /// env and block-execution ctx.
     fn start_block_input(&self, l2_block_number: u64) -> ArbExecutionInput {
         ArbExecutionInput::new(
             ArbParentHeader {
@@ -351,14 +335,12 @@ where
     I: Inspector<ArbContext<DB>>,
     H: ArbExecutionHooks,
 {
-    /// Builds Nitro's `InternalTxStartBlock` (0x6a) for this block — the first transaction of every
+    /// Builds Nitro's `InternalTxStartBlock` (0x6a) for this block: the first transaction of every
     /// L2 block, carrying the `ArbosActs.startBlock(l1BaseFee, l1BlockNumber, l2BlockNumber,
     /// timeLastBlock)` calldata. Returns `None` if the hook yields no prelude.
     ///
-    /// The caller runs this through the normal [`execute_transaction`](reth_evm::execute::BlockBuilder)
-    /// path (NOT in `apply_pre_execution_changes`) so it appears in the block's transactions and
-    /// receipts — matching Nitro, where the start-block tx is a real block transaction with its own
-    /// receipt and contributes to the transactions/receipts roots.
+    /// The caller runs this through `execute_transaction` (not `apply_pre_execution_changes`) so it
+    /// appears in the block's transactions and receipts, matching Nitro.
     pub fn start_block_tx(&self) -> Option<ArbTxEnvelope> {
         let l2_block_number = self.evm.block().number().saturating_to::<u64>();
         let derived = ArbStartBlockDerived {
@@ -372,9 +354,6 @@ where
 }
 
 /// Factory producing [`ArbBlockExecutor`]s. Mirrors `OpBlockExecutorFactory`.
-///
-/// `EvmFactory = ArbEvmFactory`, `Transaction = ArbTxEnvelope`,
-/// `Receipt = ArbReceiptEnvelope<Log>`.
 #[derive(Debug, Clone, Default)]
 pub struct ArbBlockExecutorFactory<H = DefaultArbExecutionHooks> {
     evm_factory: ArbEvmFactory,
@@ -434,18 +413,16 @@ where
         DB: StateDB,
         I: Inspector<ArbContext<DB>>,
     {
-        // Thread the block's L1 block number into the Arbitrum chain context, so the `NUMBER`
-        // opcode (which `arb_revm` overrides to read `chain().l1_block_number`) returns the L1
-        // block number, not 0. This is the Stage B/C deferral (`ArbEvmFactory::build_ctx` defaults
-        // it) now resolved at the executor seam: `ConfigureEvm::context_for_block` populates
-        // `ArbBlockExecutionCtx::l1_block_number` from `ArbHeaderInfo`, and it flows through here.
+        // Thread the L1 block number into the chain context so `NUMBER` (overridden by `arb_revm`
+        // to read `chain().l1_block_number`) returns the correct value. Populated from `ArbHeaderInfo`
+        // by `ConfigureEvm::context_for_block`.
         evm.ctx_mut().chain.l1_block_number = ctx.l1_block_number;
         ArbBlockExecutor::new(evm, ctx, self.hooks.clone(), self.chain_id)
     }
 }
 
 // `ArbTx` must be constructible from a recovered `ArbTxEnvelope` (with and without encoded bytes)
-// for the `BlockExecutor::Transaction = ArbTxEnvelope` wiring — proven by Stage B's `tx.rs`.
+// for the `BlockExecutor::Transaction = ArbTxEnvelope` wiring.
 const _: fn() = || {
     fn assert_from<T: FromRecoveredTx<ArbTxEnvelope> + FromTxWithEncoded<ArbTxEnvelope>>() {}
     assert_from::<ArbTx>();
@@ -453,14 +430,10 @@ const _: fn() = || {
 
 /// Block assembler for Arbitrum. Mirrors `OpBlockAssembler`.
 ///
-/// Builds an [`ArbBlock`](arb_alloy_consensus::ArbBlock)-shaped `Block<ArbTxEnvelope>` from the
-/// execution output: receipts root from the `ArbReceiptEnvelope`s, logs bloom from their logs,
-/// gas used, and the post-execution state root.
-///
-/// Note: Arbitrum header `extra_data` / `mix_hash` carry `send_root` / `l1_block_number` /
-/// `arbos_version` (decoded by `ArbHeaderInfo`); wiring those for byte-identical Nitro header
-/// hashes is Stage D/E. This assembler produces a structurally-correct block with a correct
-/// receipts root.
+/// Builds an [`ArbBlock`](arb_alloy_consensus::ArbBlock)-shaped `Block<ArbTxEnvelope>` from
+/// execution output: receipts root, logs bloom, gas used, and the post-execution state root.
+/// Encodes Arbitrum header metadata (`extra_data` / `mix_hash`) from the post-execution
+/// [`ArbBlockHeaderInfo`] stored in the shared ctx cell.
 #[derive(Debug, Clone, Default)]
 pub struct ArbBlockAssembler;
 
@@ -495,26 +468,24 @@ where
         let receipts_root = proofs::calculate_receipt_root(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
 
-        // Arbitrum header metadata (Nitro `HeaderInfo`): the executor stored the post-execution
-        // send-Merkle root/count + ArbOS version into the shared ctx cell during `finish`. Combine
-        // with the block's L1 block number to encode `extra_data` (= send_root) and `mix_hash`
-        // (= send_count | l1_block_number | arbos_version). Falls back to zeros if unset (e.g. a
-        // non-Arbitrum/genesis probe), which decodes back as a non-Arbitrum header.
+        // Arbitrum header metadata (Nitro `HeaderInfo`): executor stored post-execution
+        // send-Merkle root/count + ArbOS version into the shared ctx cell during `finish`.
+        // Falls back to zeros if unset (e.g. a non-Arbitrum/genesis probe).
         let computed = ctx
             .header_info_out
             .lock()
             .ok()
             .and_then(|guard| *guard)
             .unwrap_or_default();
-        // Delayed-message blocks (coinbase != batch poster) never collect tips, regardless of the
-        // chain-wide setting (Nitro `block_processor.go`); all txs in a block share the coinbase.
+        // Delayed-message blocks (coinbase != batch poster) never collect tips (Nitro
+        // `block_processor.go`); all txs in a block share the coinbase.
         let collect_tips =
             computed.collect_tips && evm_env.block_env.beneficiary() == BATCH_POSTER_ADDRESS;
         let arb_info = ArbHeaderInfo {
             send_root: computed.send_root,
             send_count: computed.send_count,
-            // The L1 block number ArbOS *recorded* for this block (post-state Blockhashes), which
-            // is what Nitro packs into `mix_hash` — not the raw message `l1BlockNumber` in `ctx`.
+            // The L1 block number ArbOS recorded post-execution (what Nitro packs into `mix_hash`),
+            // not the raw message `l1BlockNumber` from `ctx`.
             l1_block_number: computed.l1_block_number,
             arbos_format_version: computed.arbos_version,
             collect_tips,
@@ -529,25 +500,20 @@ where
             receipts_root,
             withdrawals_root: None,
             logs_bloom,
-            // Nitro sets every L2 block's difficulty to 1 (`createNewHeader`).
-            difficulty: U256::from(1u64),
+            difficulty: U256::from(1u64), // Nitro always sets L2 block difficulty to 1.
             number: evm_env.block_env.number().saturating_to(),
             gas_limit: evm_env.block_env.gas_limit(),
             gas_used: *gas_used,
             timestamp,
-            // `mix_hash` carries send_count/l1_block_number/arbos_version; `extra_data` is send_root.
-            mix_hash: arb_info.encode_mix_hash(),
-            // Nitro encodes `delayedMessagesRead` into the header nonce (`EncodeNonce`).
-            nonce: B64::new(ctx.delayed_messages_read.to_be_bytes()),
+            mix_hash: arb_info.encode_mix_hash(), // carries send_count/l1_block_number/arbos_version
+            nonce: B64::new(ctx.delayed_messages_read.to_be_bytes()), // Nitro EncodeNonce
             base_fee_per_gas: Some(evm_env.block_env.basefee()),
             extra_data: arb_info.encode_extra_data(),
             parent_beacon_block_root: None,
             blob_gas_used: None,
             excess_blob_gas: None,
             requests_hash: None,
-            // EIP-7928 (Amsterdam): not used on Arbitrum — set to None.
-            block_access_list_hash: None,
-            // EIP-7928 slot number: not used on Arbitrum — set to None.
+            block_access_list_hash: None, // EIP-7928: not used on Arbitrum
             slot_number: None,
         };
 

@@ -1,21 +1,19 @@
-//! `arb-reth-evm` — bridge `arb_revm` (Arbitrum/ArbOS execution on revm 36) into reth's
-//! EVM and block-execution extension points.
+//! `arb-reth-evm`: bridges `arb_revm` (Arbitrum/ArbOS execution on revm) into reth's EVM and
+//! block-execution extension points.
 //!
-//! **Stage B** of the arb-reth roadmap (see `docs/arb-reth-roadmap.md`): wrap `arb_revm`'s ArbOS
-//! EVM as alloy-evm's [`EvmFactory`] + [`Evm`], so a single Arbitrum transaction can be executed
-//! through the same `create_evm(...).transact_raw(tx)` surface reth drives, with `arb_revm`
+//! Stage B of the arb-reth roadmap (see `docs/arb-reth-roadmap.md`): wraps `arb_revm`'s ArbOS EVM
+//! as alloy-evm's [`EvmFactory`] + [`Evm`], so a single Arbitrum transaction can be executed
+//! through the same `create_evm(...).transact_raw(tx)` surface reth drives, with full `arb_revm`
 //! semantics (ArbOS handler, NUMBER=L1 block number, Arb precompiles).
 //!
-//! Mirrors `alloy-op-evm`'s `OpEvm` / `OpEvmFactory`. The structural difference from op: `arb_revm`
-//! already exposes its EVM as a revm [`ExecuteEvm`]/[`InspectEvm`] impl over a concrete
-//! [`ArbContext`], so this crate is a thin adapter that owns the inner [`ArbRethEvm`] and reconciles
-//! the revm `ExecuteEvm::transact` result (`ExecResultAndState`, which is exactly
-//! [`ResultAndState`]) with the alloy-evm [`Evm`] trait.
+//! Mirrors `alloy-op-evm`'s `OpEvm`/`OpEvmFactory`. `arb_revm` already exposes its EVM as a revm
+//! [`ExecuteEvm`]/[`InspectEvm`] impl over a concrete [`ArbContext`], so this crate is a thin
+//! adapter that owns the inner EVM and reconciles the result with the alloy-evm [`Evm`] trait.
 //!
 //! Stage C (`BlockExecutor`/`BlockAssembler`) and Stage D (`ConfigureEvm`) build on top of this.
 
-// Stage A's reth-primitives-traits surface (NodePrimitives/SignedTransaction/Receipt) is satisfied
-// inside arb-alloy's `reth` feature; force it into the graph so unification stays exercised.
+// arb-alloy's `reth` feature satisfies the reth-primitives-traits surface; pull it into the graph
+// so unification stays exercised.
 use reth_primitives_traits as _;
 
 extern crate alloc;
@@ -56,8 +54,8 @@ use revm::{ExecuteEvm, InspectEvm, Inspector, MainContext, SystemCallEvm};
 
 use arb_revm::ArbSpecId;
 
-/// Concrete `arb_revm` EVM type the bridge owns: the ArbOS EVM (`arb_revm::ArbEvm`) over the
-/// default Arbitrum context [`ArbContext<DB>`] with the Arbitrum precompile set.
+/// The `arb_revm` EVM type the bridge owns: the ArbOS EVM over [`ArbContext<DB>`] with
+/// the Arbitrum precompile set.
 type ArbRethEvm<DB, I> =
     arb_revm::ArbEvm<ArbContext<DB>, I, EthInstructions<EthInterpreter, ArbContext<DB>>, PrecompilesMap>;
 
@@ -65,10 +63,10 @@ type ArbRethEvm<DB, I> =
 /// `EVMError<DBError, InvalidTransaction>`.
 pub type ArbEvmError<DBError> = EVMError<DBError, InvalidTransaction>;
 
-/// Arbitrum EVM — alloy-evm [`Evm`] adapter wrapping `arb_revm`'s ArbOS EVM.
+/// Arbitrum EVM: alloy-evm [`Evm`] adapter wrapping `arb_revm`'s ArbOS EVM.
 ///
-/// `inspect` is tracked here (not in the inner EVM) so that [`Evm::transact_raw`] dispatches to the
-/// inspecting (`inspect_tx`) or plain (`transact`) execution path, exactly like `OpEvm`.
+/// `inspect` is tracked here (not in the inner EVM) so [`Evm::transact_raw`] dispatches to either
+/// the inspecting (`inspect_tx`) or plain (`transact`) path, exactly like `OpEvm`.
 #[allow(missing_debug_implementations)]
 pub struct ArbEvm<DB: Database, I = NoOpInspector> {
     inner: ArbRethEvm<DB, I>,
@@ -129,10 +127,8 @@ where
         &mut self,
         tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        // `ArbTransaction<TxEnv>` is `arb_revm`'s tx env; both `transact` and `inspect_tx` route it
-        // through `ArbHandler` (ArbOS gas charging, poster fee, NUMBER override, Arb precompiles).
-        // revm 36's `ExecuteEvm::transact` returns `ExecResultAndState<ExecutionResult<HaltReason>,
-        // EvmState>`, which is exactly `ResultAndState<HaltReason>`.
+        // Both `transact` and `inspect_tx` route through `ArbHandler` (ArbOS gas charging, poster
+        // fee, NUMBER override, Arb precompiles).
         let inner_tx: ArbTransaction<TxEnv> = tx.0;
         if self.inspect {
             self.inner.inspect_tx(inner_tx)
@@ -178,20 +174,18 @@ where
 
 /// Factory producing [`ArbEvm`]s. Mirrors `OpEvmFactory`.
 ///
-/// The `Spec` is `arb_revm`'s [`ArbSpecId`] (ArbOS-version-keyed, derived from `ArbHeaderInfo` in
-/// Stage D); the precompile set is the Arbitrum one ([`ArbPrecompiles`], version-gated); the tx is
-/// [`ArbTx`].
+/// `Spec` is `arb_revm`'s [`ArbSpecId`] (ArbOS-version-keyed, derived from `ArbHeaderInfo` in
+/// Stage D); precompile set is the Arbitrum one (version-gated); tx type is [`ArbTx`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ArbEvmFactory;
 
 impl ArbEvmFactory {
     /// Builds an [`ArbContext`] for the given database and EVM environment.
     ///
-    /// The ArbOS-specific chain context ([`ArbChainContext`]) is defaulted here. Block-scoped
-    /// inputs that are not representable in alloy's [`EvmEnv`] — notably the L1 block number read
-    /// by the `NUMBER` opcode — are populated from `ArbHeaderInfo` by `ConfigureEvm` in Stage D.
-    /// For Stage B's transact-level proof a default chain context is sufficient (a value transfer
-    /// never reads `NUMBER`).
+    /// The [`ArbChainContext`] is defaulted here. Block-scoped inputs not representable in alloy's
+    /// [`EvmEnv`] (notably the L1 block number read by `NUMBER`) are populated from `ArbHeaderInfo`
+    /// by `ConfigureEvm` in Stage D. A default chain context is sufficient for Stage B's
+    /// transact-level proof (a value transfer never reads `NUMBER`).
     fn build_ctx<DB: Database>(db: DB, evm_env: EvmEnv<ArbSpecId, BlockEnv>) -> ArbContext<DB> {
         Context::mainnet()
             .with_chain(ArbChainContext::default())
@@ -217,10 +211,9 @@ impl EvmFactory for ArbEvmFactory {
         db: DB,
         evm_env: EvmEnv<ArbSpecId, BlockEnv>,
     ) -> Self::Evm<DB, NoOpInspector> {
-        // `create_evm` must return `Evm<DB, NoOpInspector>`, so build with an explicit
-        // `NoOpInspector` (not the `()` default of `build_arb`). Swap the default `ArbPrecompiles`
-        // provider for the reth-required `PrecompilesMap` (ArbOS precompiles re-homed onto
-        // `DynPrecompile`s, eth set selected for the spec) — `ConfigureEvm` requires it.
+        // `create_evm` must return `Evm<DB, NoOpInspector>`, so pass an explicit `NoOpInspector`
+        // rather than the `()` default of `build_arb`. Swap in the `PrecompilesMap` required by
+        // `ConfigureEvm` (ArbOS precompiles re-homed onto `DynPrecompile`s).
         let spec = evm_env.cfg_env.spec;
         let inner = Self::build_ctx(db, evm_env)
             .build_arb_with_inspector(NoOpInspector {})
@@ -242,9 +235,8 @@ impl EvmFactory for ArbEvmFactory {
     }
 }
 
-// `IntoTxEnv` allows `transact(tx)` to accept the bare `ArbTx`; `Default + Clone + Debug` are
-// required by alloy-evm's higher-level bounds. Spell out the bound link so the factory's `Tx`
-// (`ArbTx`) matches the `Evm`'s `Tx`.
+// Verifies that `ArbTx` satisfies `IntoTxEnv<ArbTx> + Default + Clone + Debug` as required by
+// alloy-evm, and that the factory's `Tx` type matches the `Evm`'s.
 const _: fn() = || {
     fn assert_into_tx_env<T: IntoTxEnv<T> + Default + Clone + Debug>() {}
     assert_into_tx_env::<ArbTx>();

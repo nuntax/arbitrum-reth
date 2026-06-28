@@ -6,7 +6,7 @@
 //! usable). The reassembled byte stream is `RLP(payload)`.
 //!
 //! IMPORTANT (verified against the Go source): the two extraction passes are
-//! **interleaved per blob** — for each blob we first emit its 31-byte bodies, then
+//! **interleaved per blob**: for each blob we first emit its 31-byte bodies, then
 //! its spare-bit bytes, then move to the next blob. Doing all bodies first and all
 //! spares second would corrupt any multi-blob batch.
 
@@ -32,7 +32,7 @@ pub type Blob = [u8; BYTES_PER_BLOB];
 /// Errors from [`decode_blobs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobDecodeError {
-    /// The spare-bit accumulator did not drain to zero — corrupt blob.
+    /// The spare-bit accumulator did not drain to zero (corrupt blob).
     SpareBits(u32),
     /// The reassembled stream was not a valid RLP byte string.
     Rlp(&'static str),

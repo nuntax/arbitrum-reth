@@ -1,10 +1,8 @@
-//! D.4 — standalone Arbitrum node launcher.
+//! D.4: standalone Arbitrum node launcher.
 //!
 //! A lightweight driver: given a reth `ProviderFactory` and a feed channel,
 //! creates an [`ArbChainDriver`] and advances the chain one message at a time.
-//!
-//! This is the à-la-carte reth SDK composition: no `NodeBuilder`, no engine API.
-//! See `lib.rs` §"Rationale" for why.
+//! No `NodeBuilder`, no engine API.
 
 use alloy_consensus::Header;
 use arb_alloy_consensus::reth::ArbPrimitives;
@@ -30,15 +28,10 @@ pub async fn run<N: ProviderNodeTypes<Primitives = ArbPrimitives>>(
         driver.advance(&msg, version)?;
     }
 
-    // Defensive flush (should be empty with threshold=1).
-    driver.flush()?;
+    driver.flush()?; // defensive; should be empty with threshold=1
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -51,11 +44,7 @@ mod tests {
     use crate::driver::seed_genesis;
 
     /// D.4 smoke test: a standalone node boots, processes 2 fixture deposits,
-    /// and blocks 1 & 2 are durably persisted.
-    ///
-    /// **Acceptance criteria:** open a fresh factory, send 2 messages through the
-    /// channel, await `run()`, then verify blocks 1 & 2 exist on disk with the
-    /// correct cumulative deposit balance.
+    /// and blocks 1 & 2 are durably persisted with the correct cumulative deposit balance.
     #[tokio::test]
     async fn standalone_node_boots_and_produces_blocks() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(

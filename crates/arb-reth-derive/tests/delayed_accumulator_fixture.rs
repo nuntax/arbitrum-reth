@@ -4,7 +4,7 @@
 //! For a run of consecutive `MessageDelivered` events (Bridge 0x8315177a…), each
 //! message's `keccak256(beforeAcc ‖ messageHash)` must equal the next message's
 //! on-chain `beforeInboxAcc`. If the whole chain links, our `messageHash` byte
-//! layout (`Messages.sol`) is exact — the load-bearing part of delayed decode.
+//! layout (`Messages.sol`) is exact. This is the load-bearing part of delayed decode.
 
 use std::fs;
 

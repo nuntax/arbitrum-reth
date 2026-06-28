@@ -1,33 +1,24 @@
-//! D.2.3 + D.2.4 — `ArbChainDriver`: sequencer feed message → executed, persisted block.
+//! D.2.3 + D.2.4: `ArbChainDriver` turns sequencer feed messages into executed, persisted blocks.
 //!
-//! This is the keystone integration of the Arbitrum reth node: a single call to
-//! [`ArbChainDriver::advance`] turns one [`BroadcastFeedMessage`] into one durably-persisted
-//! Arbitrum block, executed exactly once (no re-execution, no engine API).
+//! A single call to [`ArbChainDriver::advance`] turns one [`BroadcastFeedMessage`] into one
+//! durably-persisted Arbitrum block, executed exactly once (no re-execution, no engine API).
+//! D.2.4 adds in-memory canonical state, batch persistence cadence, `flush()`, and reorg
+//! support via [`NewCanonicalChain::Reorg`].
 //!
-//! D.2.4 adds the in-memory canonical state, batch persistence cadence, explicit `flush()`,
-//! and reorg support via [`NewCanonicalChain::Reorg`].
-//!
-//! # Architecture (Seam A — reth `BlockBuilder` via `ArbEvmConfig`)
+//! # Architecture (reth `BlockBuilder` via `ArbEvmConfig`)
 //!
 //! ```text
 //! feed_msg
-//!   └─ digest_message(msg, parent_tip, cfg, version)   ← Stage E
-//!        └─ ArbExecutionInput
-//!             └─ map to ArbNextBlockEnvAttributes
-//!                  └─ evm_config.builder_for_next_block(db, parent, attrs)
-//!                       └─ builder.apply_pre_execution_changes()  (EIP-2935 + StartBlock tx)
-//!                       └─ for tx in input.message.txs: builder.execute_transaction(tx)
-//!                       └─ builder.finish(state_provider)
-//!                            └─ BlockBuilderOutcome { block, execution_result,
-//!                                                    hashed_state, trie_updates }
-//!                                 └─ build ExecutedBlock → canonical_in_memory.update_chain(Commit)
-//!                                      └─ push to pending_persist
-//!                                           └─ [when threshold reached] flush → save_blocks → commit
-//!                                                └─ canonical_in_memory.remove_persisted_blocks
+//!   └─ digest_message(msg, parent_tip, cfg, version)
+//!        └─ ArbExecutionInput → ArbNextBlockEnvAttributes
+//!             └─ evm_config.builder_for_next_block(db, parent, attrs)
+//!                  └─ builder.apply_pre_execution_changes()  (EIP-2935 + StartBlock tx)
+//!                  └─ for tx in input.message.txs: builder.execute_transaction(tx)
+//!                  └─ builder.finish(state_provider)
+//!                       └─ BlockBuilderOutcome → ExecutedBlock
+//!                            └─ canonical_in_memory.update_chain(Commit)
+//!                            └─ [when threshold reached] flush → save_blocks → commit
 //! ```
-//!
-//! One execution, the correct Nitro shape. Blocks are served from in-memory state immediately
-//! and flushed to MDBX in batches for throughput.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -59,11 +50,9 @@ use reth_provider::{ProviderFactory, SaveBlocksMode};
 use reth_storage_api::BlockExecutionWriter;
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
+use reth_db_api::Database as _; // brings `db_ref().tx()` into scope
+use crate::hashed_db::{HashedExecDb, HashedStateDb};
 use revm_database::BundleState;
-
-// ---------------------------------------------------------------------------
-// ArbChainDriver
-// ---------------------------------------------------------------------------
 
 /// Arbitrum block-production driver.
 ///
@@ -71,16 +60,11 @@ use revm_database::BundleState;
 /// reth node. Each call to [`advance`](ArbChainDriver::advance) executes one sequencer message
 /// exactly once and stages the resulting block for persistence.
 ///
-/// ## D.2.4 — persistence cadence
-///
 /// Blocks are accumulated in memory (served via [`CanonicalInMemoryState`]) and flushed to
 /// MDBX in batches of `persistence_threshold` blocks. Call [`flush`](ArbChainDriver::flush)
-/// explicitly to force a write of all pending blocks. The in-memory state is updated
-/// immediately on each [`advance`] so that recent blocks are queryable without MDBX reads.
+/// explicitly to force a write of all pending blocks.
 ///
-/// ## Reorgs
-///
-/// [`reorg`](ArbChainDriver::reorg) replaces a suffix of the chain — our derivation layer is
+/// [`reorg`](ArbChainDriver::reorg) replaces a suffix of the chain; our derivation layer is
 /// the sole authority on canonical chain ordering via L1 finality.
 pub struct ArbChainDriver<N: ProviderNodeTypes<Primitives = ArbPrimitives>> {
     /// reth provider factory (MDBX + static files).
@@ -93,7 +77,7 @@ pub struct ArbChainDriver<N: ProviderNodeTypes<Primitives = ArbPrimitives>> {
     ///
     /// Seeded from genesis at construction; advanced on each successful [`advance`] call.
     tip: SealedHeader<Header>,
-    /// D.2.4: In-memory canonical state — serves recent blocks without MDBX reads.
+    /// D.2.4: In-memory canonical state; serves recent blocks without MDBX reads.
     canonical_in_memory: CanonicalInMemoryState<ArbPrimitives>,
     /// D.2.4: Number of blocks to accumulate before flushing to MDBX.
     persistence_threshold: u64,
@@ -131,10 +115,9 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
 
     /// Creates a driver that shares an existing [`CanonicalInMemoryState`].
     ///
-    /// Used by the node launcher (D.3b): the `BlockchainProvider` that serves RPC owns a
-    /// `CanonicalInMemoryState`, and the driver must update *that same* instance so freshly
-    /// produced (not-yet-flushed) blocks are visible to `eth_*` queries. Passing the provider's
-    /// state here (instead of letting `new` create a fresh one) is what wires the two together.
+    /// The `BlockchainProvider` that serves RPC owns a `CanonicalInMemoryState`. The driver must
+    /// update that same instance so freshly produced (not-yet-flushed) blocks are visible to
+    /// `eth_*` queries. Passing the provider's state here (instead of a fresh one) wires them.
     pub fn with_canonical_state(
         factory: ProviderFactory<N>,
         chain_id: u64,
@@ -153,28 +136,16 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         }
     }
 
-    // ------------------------------------------------------------------ //
-    // advance — the core loop
-    // ------------------------------------------------------------------ //
-
     /// Execute one sequencer feed message and stage the resulting block for persistence.
     ///
     /// Returns the block hash of the newly-produced block, which becomes the new chain tip.
+    /// The block is added to [`CanonicalInMemoryState`] immediately so it is queryable without
+    /// an MDBX round-trip, and flushed to MDBX when `pending_persist.len() >= persistence_threshold`.
     ///
-    /// The block is added to [`canonical_in_memory`](CanonicalInMemoryState) immediately so
-    /// that it is queryable without an MDBX round-trip. It is queued for persistence and
-    /// flushed to MDBX when `pending_persist.len() >= persistence_threshold`.
-    ///
-    /// # Execution contract
-    /// - Executes the block exactly **once** (no engine re-execution).
-    /// - Pre-execution hook runs `EIP-2935 ProcessParentBlockHash` + Nitro `InternalTxStartBlock`
-    ///   (via `ArbBlockExecutor::apply_pre_execution_changes`), exactly mirroring `execute_message`.
-    /// - Timestamp = `max(l1_timestamp, parent.timestamp)` (Nitro `createNewHeader` rule).
-    /// - Gas limit = `ArbExecCfg::block_gas_limit` default (`1 << 50`); clamped by the assembler.
+    /// Pre-execution runs EIP-2935 `ProcessParentBlockHash` and Nitro `InternalTxStartBlock`
+    /// (exactly mirroring `execute_message`). Timestamp is `max(l1_timestamp, parent.timestamp)`
+    /// per Nitro's `createNewHeader` rule.
     pub fn advance(&mut self, feed_msg: &BroadcastFeedMessage, version: u8) -> eyre::Result<B256> {
-        // ------------------------------------------------------------------ //
-        // 1. Build ArbParentHeader from the current tip.
-        // ------------------------------------------------------------------ //
         let parent_header = self.tip.header();
         let parent = ArbParentHeader {
             number: parent_header.number,
@@ -186,9 +157,6 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             prevrandao: Some(parent_header.mix_hash),
         };
 
-        // ------------------------------------------------------------------ //
-        // 2. Digest the feed message into structured executor input.
-        // ------------------------------------------------------------------ //
         let cfg = ArbExecCfg {
             chain_id: self.chain_id,
             ..ArbExecCfg::default()
@@ -196,10 +164,7 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         let input =
             digest_message(feed_msg, parent, cfg, version).wrap_err("digest_message failed")?;
 
-        // ------------------------------------------------------------------ //
-        // 3. Map ArbExecutionInput → ArbNextBlockEnvAttributes.
-        //    Parity-critical: mirror run.rs::build_block_env.
-        // ------------------------------------------------------------------ //
+        // Map ArbExecutionInput to ArbNextBlockEnvAttributes (mirrors run.rs::build_block_env).
         let next_timestamp = input.message.l1_timestamp.max(parent.timestamp);
         let next_gas_limit = input.cfg.block_gas_limit;
 
@@ -221,61 +186,54 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             withdrawals: None,
         };
 
-        // ------------------------------------------------------------------ //
-        // 4. Open a state provider at the parent tip and wrap it for revm.
-        //
-        //    NOTE: this reads from MDBX, so the parent block MUST have been
-        //    flushed before its child is executed. With batch persistence
-        //    (threshold > 1), the caller must flush after each block (threshold=1)
-        //    or we'd need to serve parent state from CanonicalInMemoryState.
-        // ------------------------------------------------------------------ //
+        // NOTE: parent block must have been flushed to MDBX before its child is executed.
+        // With threshold=1 this is guaranteed; larger thresholds would require serving parent
+        // state from CanonicalInMemoryState instead.
         let parent_number = parent_header.number;
         let state_provider_for_trie = self
             .factory
             .history_by_block_number(parent_number)
             .wrap_err("failed to open parent state provider")?;
 
-        let db_inner = StateProviderDatabase::new(
+        // Execution reads from the HASHED tables (keccak(addr)->HashedAccounts, etc.) so that
+        // a snapshot imported by `arb-snapshot-import` (which has only hashed state, no plain
+        // preimage tables) works correctly. `block_hash` is delegated to a header-aware provider
+        // because headers live in static files, not the MDBX CanonicalHeaders table (EIP-2935).
+        let blocks_db = StateProviderDatabase::new(
             self.factory
                 .history_by_block_number(parent_number)
-                .wrap_err("failed to open parent state provider for EVM")?,
+                .wrap_err("failed to open parent state provider for block hashes")?,
         );
+        let hashed = HashedStateDb::new(
+            self.factory
+                .db_ref()
+                .tx()
+                .wrap_err("failed to open RO tx for hashed execution db")?,
+        );
+        let db_inner = HashedExecDb { state: hashed, blocks: blocks_db };
         let mut state = State::builder()
             .with_database(db_inner)
             .with_bundle_update()
             .build();
 
-        // ------------------------------------------------------------------ //
-        // 5. Create the block builder via ArbEvmConfig (Seam A).
-        // ------------------------------------------------------------------ //
         let mut builder = self
             .evm_config
             .builder_for_next_block(&mut state, &self.tip, attrs)
             .map_err(|e| eyre!("builder_for_next_block: {e:?}"))?;
 
-        // ------------------------------------------------------------------ //
-        // 6. Run pre-execution (EIP-2935 + InternalTxStartBlock).
-        // ------------------------------------------------------------------ //
         builder
             .apply_pre_execution_changes()
             .wrap_err("apply_pre_execution_changes failed")?;
 
-        // ------------------------------------------------------------------ //
-        // 7. Execute each transaction from the digested message, plus any ArbOS
-        //    scheduled retries (auto-redeems) they trigger — mirroring
-        //    `execute_message`'s loop (run.rs). A successful SubmitRetryable or
-        //    `ArbRetryableTx.redeem` emits a `RedeemScheduled` log; ArbOS then runs
-        //    the corresponding redeem tx *within the same block*. These auto-redeem
-        //    txs are real block transactions (own receipt + tx-root entry), so they
-        //    must go through the builder too, or blocks containing retryables/deposits
-        //    diverge from Nitro in gas, state root, and tx/receipt roots.
-        // ------------------------------------------------------------------ //
+        // Execute transactions from the digested message, plus any ArbOS auto-redeems they trigger.
+        // A successful SubmitRetryable or ArbRetryableTx.redeem emits a `RedeemScheduled` log;
+        // ArbOS then runs the redeem tx within the same block. These are real block transactions
+        // with their own receipts, so they must go through the builder or blocks diverge from Nitro.
         let mut queue: VecDeque<ArbTxEnvelope> = input.message.txs.into_iter().collect();
 
-        // Nitro's `InternalTxStartBlock` (0x6a) is the first transaction of every L2 block — a real
-        // block tx with its own receipt (contributes to the transactions/receipts roots). The
-        // executor builds it from this block's start-block inputs; we run it through the normal
-        // execute path ahead of the user txs (EIP-2935 already ran in apply_pre_execution_changes).
+        // Nitro's `InternalTxStartBlock` (0x6a) is the first tx of every L2 block, with its own
+        // receipt contributing to the tx/receipt roots. EIP-2935 already ran in
+        // apply_pre_execution_changes; this tx goes ahead of user txs.
         if let Some(start_block_tx) = builder.executor().start_block_tx() {
             queue.push_front(start_block_tx);
         }
@@ -295,9 +253,8 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
                 })
                 .wrap_err("execute_transaction failed")?;
 
-            // Schedule auto-redeems from this tx's RedeemScheduled logs (only on success,
-            // matching run.rs). Newly-scheduled retries are appended and processed in turn,
-            // so a retry that itself schedules another is handled.
+            // Schedule auto-redeems on success, matching run.rs. Newly-scheduled retries are
+            // appended so a retry that itself schedules another is processed in turn.
             if tx_success {
                 let retries = scheduled_retries_from_redeem_logs(
                     builder.evm_mut().ctx_mut(),
@@ -308,22 +265,14 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             }
         }
 
-        // ------------------------------------------------------------------ //
-        // 8. Finish: assemble the block (state root computed inside finish via
-        //    state_root_with_updates).
-        // ------------------------------------------------------------------ //
         let outcome = builder
             .finish(state_provider_for_trie, None)
             .wrap_err("BlockBuilder::finish failed")?;
 
-        // builder consumed → &mut State borrow released. The EVM's finish()
-        // internally calls merge_transitions(BundleRetention::Reverts) so the
-        // bundle is populated; we recover it here for persistence.
+        // finish() internally calls merge_transitions(BundleRetention::Reverts), populating
+        // the bundle; we recover it here for persistence.
         let bundle = state.take_bundle();
 
-        // ------------------------------------------------------------------ //
-        // 9. Sanity-check the produced block number.
-        // ------------------------------------------------------------------ //
         let block_hash = outcome.block.hash();
         let _state_root = outcome.block.header().state_root;
         let expected_number = parent_number + 1;
@@ -334,9 +283,6 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             ));
         }
 
-        // ------------------------------------------------------------------ //
-        // 10. Build ExecutedBlock from the outcome.
-        // ------------------------------------------------------------------ //
         let recovered_block: RecoveredBlock<ArbBlock> = outcome.block;
         let trie_data = ComputedTrieData::new(
             Arc::new(outcome.hashed_state.into_sorted()),
@@ -359,10 +305,6 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             trie_data,
         );
 
-        // ------------------------------------------------------------------ //
-        // 11. D.2.4: Update in-memory canonical state immediately.
-        //     Blocks are queryable via canonical_in_memory without MDBX reads.
-        // ------------------------------------------------------------------ //
         let new_tip = SealedHeader::new(recovered_block.header().clone(), block_hash);
         self.canonical_in_memory
             .update_chain(NewCanonicalChain::Commit {
@@ -370,13 +312,9 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             });
         self.canonical_in_memory.set_canonical_head(new_tip.clone());
 
-        // ------------------------------------------------------------------ //
-        // 12. D.2.4: Queue for batch persistence.
-        // ------------------------------------------------------------------ //
         self.pending_persist.push(executed);
         self.tip = new_tip;
 
-        // Auto-flush if threshold reached.
         if self.pending_persist.len() as u64 >= self.persistence_threshold {
             self.flush()?;
         }
@@ -384,16 +322,9 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         Ok(block_hash)
     }
 
-    // ------------------------------------------------------------------ //
-    // flush — force-persist all pending blocks to MDBX
-    // ------------------------------------------------------------------ //
-
-    /// Persist all pending blocks to MDBX and update the in-memory state's persisted
-    /// horizon so that persisted blocks can be evicted from the cache.
+    /// Persist all pending blocks to MDBX and advance the in-memory persisted horizon.
     ///
-    /// No-op if there are no pending blocks. After a successful flush the in-memory
-    /// state still holds the recently-persisted blocks (they are evicted only when
-    /// the window grows beyond the persisted horizon).
+    /// No-op if there are no pending blocks.
     pub fn flush(&mut self) -> eyre::Result<()> {
         if self.pending_persist.is_empty() {
             return Ok(());
@@ -415,34 +346,18 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             .wrap_err("flush save_blocks failed")?;
         provider_rw.commit().wrap_err("flush commit failed")?;
 
-        // Tell the in-memory state that blocks up to `last_num` are persisted.
         let persisted = alloy_eips::BlockNumHash::new(last_num, last_hash);
         self.canonical_in_memory.remove_persisted_blocks(persisted);
 
         Ok(())
     }
 
-    // ------------------------------------------------------------------ //
-    // reorg — replace a suffix of the chain
-    // ------------------------------------------------------------------ //
-
     /// Apply a reorg: replace `old_blocks` with `new_blocks`.
     ///
-    /// Our derivation layer is the sole authority on canonical chain ordering
-    /// (enforced by L1 finality). When it detects a fork, it calls this method
-    /// to unwind the old suffix and install the new one.
-    ///
-    /// # Contract
-    /// - `old_blocks` must be contiguous and trace back to a shared ancestor with
-    ///   `new_blocks`.
-    /// - `new_blocks` start from the same ancestor and form the new canonical suffix.
-    /// - Blocks are unwound from MDBX (via `take_block_and_execution_above`) and the
-    ///   new blocks are persisted immediately.
-    /// - The in-memory state is updated via [`NewCanonicalChain::Reorg`].
-    /// - `self.tip` is set to the last block in `new_blocks`.
-    ///
-    /// # Errors
-    /// Returns an error if the unwind or persist operations fail.
+    /// `old_blocks` must be contiguous and share an ancestor with `new_blocks`.
+    /// Unwinds MDBX above the fork point and persists the new suffix.
+    /// The in-memory state is updated via [`NewCanonicalChain::Reorg`] and `self.tip`
+    /// is set to the last block in `new_blocks`.
     pub fn reorg(
         &mut self,
         new_blocks: Vec<ExecutedBlock<ArbPrimitives>>,
@@ -452,7 +367,6 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             return Err(eyre!("reorg: new_blocks must not be empty"));
         }
 
-        // The fork number = the shared ancestor (one before the first new block).
         let fork_number = new_blocks[0]
             .recovered_block()
             .header()
@@ -460,10 +374,8 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
             .checked_sub(1)
             .ok_or_else(|| eyre!("reorg: fork number underflow"))?;
 
-        // Disk unwind: remove everything above the fork, then save new blocks.
-        // Two separate MDBX transactions (mirrors reth's own reorg test at
-        // provider.rs:696-704). Each provider_rw() call opens a fresh write
-        // transaction; we commit before the next to avoid deadlocks.
+        // Two separate MDBX write transactions (mirrors reth's reorg test at
+        // provider.rs:696-704); commit each before opening the next to avoid deadlocks.
         {
             let provider_rw = self
                 .factory
@@ -490,14 +402,12 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
                 .wrap_err("reorg: commit after save failed")?;
         }
 
-        // Update in-memory canonical state.
         self.canonical_in_memory
             .update_chain(NewCanonicalChain::Reorg {
                 new: new_blocks.clone(),
                 old: old_blocks,
             });
 
-        // Update the tracked tip to the last new block.
         let new_tip_header = new_blocks
             .last()
             .unwrap()
@@ -511,10 +421,6 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
 
         Ok(())
     }
-
-    // ------------------------------------------------------------------ //
-    // Accessors
-    // ------------------------------------------------------------------ //
 
     /// Returns the current chain tip (the parent for the next block).
     pub fn tip(&self) -> &SealedHeader<Header> {
@@ -531,10 +437,6 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         self.pending_persist.len()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// Seed genesis block 0 into the factory so static files are contiguous for block 1.
 ///
@@ -575,10 +477,6 @@ pub(crate) fn seed_genesis<N: ProviderNodeTypes<Primitives = ArbPrimitives>>(
     )
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,17 +499,11 @@ mod tests {
 
     use crate::ArbNode;
 
-    /// Default persistence threshold for tests — flush every block.
+    /// Default persistence threshold for tests: flush every block.
     const TEST_THRESHOLD: u64 = 1;
 
-    /// D.2.3 end-to-end test: advance_digests_and_persists_a_block.
-    ///
-    /// Drives the full pipeline:
-    ///   1. Set up an in-memory test factory + genesis.
-    ///   2. Load the `deposit_message_only.json` fixture (a real captured `BroadcastFeedMessage`
-    ///      containing one `ArbitrumDepositTx`).
-    ///   3. `driver.advance(&feed_msg, 0)` — execute the deposit exactly once and persist.
-    ///   4. Reopen a fresh provider and assert structural correctness.
+    /// D.2.3 end-to-end: load the `deposit_message_only.json` fixture, advance once, and
+    /// verify the block is persisted and the deposit recipient has a non-zero balance.
     #[test]
     fn advance_digests_and_persists_a_block() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
@@ -639,20 +531,15 @@ mod tests {
             );
         }
 
-        // Build and run the driver with threshold=1 (flush every block).
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, TEST_THRESHOLD);
         let block_hash = driver.advance(&feed_msg, 0).expect("advance must succeed");
 
-        // After advance with threshold=1, pending should be empty (auto-flushed).
         assert_eq!(
             driver.pending_count(),
             0,
             "pending should be 0 after auto-flush"
         );
 
-        // ------------------------------------------------------------------ //
-        // Verification: reopen a fresh provider from the same factory.
-        // ------------------------------------------------------------------ //
         let provider = factory.provider().expect("fresh provider must open");
 
         let best = provider
@@ -676,7 +563,6 @@ mod tests {
 
         drop(provider);
 
-        // Verify deposit recipient balance is credited.
         let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
         let state = factory.latest().expect("latest state must open");
         let account = state
@@ -692,25 +578,17 @@ mod tests {
                 );
             }
             None => panic!(
-                "deposit recipient {deposit_to} has no account after advance — \
-                 BundleState was not persisted (P0 bug)"
+                "deposit recipient {deposit_to} has no account after advance (BundleState not persisted)"
             ),
         }
     }
 
-    /// Stage G.6 (part A): the assembled header must carry Arbitrum's `HeaderInfo` encoding,
-    /// not a plain Ethereum header. After advancing one message we decode the produced block-1
-    /// header and assert the Arbitrum-specific fields:
-    ///   - `difficulty == 1` (Nitro `createNewHeader`)
-    ///   - `extra_data` is exactly 32 bytes = `send_root`
-    ///   - `mix_hash` decodes to `send_count | l1_block_number | arbos_version`
-    ///   - `nonce == delayedMessagesRead`
+    /// Stage G.6 (part A): the produced block-1 header must carry Arbitrum's `HeaderInfo`
+    /// encoding (`difficulty==1`, `extra_data`==32-byte send_root, `mix_hash` encodes
+    /// `send_count|l1_block_number|arbos_version`, `nonce`==delayedMessagesRead).
     ///
-    /// The test factory boots from an empty (non-ArbOS) genesis, so the post-execution ArbOS
-    /// state is empty: `send_root == 0`, `send_count == 0`, `arbos_version == 0`. The header
-    /// `nonce` must equal the digested message's `delayedMessagesRead` (an exact, plumbed value,
-    /// not faked). Exact `l1_block_number` parity (which comes from post-state Blockhashes and
-    /// requires a real ArbOS genesis) is validated against the live testnode in Stage G.6 part B.
+    /// Boots from an empty (non-ArbOS) genesis so post-execution ArbOS state is zeroed.
+    /// Exact `l1_block_number` parity is validated against the live testnode in part B.
     #[test]
     fn produced_header_carries_arbitrum_header_info() {
         use arb_alloy_consensus::header::ArbHeaderInfo;
@@ -766,34 +644,15 @@ mod tests {
 
     /// Stage G.6: full per-block parity against a real nitro-testnode.
     ///
-    /// Replays a genesis-contiguous sequencer-feed capture (seq 0..17, captured 2026-06-27 from a
-    /// fresh `nitro-testnode` run with `--batchposters 0` so the broadcaster backlog retained seq 0)
-    /// through the actual node pipeline — real ArbOS genesis (built from the same chain config +
-    /// InitialL1BaseFee=167 the testnode used) → `ArbChainDriver::advance` per message → produced
-    /// block — and asserts each produced block's **state root AND hash** equals the testnode's.
+    /// Replays a genesis-contiguous sequencer-feed capture (seq 0..17, 2026-06-27) through the
+    /// actual node pipeline with a real ArbOS genesis (InitialL1BaseFee=167) and asserts each
+    /// produced block's state root AND hash equals the testnode's. Hermetic: vendored fixtures only.
     ///
-    /// This is the end-to-end proof of Stage G.6: state-root parity = execution correctness, and
-    /// hash parity = the Arbitrum header port (difficulty/nonce/extra_data/mix_hash via
-    /// `ArbHeaderInfo` from post-execution ArbOS state). The genesis is independently locked by
-    /// `genesis::testnode_genesis_parity::matches_capture_instance_genesis`.
-    ///
-    /// Hermetic: depends only on vendored fixtures, not a live testnode.
-    ///
-    /// ## FULL parity: every captured block 1..=17 (root AND hash exact)
-    ///
-    /// All 17 blocks match the real testnode **byte-for-byte** (state root and block hash):
-    /// - seq 1..9: L1→L2 deposits + auto-redeemed retryables
-    /// - seq 10..14: sequencer batches deploying the rollup/token-bridge contracts
-    /// - seq 15: the chain owner registering a Stylus CacheManager (`ArbOwner.addWasmCacheManager`)
-    /// - seq 16..17: further sequencer batches
-    ///
-    /// This validates the full pipeline end-to-end: the Arbitrum header port
-    /// (difficulty/nonce/extra_data/mix_hash incl. post-state Blockhashes L1 number + collectTips),
-    /// the InternalTxStartBlock-as-first-block-tx, ArbOS-scheduled auto-redeems, the ArbOwner
-    /// `OwnerActs` event, and ArbOwner's zero-gas (`OwnerPrecompile` `ZeroGas`) accounting.
+    /// Validates the full pipeline: Arbitrum header encoding, InternalTxStartBlock-as-first-tx,
+    /// ArbOS auto-redeems, ArbOwner OwnerActs, and zero-gas OwnerPrecompile accounting.
     #[test]
     fn replay_feed_matches_testnode_per_block() {
-        /// Highest captured block — all of 1..=17 match exactly.
+        /// Highest captured block; all of 1..=17 match exactly.
         const MATCHED_THROUGH: u64 = 17;
 
         use crate::genesis::arb_chain_spec;
@@ -820,7 +679,7 @@ mod tests {
         // Expected testnode blocks, keyed by number.
         let expected: Vec<serde_json::Value> = serde_json::from_str(BLOCKS).unwrap();
 
-        // Genesis (block 0) must already match — guards the parent chain for block 1.
+        // Genesis (block 0) must already match; guards the parent chain for block 1.
         let genesis_tip = {
             let p = factory.provider().unwrap();
             let h = p.sealed_header(0).unwrap().expect("genesis header");
@@ -849,8 +708,7 @@ mod tests {
                 continue;
             }
             let bn = m.sequence_number;
-            // Only the proven contiguous range is asserted; stop once past it (block 15+ depends on
-            // the arb_revm ArbOwner `OwnerActs` gap, after which state diverges and cascades).
+                // Only assert the proven contiguous range; stop past it.
             if bn > MATCHED_THROUGH {
                 break;
             }
@@ -921,12 +779,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------ //
-    // D.2.4 tests
-    // ------------------------------------------------------------------ //
-
-    /// D.2.4: in-memory state is populated after advance and queryable
-    /// before any flush to MDBX.
+    /// D.2.4: in-memory state is queryable immediately after advance, before any MDBX flush.
     #[test]
     fn in_memory_state_available_before_flush() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
@@ -939,8 +792,7 @@ mod tests {
         let json = std::fs::read_to_string(&fixture_path).unwrap();
         let feed_msg: BroadcastFeedMessage = serde_json::from_str(&json).unwrap();
 
-        // Use a high threshold so the block stays in memory.
-        let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, u64::MAX);
+        let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip, u64::MAX); // never auto-flush
 
         let block_hash = driver.advance(&feed_msg, 0).expect("advance must succeed");
         assert_eq!(
@@ -949,7 +801,6 @@ mod tests {
             "block should be pending (not flushed)"
         );
 
-        // In-memory state should be queryable.
         let in_mem = driver.canonical_in_memory();
         let head = in_mem.head_state().expect("head state must exist");
         assert_eq!(head.hash(), block_hash, "in-memory head hash must match");
@@ -958,7 +809,6 @@ mod tests {
         // Canonical block number should be 1.
         assert_eq!(in_mem.get_canonical_block_number(), 1);
 
-        // Now flush and verify the on-disk state.
         driver.flush().expect("flush must succeed");
         assert_eq!(driver.pending_count(), 0);
 
@@ -966,11 +816,8 @@ mod tests {
         assert_eq!(provider.best_block_number().unwrap(), 1);
     }
 
-    /// D.2.4: a simple reorg — replace one block with another at the same height.
-    ///
-    /// Advance a block, then reorg it to a different block at the same height.
-    /// Verifies the in-memory state and tracked tip are updated correctly.
-    /// MDBX-level unwind/persist is deferred (see reorg() doc).
+    /// D.2.4: advance a block, then reorg it to a different block at the same height.
+    /// Verifies in-memory state and tracked tip are updated correctly.
     #[test]
     fn reorg_replaces_block_suffix() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
@@ -983,14 +830,12 @@ mod tests {
         let json = std::fs::read_to_string(&fixture_path).unwrap();
         let feed_msg: BroadcastFeedMessage = serde_json::from_str(&json).unwrap();
 
-        // Advance block 1 (auto-flushed with threshold=1).
         let mut driver = ArbChainDriver::new(factory.clone(), 42161, genesis_tip.clone(), 1);
         let _first_hash = driver
             .advance(&feed_msg, 0)
             .expect("first advance must succeed");
         assert_eq!(driver.pending_count(), 0); // auto-flushed
 
-        // Re-execute from genesis to get a "new" block 1.
         let parent_header = genesis_tip.header();
         let parent = ArbParentHeader {
             number: parent_header.number,
@@ -1069,7 +914,6 @@ mod tests {
             trie_data,
         );
 
-        // Build a minimal old block at height 1 with the first_hash.
         let old_block = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
             header: Header {
                 number: 1,
@@ -1092,12 +936,10 @@ mod tests {
             ComputedTrieData::default(),
         );
 
-        // Perform the reorg (in-memory state + MDBX unwind/save).
         driver
             .reorg(vec![new_executed.clone()], vec![old_executed])
             .expect("reorg must succeed");
 
-        // After reorg, the tip should be the new block.
         assert_eq!(
             driver.tip().hash(),
             new_hash,
@@ -1105,7 +947,6 @@ mod tests {
         );
         assert_eq!(driver.tip().number, 1, "tip number must still be 1");
 
-        // In-memory state should reflect the new block.
         let in_mem = driver.canonical_in_memory();
         let head = in_mem.head_state().unwrap();
         assert_eq!(
@@ -1115,16 +956,8 @@ mod tests {
         );
     }
 
-    /// P0 regression: a 2-block advance must carry state forward.
-    ///
-    /// Block 1 deposits to an account. Block 2 deposits again. After both blocks
-    /// are flushed, the account balance must reflect the cumulative deposits.
-    /// This catches the P0 bug where BundleState was discarded (block 2 would see
-    /// no post-block-1 state and execute against genesis).
-    ///
-    /// **Acceptance:** reverting `state.take_bundle()` in `advance()` must make
-    /// this test FAIL — the mid-chain balance at block 1 would be zero and the
-    /// cumulative balance at block 2 would be only one deposit.
+    /// P0 regression: 2-block advance must carry state forward (block 2 builds on block 1's state).
+    /// Reverting `state.take_bundle()` in `advance()` must make this test fail.
     #[test]
     fn two_block_advance_carries_state_forward() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
@@ -1142,7 +975,6 @@ mod tests {
         let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
         let single_deposit = U256::from(111000000000000000u128);
 
-        // Advance block 1
         let bh1 = driver
             .advance(&feed_msg, 0)
             .expect("block 1 advance must succeed");
@@ -1150,7 +982,7 @@ mod tests {
         assert_eq!(driver.tip().number, 1);
         assert_eq!(driver.tip().hash(), bh1);
 
-        // ---- Mid-chain check: block 1's state, independently read from disk ----
+        // Mid-chain check: block 1's state must be on disk.
         {
             let state_at_1 = factory
                 .history_by_block_number(1)
@@ -1167,7 +999,6 @@ mod tests {
             );
         }
 
-        // Advance block 2 — threshold=1 flushes each block immediately
         let bh2 = driver
             .advance(&feed_msg, 0)
             .expect("block 2 advance must succeed");
@@ -1175,11 +1006,9 @@ mod tests {
         assert_eq!(driver.tip().number, 2);
         assert_eq!(driver.tip().hash(), bh2);
 
-        // Verify both blocks are on disk
         let provider = factory.provider().unwrap();
         assert_eq!(provider.best_block_number().unwrap(), 2);
 
-        // Block 1 header exists
         let h1 = provider.header_by_number(1).unwrap().unwrap();
         let h1_root = h1.state_root;
         assert_eq!(
@@ -1188,7 +1017,6 @@ mod tests {
             "block-1 hash mismatch"
         );
 
-        // Block 2 header exists
         let h2 = provider.header_by_number(2).unwrap().unwrap();
         let h2_root = h2.state_root;
         assert_eq!(
@@ -1202,7 +1030,6 @@ mod tests {
             "state roots of distinct blocks must differ"
         );
 
-        // Cumulative balance: exactly two deposits.
         let expected_cumulative = single_deposit * U256::from(2);
         let state = factory.latest().expect("latest state must open");
         let account = state
@@ -1216,16 +1043,8 @@ mod tests {
         );
     }
 
-    /// D.2.4+ full reorg: disk unwind + persist new suffix.
-    ///
-    /// Advance blocks 1 & 2 (threshold=1, flushed). Then reorg block 2 to a
-    /// different block 2′ at the same height. After reorg:
-    /// - `best_block_number == 2`
-    /// - `header_by_number(2)` hash == 2′ (NOT the old block 2)
-    /// - `header_by_number(1)` exists and is unchanged
-    /// - The old block 2's state is gone, 2′'s state is present
-    ///
-    /// This is verified by reopening a fresh provider from the same factory.
+    /// D.2.4: advance blocks 1 & 2, then reorg block 2 to a different block 2'.
+    /// Verifies disk unwind + persist of new suffix via a fresh provider.
     #[test]
     fn reorg_unwinds_disk() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(MAINNET.clone());
@@ -1249,8 +1068,6 @@ mod tests {
         assert_eq!(driver.tip().number, 2);
         assert_eq!(driver.pending_count(), 0); // auto-flushed
 
-        // Build a new block 1′ (different from the existing block 1) by
-        // re-executing the deposit against genesis.
         let (new_block_1, new_hash) = {
             let p = genesis_tip.header();
             let parent = ArbParentHeader {
@@ -1302,7 +1119,6 @@ mod tests {
             (ex, hash)
         };
 
-        // old block 1 synthetic for in-memory rollback
         let old_synth = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
             header: Header { number: 1, parent_hash: genesis_tip.hash(), ..Default::default() },
             body: Default::default(),
@@ -1317,7 +1133,6 @@ mod tests {
 
         driver.reorg(vec![new_block_1], vec![old_ex]).expect("reorg must succeed");
 
-        // 2: Verify on-disk state from a fresh provider
         let provider = factory.provider().unwrap();
         assert_eq!(provider.best_block_number().unwrap(), 1,
             "best block must be 1");
@@ -1335,10 +1150,76 @@ mod tests {
         assert_eq!(acct.balance, single_deposit,
             "balance after reorg must be one deposit");
 
-        // 3: Old block 2 hash must NOT be on disk
         let p2 = factory.provider().unwrap();
         let h1_again = p2.header_by_number(1).unwrap().unwrap();
         assert_ne!(reth_primitives_traits::SealedHeader::seal_slow(h1_again).hash(),
             old_bh2, "old block 2 hash gone");
+    }
+
+    /// Regression (#54): composite execution DB (HashedStateDb + header-aware block_hash) must
+    /// read identically to the plain StateProvider. Guards against block_hash returning zero from
+    /// the MDBX CanonicalHeaders table (headers live in static files), which corrupted EIP-2935.
+    #[test]
+    fn hashed_exec_db_reads_match_plain() {
+        use crate::genesis::arb_chain_spec;
+        use crate::hashed_db::{HashedExecDb, HashedStateDb};
+        use arb_revm::arbos_init::ArbosInitConfig;
+        use reth_db_api::Database as _;
+        use reth_provider::test_utils::create_test_provider_factory_with_node_types;
+        use reth_storage_api::AccountReader;
+        use revm::database_interface::Database as _;
+        use std::str::FromStr;
+
+        const CHAIN_CONFIG: &[u8] =
+            include_bytes!("../tests/fixtures/testnode_l2_chain_config.json");
+        let init = ArbosInitConfig {
+            initial_arbos_version: 40,
+            initial_chain_owner: address!("5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927"),
+            chain_id: U256::from(412346u64),
+            genesis_block_number: 0,
+            initial_l1_base_fee: U256::from(167u64),
+            serialized_chain_config: CHAIN_CONFIG.to_vec(),
+            debug_precompiles: true,
+        };
+        let spec = Arc::new(arb_chain_spec(&init).expect("spec"));
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(spec);
+        reth_db_common::init::init_genesis(&factory).expect("init genesis");
+
+        let arbos = address!("0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        let version_slot =
+            B256::from_str("0x15fed0451499512d95f3ec5a41c878b9de55f21878b5b4e190d4667ec709b400")
+                .unwrap();
+
+        let plain = factory.latest().unwrap();
+        let p_acct = plain.basic_account(&arbos).unwrap();
+        let p_stor = plain.storage(arbos, version_slot).unwrap();
+        drop(plain);
+
+        let tx = factory.db_ref().tx().unwrap();
+        let mut h = HashedStateDb::new(tx);
+        let h_acct = h.basic(arbos).unwrap();
+        let h_stor = h.storage(arbos, U256::from_be_bytes(version_slot.0)).unwrap();
+
+        let p_acct = p_acct.expect("arbos account (plain)");
+        let h_acct = h_acct.expect("arbos account (hashed)");
+        assert_eq!(h_acct.nonce, p_acct.nonce, "nonce");
+        assert_eq!(h_acct.balance, p_acct.balance, "balance");
+        assert_eq!(h_stor, p_stor.unwrap_or_default(), "version slot");
+
+        let blocks_db = StateProviderDatabase::new(factory.history_by_block_number(0).unwrap());
+        let mut db = HashedExecDb {
+            state: HashedStateDb::new(factory.db_ref().tx().unwrap()),
+            blocks: blocks_db,
+        };
+        let p_bh = factory.latest().unwrap().block_hash(0).unwrap().expect("genesis hash");
+        assert_eq!(db.block_hash(0).unwrap(), p_bh, "composite block_hash(0) must equal genesis hash");
+        assert_ne!(db.block_hash(0).unwrap(), B256::ZERO);
+        // Raw HashedStateDb reads the empty CanonicalHeaders table and returns zero;
+        // the composite DB avoids this by delegating block_hash to the header-aware provider.
+        assert_eq!(
+            HashedStateDb::new(factory.db_ref().tx().unwrap()).block_hash(0).unwrap(),
+            B256::ZERO,
+            "raw HashedStateDb.block_hash reads the empty CanonicalHeaders table"
+        );
     }
 }

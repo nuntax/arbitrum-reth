@@ -5,18 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Stage D.2: the node skeleton. Arbitrum is execute-to-derive — a block's state root
-# only exists *after* execution — so this does NOT use reth's download-then-execute sync
-# pipeline (whose MerkleStage validates a computed root against an already-stored,
-# trustless header). Instead it follows reth's local/payload-block path: produce ->
-# execute -> compute state root over the trie -> seal -> persist via the provider's
-# block-writer (the `ExecutedBlock` / `save_blocks` route the engine uses), Nitro-style.
-#
-# Reuses the validated pieces already in the tree:
-#   - arb_revm::executor::digest_message        (Stage E: feed message -> ArbExecutionInput)
-#   - arb_revm::executor::execute_message        (the STF; returns write-set + receipts data)
-#   - arb-reth-evm: ArbEvmConfig / ArbBlockExecutor / ArbBlockAssembler (Stages C/D.1)
-#   - arb-reth-derive: L1-inbox derivation -> DerivedMessage (Stage F, chain-validated)
+# Stage D.2: the node skeleton. Arbitrum is execute-to-derive (state root only exists after
+# execution), so this does NOT use reth's download-then-execute sync pipeline. It follows
+# reth's payload-block path: produce, execute, compute trie root, seal, persist via
+# save_blocks. Reuses arb_revm STF (Stage E), arb-reth-evm (Stages C/D.1), and
+# arb-reth-derive (Stage F).
 
 [dependencies]
 arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth"] }
@@ -40,7 +33,7 @@ reth-storage-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-primitives-traits = { version = "0.5.0", default-features = false }
 
-# D.2.2: persist primitive — trie, chain-state, execution types, provider write path
+# D.2.2: trie, chain-state, execution types, provider write path
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
@@ -48,12 +41,12 @@ reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224
 revm = { workspace = true }
 revm-database = "41.0.0"
 
-# D.2.3: driver — reth BlockBuilder + revm State<StateProviderDatabase>
+# D.2.3: driver (reth BlockBuilder + revm State<StateProviderDatabase>)
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network" }
 
-# D.3b: NodeBuilder integration — Node<N> + noop components + custom LaunchNode
+# D.3b: NodeBuilder integration (Node<N> + noop components + custom LaunchNode)
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
@@ -61,23 +54,31 @@ reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "
 reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 alloy-rlp = { workspace = true }
 
-# D.3b.2: custom launcher — trie-db changeset cache, reth tasks, reth-db (DatabaseEnv)
+# D.3b.2: custom launcher (trie-db changeset cache, reth tasks, reth-db DatabaseEnv)
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-tasks = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-db = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
-# D.4: standalone launcher — tokio channels
+# H/#52: boot-wiring (static-file Headers segment + stage checkpoints)
+reth-stages-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-static-file-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+# H/#1: launch genesis-acceptance gate (init_genesis_with_settings_and_validate)
+reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+tracing = "0.1"
+
+# D.4: standalone launcher (tokio channels)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
 
-# D.3b.4: bin/arb-reth — CLI entrypoint (clap), reth runtime/ctrl-c harness,
-# tracing, node-core (NodeConfig datadir args + on-disk DB open).
+# D.3b.4: bin/arb-reth (clap CLI, reth runtime/ctrl-c harness, tracing, node-core)
 clap = { version = "4", features = ["derive"] }
 reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
-# D.5: eth_* RPC layer — receipt converter + serve_rpc helper
+# D.5: eth_* RPC layer (receipt converter + serve_rpc helper)
 arb-alloy-network = { path = "../../../arb-alloy/crates/network" }
 arb-alloy-rpc-types = { path = "../../../arb-alloy/crates/rpc-types", features = ["reth-compat"] }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }

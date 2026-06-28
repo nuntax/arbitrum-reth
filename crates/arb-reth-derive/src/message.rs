@@ -27,7 +27,7 @@ pub struct L1IncomingMessageHeader {
     pub l1_base_fee: U256,
 }
 
-/// An L1 incoming message plus its delayed-inbox cursor — the unit a batch
+/// An L1 incoming message plus its delayed-inbox cursor, the unit a batch
 /// decodes into (mirrors Nitro `MessageWithMetadata`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedMessage {

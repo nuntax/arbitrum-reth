@@ -1,10 +1,10 @@
-//! [`ArbTx`] — newtype wrapper around `arb_revm`'s [`ArbTransaction<TxEnv>`] that implements the
+//! [`ArbTx`]: newtype wrapper around `arb_revm`'s [`ArbTransaction<TxEnv>`] implementing the
 //! foreign alloy-evm transaction traits ([`IntoTxEnv`], [`FromRecoveredTx`], [`FromTxWithEncoded`]).
 //!
-//! Mirrors `alloy-op-evm`'s `OpTx`. The orphan rule forces a local newtype: `ArbTransaction<TxEnv>`
-//! lives in `arb_revm` and the alloy-evm traits live in `alloy_evm`, so neither crate can carry the
-//! impls. This wrapper is the seam that lets reth/alloy hand us a recovered Arbitrum consensus tx
-//! and get back the exact revm tx env `arb_revm`'s handler executes.
+//! Mirrors `alloy-op-evm`'s `OpTx`. The orphan rule requires a local newtype: `ArbTransaction<TxEnv>`
+//! lives in `arb_revm` and the traits live in `alloy_evm`, so neither crate can carry the impls.
+//! This wrapper lets reth/alloy hand us a recovered Arbitrum consensus tx and get back the revm tx
+//! env that `arb_revm`'s handler executes.
 
 use alloy_consensus::transaction::Transaction as AlloyTransaction;
 use alloy_eips::eip2718::{Encodable2718, Typed2718};
@@ -57,10 +57,9 @@ impl IntoTxEnv<Self> for ArbTx {
     }
 }
 
-// `revm::context::Transaction` for the newtype: delegate to the inner `ArbTransaction<TxEnv>`, which
-// already implements it (arb_revm `transaction.rs`). Required because `TransactionEnvMut` has
-// `Transaction` as a supertrait, and reth's `ConfigureEvm` bounds the `EvmFactory::Tx` with
-// `TransactionEnvMut`. (Deref does not carry trait impls, so this must be spelled out.)
+// Delegates `revm::context::Transaction` to the inner `ArbTransaction<TxEnv>`. Required because
+// `TransactionEnvMut` has `Transaction` as a supertrait, and reth's `ConfigureEvm` bounds
+// `EvmFactory::Tx: TransactionEnvMut`. Deref does not carry trait impls.
 impl RevmTransaction for ArbTx {
     type AccessListItem<'a> = <ArbTransaction<TxEnv> as RevmTransaction>::AccessListItem<'a>;
     type Authorization<'a> = <ArbTransaction<TxEnv> as RevmTransaction>::Authorization<'a>;
@@ -118,8 +117,8 @@ impl RevmTransaction for ArbTx {
     }
 }
 
-// `TransactionEnvMut` mutators delegate to the inner revm `TxEnv` (`self.0.base`). This satisfies the
-// `ConfigureEvm::BlockExecutorFactory::EvmFactory::Tx: TransactionEnvMut` bound for `ArbTx`.
+// `TransactionEnvMut` mutators delegate to the inner revm `TxEnv` (`self.0.base`), satisfying
+// the `ConfigureEvm::BlockExecutorFactory::EvmFactory::Tx: TransactionEnvMut` bound.
 impl TransactionEnvMut for ArbTx {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.0.base.set_gas_limit(gas_limit);
@@ -134,11 +133,10 @@ impl TransactionEnvMut for ArbTx {
 
 /// Builds the revm tx env for an [`ArbTxEnvelope`] given an already-recovered `caller`.
 ///
-/// This is the recovered-sender analogue of `arb_revm`'s `TryFrom<&ArbTxEnvelope>` adapter: it
-/// reuses the same field lowering but takes the caller from reth (which has already recovered or
-/// otherwise determined the sender), instead of re-running secp256k1 recovery. That also makes it
-/// total — Arbitrum's unsigned/system tx variants (Deposit, Unsigned, Internal, …) have no
-/// recoverable signature but do carry a `from`, which reth supplies here.
+/// Analogous to `arb_revm`'s `TryFrom<&ArbTxEnvelope>`: reuses the same field lowering but takes
+/// the caller from reth rather than re-running secp256k1 recovery. This makes it total: Arbitrum's
+/// unsigned/system tx variants (Deposit, Unsigned, Internal, etc.) carry no recoverable signature
+/// but do carry a `from`, which reth supplies.
 fn arb_tx_from_envelope(tx: &ArbTxEnvelope, caller: Address, encoded: Bytes) -> ArbTx {
     let access_list = tx
         .access_list()

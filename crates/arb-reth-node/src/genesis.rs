@@ -1,23 +1,22 @@
-//! ArbOS genesis chain-spec builder (Stage D.5 / genesis wiring).
+//! ArbOS genesis chain-spec builder.
 //!
 //! Converts an [`arb_revm::arbos_init::ArbosInitConfig`] into a
 //! [`reth_chainspec::ChainSpec`] whose genesis allocation is the trie over the
 //! ArbOS-initialized state (block 0's state root).
 //!
-//! Two additional helpers parse the chain config from the sources that supply
-//! the init parameters:
-//! - [`arbos_init_from_chain_config_json`] — parse an Arbitrum chain-config JSON
-//!   blob (the `ArbChainConfig` Go type, same JSON embedded in the init message).
-//! - [`arbos_init_from_parsed`] — extract from a [`ParsedInitMessage`] that has
-//!   already been decoded from an L1 Initialize message.
+//! Two additional helpers parse the chain config from the sources that supply the init parameters:
+//! - [`arbos_init_from_chain_config_json`]: parse an Arbitrum chain-config JSON blob (the
+//!   `ArbChainConfig` Go type, same JSON embedded in the init message).
+//! - [`arbos_init_from_parsed`]: extract from a [`ParsedInitMessage`] decoded from an L1
+//!   Initialize message.
 //!
 //! # Genesis header
 //!
 //! [`arb_chain_spec`] reproduces Nitro's `arbosState.MakeGenesisBlock` header exactly (London
 //! format, nonce=1, gasLimit=1<<50, baseFee=0.1gwei, difficulty=1, extraData=32 zero bytes,
-//! mixHash encoding the ArbOS version) so both the genesis state root AND the genesis block hash
-//! match the real chain — validated byte-for-byte against the nitro-testnode (block 0 hash
-//! `0xb88471…`, state root `0xff8927…`). The genesis timestamp is currently 0 (testnode);
+//! mixHash encoding the ArbOS version) so both the genesis state root and the genesis block hash
+//! match the real chain. Validated byte-for-byte against the nitro-testnode (block 0 hash
+//! `0xb88471...`, state root `0xff8927...`). The genesis timestamp is currently 0 (testnode);
 //! Arbitrum One uses its Nitro-migration time (see TODO in `arb_chain_spec`).
 
 use std::collections::BTreeMap;
@@ -33,10 +32,6 @@ use reth_chainspec::ChainSpec;
 /// The genesis allocation is produced by running [`arb_genesis_accounts`], which
 /// re-executes the ArbOS init procedure against an empty state to enumerate every
 /// account written to block 0's state trie.
-///
-/// All EVM hard-forks through Prague are activated at genesis so reth derives a
-/// Prague-class execution spec. The genesis header fields (gas_limit, timestamp)
-/// are placeholder values; see the module-level TODO for testnode-parity.
 pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
     let accounts = arb_genesis_accounts(init).map_err(|e| eyre::eyre!(e))?;
 
@@ -56,12 +51,11 @@ pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
         })
         .collect();
 
-    // Arbitrum's geth chain config is LONDON-format: forks activate through london only, with NO
-    // shanghai/cancun/prague (those would make reth add withdrawalsRoot / blob / requests fields to
-    // the genesis header, diverging from Nitro's London-format header). The post-london EVM features
-    // are gated on the ArbOS version (decoded from the header mixHash by `ArbEvmConfig`), not on
-    // these chainspec forks — so a London-only config is both correct for execution and required for
-    // genesis block-hash parity. Mirrors the testnode's `l2_chain_config.json`.
+    // Arbitrum's geth chain config is LONDON-format: forks activate through London only, with no
+    // Shanghai/Cancun/Prague. Adding those forks would cause reth to add withdrawalsRoot/blob/
+    // requests fields to the genesis header, diverging from Nitro's London-format header. Post-London
+    // EVM features are gated on the ArbOS version (decoded from the header mixHash by `ArbEvmConfig`),
+    // not on chain-spec forks. Mirrors the testnode's `l2_chain_config.json`.
     let config = ChainConfig {
         chain_id: init.chain_id.to::<u64>(),
         homestead_block: Some(0),
@@ -79,16 +73,13 @@ pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
         ..Default::default()
     };
 
-    // Genesis header — reproduces Nitro `arbosState.MakeGenesisBlock` exactly so the block hash
-    // matches (validated against the nitro-testnode genesis, 0xb88471…). All values are Nitro
-    // constants except the ArbOS version (encoded into mixHash) and the timestamp.
-    //   - nonce      = 1  (EncodeNonce(1): "the genesis block reads the init message")
-    //   - gasLimit   = l2pricing.GethBlockGasLimit = 1 << 50
-    //   - baseFee    = l2pricing.InitialBaseFeeWei = 0.1 gwei
-    //   - difficulty = 1
-    //   - extraData  = SendRoot = 32 zero bytes at genesis (HeaderInfo.extra())
-    //   - mixHash    = pack(SendCount=0[0:8], L1BlockNumber=0[8:16], ArbOSFormatVersion[16:24])
-    //     (HeaderInfo.mixDigest()); ArbEvmConfig reads the version back out of bytes [16:24].
+    // Genesis header reproduces Nitro `arbosState.MakeGenesisBlock` exactly (validated against
+    // nitro-testnode genesis `0xb88471...`). Nitro constants:
+    //   nonce=1 (EncodeNonce(1): "the genesis block reads the init message")
+    //   gasLimit=l2pricing.GethBlockGasLimit=1<<50, baseFee=l2pricing.InitialBaseFeeWei=0.1gwei
+    //   difficulty=1, extraData=SendRoot=32 zero bytes (HeaderInfo.extra())
+    //   mixHash=pack(SendCount=0[0:8], L1BlockNumber=0[8:16], ArbOSFormatVersion[16:24])
+    //     (HeaderInfo.mixDigest()); ArbEvmConfig reads the version from bytes [16:24].
     // TODO(arb-one): Arbitrum One's genesis timestamp is the Nitro-migration time, not 0.
     let mut mix = [0u8; 32];
     mix[16..24].copy_from_slice(&init.initial_arbos_version.to_be_bytes());
@@ -112,10 +103,9 @@ pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
 
 /// Parse an Arbitrum chain-config JSON blob into an [`ArbosInitConfig`].
 ///
-/// The JSON must be the Go `ChainConfig` format (top-level `"chainId"` +
-/// `"arbitrum"` object) — the same JSON embedded in the ArbOS Initialize message.
-/// The initial L1 base fee defaults to 50 GWei (`DefaultInitialL1BaseFee`); the
-/// serialized chain config is the raw JSON bytes passed in.
+/// The JSON must be the Go `ChainConfig` format (top-level `"chainId"` + `"arbitrum"` object),
+/// the same JSON embedded in the ArbOS Initialize message. The initial L1 base fee defaults to
+/// 50 GWei (`DefaultInitialL1BaseFee`); the serialized chain config is the raw JSON bytes.
 pub fn arbos_init_from_chain_config_json(json: &[u8]) -> eyre::Result<ArbosInitConfig> {
     let cfg: ArbChainConfig = serde_json::from_slice(json)
         .map_err(|e| eyre::eyre!("failed to parse ArbChainConfig JSON: {}", e))?;
@@ -134,8 +124,7 @@ pub fn arbos_init_from_chain_config_json(json: &[u8]) -> eyre::Result<ArbosInitC
 
 /// Build an [`ArbosInitConfig`] from a [`ParsedInitMessage`].
 ///
-/// Requires `parsed.chain_config` to be `Some` (the Initialize message must have
-/// included a chain-config JSON payload).
+/// `parsed.chain_config` must be `Some` (the Initialize message must include a chain-config JSON).
 pub fn arbos_init_from_parsed(p: &ParsedInitMessage) -> eyre::Result<ArbosInitConfig> {
     let cfg = p
         .chain_config
@@ -153,16 +142,12 @@ pub fn arbos_init_from_parsed(p: &ParsedInitMessage) -> eyre::Result<ArbosInitCo
     })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::address;
 
-    /// ArbSys precompile address — 0x0000...0064.
+    /// ArbSys precompile address (0x0000...0064).
     const ARB_SYS: Address = address!("0x0000000000000000000000000000000000000064");
     /// ArbOS state account address (Nitro constant).
     const ARBOS_STATE: Address = address!("0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
@@ -171,7 +156,7 @@ mod tests {
         br#"{"chainId":412346,"arbitrum":{"InitialArbOSVersion":32,"InitialChainOwner":"0x00000000000000000000000000000000000a11ce","GenesisBlockNum":0,"AllowDebugPrecompiles":false}}"#.to_vec()
     }
 
-    /// Round-trip through JSON parse → chain spec, check chain id and key accounts.
+    /// Round-trip through JSON parse to chain spec; check chain id and key accounts.
     #[test]
     fn arb_chain_spec_from_json_has_correct_chain_id() {
         let json = test_chain_config_json();
@@ -215,7 +200,7 @@ mod tests {
         assert!(!storage.is_empty(), "ArbOS state storage must be non-empty");
     }
 
-    /// `arbos_init_from_parsed` with a full ParsedInitMessage.
+    /// `arbos_init_from_parsed` with a full `ParsedInitMessage`.
     #[test]
     fn arbos_init_from_parsed_works() {
         use arb_sequencer_network::init_message::{ArbitrumChainParams, ArbChainConfig, ParsedInitMessage};
@@ -265,25 +250,15 @@ mod testnode_genesis_parity {
     use std::str::FromStr;
 
     /// The nitro-testnode's L2 chain config (ArbOS v40, debug precompiles on), vendored verbatim
-    /// from its `config` docker volume (`l2_chain_config.json`). Its byte content is stored in the
-    /// ArbOS `chainConfig` subspace, so it must match Nitro's exactly for genesis parity.
+    /// from its `config` docker volume (`l2_chain_config.json`). Its byte content is stored in
+    /// the ArbOS `chainConfig` subspace, so it must match Nitro's exactly for genesis parity.
     const TESTNODE_CHAIN_CONFIG: &[u8] =
         include_bytes!("../tests/fixtures/testnode_l2_chain_config.json");
 
-    /// GENESIS PARITY: our ArbOS genesis must reproduce the real nitro-testnode's L2 block-0 state
-    /// root exactly. The expected root was captured from a live nitro-testnode (nitro v3.9.6) via
-    /// `eth_getBlockByNumber("0x0").stateRoot`; the ArbOS storage was additionally verified
-    /// slot-for-slot against the live node (`eth_getStorageAt`, 49/49 match).
-    ///
-    /// This locks in the ArbOS genesis init (Stage G.1/G.2) including the two parity fixes found
-    /// by this very comparison: the v6 firstTime pricing overrides (equilibrationUnits=160e6,
-    /// speedLimit=7e6, perBlockGasLimit=32e6) and the ArbOS-state-account nonce=1. The L2 genesis
-    /// state is exactly the ArbOS accounts (prefunded EOAs in the testnode's `geth_genesis.json`
-    /// belong to the L1 chain; L2 accounts are funded by deposits in later blocks).
-    /// Same as below, but for the 2026-06-27 capture instance used by the per-block replay-parity
+    /// Genesis parity for the 2026-06-27 capture instance used by the per-block replay-parity
     /// test (`driver::tests::replay_feed_matches_testnode_per_block`). That testnode init read a
-    /// live L1 base fee of 167 wei (not 147), giving a different genesis — this locks the genesis
-    /// inputs that the per-block fixtures depend on.
+    /// live L1 base fee of 167 wei (not 147), giving a different genesis than the live-testnode
+    /// fixture below. This test locks the genesis inputs that the per-block fixtures depend on.
     #[test]
     fn matches_capture_instance_genesis() {
         let init = ArbosInitConfig {
@@ -326,9 +301,8 @@ mod testnode_genesis_parity {
             "0xff8927407d6cd2703a5e65285970bd4da3b3b20b48861a62583a159795dc37bf",
             "ArbOS genesis state root must match the real nitro-testnode L2 block 0"
         );
-        // Full block-hash parity: the genesis header (London format, nonce=1, gasLimit=1<<50,
-        // baseFee=0.1gwei, difficulty=1, extraData=32 zeros, mixHash encoding ArbOS v40) must hash
-        // to the testnode's actual block-0 hash.
+        // Full block-hash parity: London format, nonce=1, gasLimit=1<<50, baseFee=0.1gwei,
+        // difficulty=1, extraData=32 zeros, mixHash encoding ArbOS v40.
         let hash = spec.genesis_hash();
         assert_eq!(
             format!("{hash:#x}"),

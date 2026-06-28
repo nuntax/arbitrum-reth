@@ -1,4 +1,4 @@
-//! D.3 — `ArbExecutorBuilder`: plugs `ArbEvmConfig` into reth's `ExecutorBuilder` trait.
+//! D.3: `ArbExecutorBuilder` plugs `ArbEvmConfig` into reth's `ExecutorBuilder` trait.
 
 use arb_reth_evm::ArbEvmConfig;
 use reth_node_builder::BuilderContext;

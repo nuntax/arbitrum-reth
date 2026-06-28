@@ -26,12 +26,12 @@ pub struct DelayedMessage {
     pub inbox_seq_num: u64,
     pub base_fee_l1: U256,
     pub data: Vec<u8>,
-    /// The inbox accumulator *before* this message — for chain verification.
+    /// The inbox accumulator *before* this message, used for chain verification.
     pub before_inbox_acc: B256,
 }
 
 impl DelayedMessage {
-    /// `keccak256(data)` — must equal the event's `messageDataHash`.
+    /// `keccak256(data)`. Must equal the event's `messageDataHash`.
     pub fn message_data_hash(&self) -> B256 {
         keccak256(&self.data)
     }
@@ -113,7 +113,7 @@ pub trait DelayedSource {
     fn message(&self, index: u64) -> Option<&DelayedMessage>;
 }
 
-/// Empty source — sequencer-only batches never query it.
+/// Empty source; sequencer-only batches never query it.
 pub struct NoDelayed;
 
 impl DelayedSource for NoDelayed {

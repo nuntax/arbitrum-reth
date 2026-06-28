@@ -1,4 +1,4 @@
-//! arb-reth-node — the Arbitrum node skeleton (Stage D.2).
+//! arb-reth-node: the Arbitrum node skeleton (Stage D.2).
 //!
 //! # Why this is not a reth sync `Stage`
 //!
@@ -8,22 +8,22 @@
 //! check a header you *downloaded* from a peer.
 //!
 //! An Arbitrum node has no such header. It is **execute-to-derive**: a sequencer message is the
-//! input, and the block — including its state root — is the *output* of executing that message.
+//! input, and the block (including its state root) is the *output* of executing that message.
 //! We mint it. So we follow the path reth uses for locally-produced (payload/engine) blocks:
-//! produce → execute → compute the state root → seal the header → persist the executed block
+//! produce, execute, compute the state root, seal the header, persist the executed block
 //! via the provider's block-writer (`save_blocks` / `ExecutedBlock`).
 //!
-//! # D.2.1 — `NodeTypes` + `ProviderFactory` smoke test
+//! # D.2.1: `NodeTypes` + `ProviderFactory` smoke test
 //!
 //! This increment wires `ArbNode : NodeTypes` so that a reth `ProviderFactory` can stand up
 //! over a temp-MDBX database. The four associated types are:
 //!
-//! - `Primitives = ArbPrimitives` — Arbitrum tx/receipt/block types from arb-alloy.
-//! - `ChainSpec  = reth_chainspec::ChainSpec` — reth's stock chain spec (satisfies
+//! - `Primitives = ArbPrimitives`: Arbitrum tx/receipt/block types from arb-alloy.
+//! - `ChainSpec  = reth_chainspec::ChainSpec`: reth's stock chain spec (satisfies
 //!   `EthChainSpec<Header = alloy_consensus::Header>`).
-//! - `Storage    = EthStorage<ArbTxEnvelope>` — reth's generic body storage, parameterised
+//! - `Storage    = EthStorage<ArbTxEnvelope>`: reth's generic body storage, parameterised
 //!   for Arbitrum transactions.
-//! - `Payload    = ArbPayloadTypes` — a minimal stub that satisfies the `PayloadTypes` bound;
+//! - `Payload    = ArbPayloadTypes`: a minimal stub that satisfies the `PayloadTypes` bound;
 //!   the execute-once driver never builds engine payloads.
 
 extern crate alloc;
@@ -32,6 +32,9 @@ use alloc::sync::Arc;
 
 pub mod genesis;
 pub use genesis::{arb_chain_spec, arbos_init_from_chain_config_json, arbos_init_from_parsed};
+
+pub mod hashed_db;
+pub use hashed_db::{HashedStateDb, account_by_address, code_of, storage_at};
 
 pub mod persist;
 pub use persist::persist_executed_block;
@@ -75,17 +78,9 @@ use arb_alloy_consensus::{
 /// Arbitrum One mainnet chain id.
 pub const ARB_ONE_CHAIN_ID: u64 = 42161;
 
-// ---------------------------------------------------------------------------
-// ArbBuiltPayload
-//
-// D.2.1: unused payload type — exists solely to satisfy NodeTypes::Payload;
-// the execute-once driver never builds engine payloads.
-// ---------------------------------------------------------------------------
-
 /// A minimal built-payload stub for Arbitrum.
 ///
-/// D.2.1: unused payload type — exists solely to satisfy `NodeTypes::Payload`.
-/// The execute-once driver never builds engine payloads.
+/// Exists solely to satisfy `NodeTypes::Payload`; the execute-once driver never builds engine payloads.
 #[derive(Debug, Clone)]
 pub struct ArbBuiltPayload {
     block: Arc<RecoveredBlock<ArbBlock>>,
@@ -115,23 +110,15 @@ impl BuiltPayload for ArbBuiltPayload {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ArbExecutionData
-//
-// The ExecutionData type used in ArbPayloadTypes. Wraps alloy's ExecutionData
-// so that From<ArbBuiltPayload> can be implemented (orphan rule: we own
-// ArbBuiltPayload and ArbExecutionData, so the From impl is allowed).
-// ---------------------------------------------------------------------------
-
 /// Thin wrapper around [`ExecutionData`] for Arbitrum.
 ///
-/// D.2.1: unused payload type — exists solely to satisfy `NodeTypes::Payload`.
+/// Wraps alloy's `ExecutionData` so that `From<ArbBuiltPayload>` can be implemented (orphan rule:
+/// we own both types). Exists solely to satisfy `NodeTypes::Payload`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ArbExecutionData(pub ExecutionData);
 
 impl From<ArbBuiltPayload> for ArbExecutionData {
     fn from(payload: ArbBuiltPayload) -> Self {
-        // Use the already-computed sealed hash to avoid re-hashing.
         let block_hash = payload.block.hash();
         let block = Arc::unwrap_or_clone(payload.block).into_block();
         let (execution_payload, sidecar) =
@@ -190,13 +177,7 @@ impl ExecutionPayload for ArbExecutionData {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ArbPayloadAttributes — a minimal payload-attributes stub
-// ---------------------------------------------------------------------------
-
-/// Minimal payload-attributes stub.
-///
-/// D.2.1: unused payload type — exists solely to satisfy `NodeTypes::Payload`.
+/// Minimal payload-attributes stub. Exists solely to satisfy `NodeTypes::Payload`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ArbPayloadAttributes {
     /// Timestamp (required by `PayloadAttributes`).
@@ -236,14 +217,7 @@ impl PayloadAttributes for ArbPayloadAttributes {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ArbPayloadTypes
-// ---------------------------------------------------------------------------
-
-/// Payload-types stub for [`ArbNode`].
-///
-/// D.2.1: unused payload type — exists solely to satisfy `NodeTypes::Payload`;
-/// the execute-once driver never builds engine payloads.
+/// Payload-types stub for [`ArbNode`]. Exists solely to satisfy `NodeTypes::Payload`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ArbPayloadTypes;
 
@@ -267,11 +241,7 @@ impl PayloadTypes for ArbPayloadTypes {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ArbNode
-// ---------------------------------------------------------------------------
-
-/// Arbitrum node type — wires Arbitrum primitives into reth's `NodeTypes` surface.
+/// Arbitrum node type. Wires Arbitrum primitives into reth's `NodeTypes` surface.
 ///
 /// This struct is stateless; it exists only as a type-level tag so that reth's
 /// generic provider infrastructure can be instantiated for Arbitrum.
@@ -279,45 +249,25 @@ impl PayloadTypes for ArbPayloadTypes {
 pub struct ArbNode;
 
 impl NodeTypes for ArbNode {
-    /// Arbitrum block/tx/receipt primitive types from arb-alloy.
     type Primitives = ArbPrimitives;
-
-    /// reth's stock `ChainSpec` — satisfies `EthChainSpec<Header = alloy_consensus::Header>`.
     type ChainSpec = reth_chainspec::ChainSpec;
-
-    /// Generic Ethereum body storage parameterised for Arbitrum transactions.
     type Storage = EthStorage<ArbTxEnvelope, Header>;
-
-    /// Minimal payload-types stub.  The execute-once driver never builds engine payloads;
-    /// this type exists solely to satisfy the `NodeTypes::Payload` bound.
     type Payload = ArbPayloadTypes;
 }
 
-// ---------------------------------------------------------------------------
-// ArbNetworkPrimitives — NetworkPrimitives for Arbitrum (for the noop network builder)
-// ---------------------------------------------------------------------------
-
-/// Network primitives for Arbitrum — used by the noop network builder.
+/// Network primitives for Arbitrum, used by the noop network builder.
 ///
-/// `BroadcastedTransaction = ArbTxEnvelope`; `PooledTransaction = ArbTxEnvelope`
-/// (the noop network never serves pooled txs — Arbitrum has no p2p tx gossip).
+/// Both `BroadcastedTransaction` and `PooledTransaction` are `ArbTxEnvelope`;
+/// the noop network never serves pooled txs (Arbitrum has no p2p tx gossip).
 pub type ArbNetworkPrimitives =
     reth_eth_wire_types::BasicNetworkPrimitives<ArbPrimitives, ArbTxEnvelope>;
 
-// ---------------------------------------------------------------------------
-// impl Node<N> for ArbNode — D.3b NodeBuilder integration.
-//
-// This is required so `builder.node(ArbNode)` produces the
-// `NodeBuilderWithComponents` our custom `ArbLauncher` (a `LaunchNode`) consumes.
-// The components are NOOP except the executor: Arbitrum is an execute-to-derive
-// producer (no tx gossip, no p2p, no fork-choice engine), so pool/network/
-// consensus/payload are noop stand-ins and `ArbExecutorBuilder` supplies the
-// ArbOS `ConfigureEvm`. The actual block production is NOT reth's engine — our
-// `ArbLauncher` reuses reth's `LaunchContext` for DB/provider/blockchain-db/tasks
-// but skips the engine pipeline/orchestrator and spawns `ArbChainDriver` instead,
-// standing up `eth_*` RPC manually (so `AddOns = ()` — no engine-coupled
-// `RpcAddOns`). See `launcher.rs` (D.3b) and `docs/stage-d2-handoff.md` §12.
-// ---------------------------------------------------------------------------
+// impl Node<N> for ArbNode: required so `builder.node(ArbNode)` produces the
+// `NodeBuilderWithComponents` our `ArbLauncher` consumes. All components are noop
+// except the executor (Arbitrum has no tx gossip, p2p, or fork-choice engine).
+// `ArbLauncher` reuses reth's `LaunchContext` for DB/provider/tasks but skips the
+// engine pipeline and spawns `ArbChainDriver` directly; AddOns = () (no engine-coupled
+// RpcAddOns). See `launcher.rs` and `docs/stage-d2-handoff.md` §12.
 
 use reth_node_builder::components::{
     ComponentsBuilder, NoopConsensusBuilder, NoopNetworkBuilder, NoopPayloadBuilder,
@@ -353,20 +303,12 @@ where
     fn add_ons(&self) -> Self::AddOns {}
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use reth_chainspec::MAINNET;
 
-    /// D.2.1 smoke test: verify that a reth `ProviderFactory` can be instantiated for
-    /// `ArbNode` (MDBX + static files + RocksDB under a temp directory).
-    ///
-    /// A full genesis write is deferred to D.2.3; for now we just assert the factory
-    /// opens cleanly and a provider can be obtained.
+    /// Smoke test: verify that a reth `ProviderFactory` can be instantiated for `ArbNode`.
     #[test]
     fn provider_factory_stands_up() {
         let chain_spec = MAINNET.clone();
@@ -374,9 +316,7 @@ mod tests {
             reth_provider::test_utils::create_test_provider_factory_with_node_types::<ArbNode>(
                 chain_spec,
             );
-        // Obtain a read-only provider — proves the whole NodeTypes stack is wired correctly.
         let provider = factory.provider().expect("provider should open");
-        // A fresh DB has no blocks, so this should return 0 (genesis block number).
         use reth_provider::BlockNumReader;
         let best = provider.best_block_number().expect("best_block_number should succeed");
         assert_eq!(best, 0, "fresh DB should have block 0 as best");

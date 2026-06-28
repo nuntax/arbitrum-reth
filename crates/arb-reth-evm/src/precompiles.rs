@@ -3,7 +3,7 @@
 //! reth v2.0.0's `ConfigureEvm` requires `EvmFactory<…, Precompiles = PrecompilesMap, …>`.
 //! `PrecompilesMap` dispatches each precompile through a [`DynPrecompile`] closure that receives a
 //! [`PrecompileInput`] (carrying an `EvmInternals` state handle), NOT a revm `Context`. We bridge
-//! to `arb_revm`'s precompiles — unchanged, parity-validated — via `ArbPrecompilesEnum::run_dispatch`
+//! to `arb_revm`'s precompiles (unchanged, parity-validated) via `ArbPrecompilesEnum::run_dispatch`
 //! over an [`ArbNodeCtx`] (see `arb_revm::arb_journal`). One `DynPrecompile` per ArbOS precompile
 //! address is layered over the spec's eth precompile set.
 
@@ -15,7 +15,7 @@ use revm::interpreter::{InstructionResult, InterpreterResult};
 use revm::precompile::{PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult};
 
 /// Builds the Arbitrum [`PrecompilesMap`] for an ArbOS version: the spec's eth precompile set
-/// (Cancun+P256 below ArbOS 50, Osaka at/after — same selection as the in-EVM path) with the 16
+/// (Cancun+P256 below ArbOS 50, Osaka at/after; same selection as the in-EVM path) with the 16
 /// ArbOS precompile addresses layered on top as stateful [`DynPrecompile`]s.
 pub fn arb_precompiles_map(spec: ArbSpecId) -> PrecompilesMap {
     let mut map = PrecompilesMap::from_static(arb_eth_precompiles(spec));
@@ -56,7 +56,7 @@ fn arb_node_call(arb: ArbPrecompilesEnum, input: PrecompileInput<'_>) -> Precomp
         is_static,
     };
     // `PrecompileInput` carries no EVM call depth; default to top-level. Only `ArbSys.isTopLevelCall`
-    // observes this, and it is a rare path — documented best-effort on the node path.
+    // observes this (a rare path), so this is best-effort on the node path.
     let mut ctx = ArbNodeCtx::new(&mut internals, 1);
     to_precompile_result(arb.run_dispatch(&mut ctx, &call), reservoir)
 }

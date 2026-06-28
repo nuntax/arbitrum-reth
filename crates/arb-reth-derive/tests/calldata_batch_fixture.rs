@@ -6,11 +6,11 @@
 //! The 40-byte timeBounds header is NOT embedded in the calldata bytes; it comes
 //! from the `SequencerBatchDelivered` L1 event. `SerializeSequencerInboxBatch` in
 //! `nitro/arbnode/sequencer_inbox.go` prepends the header before passing to
-//! `ParseSequencerMessage` — we do the same here.
+//! `ParseSequencerMessage`; we do the same here.
 //!
 //! # Fixture layout
-//! - `arb1_calldata_batch_497980_meta.json`  — event fields + expected counts
-//! - `arb1_calldata_batch_497980_payload.bin` — raw calldata `data` bytes
+//! - `arb1_calldata_batch_497980_meta.json`: event fields + expected counts
+//! - `arb1_calldata_batch_497980_payload.bin`: raw calldata `data` bytes
 //!   (98 844 bytes; byte 0 = 0x00 BROTLI flag; bytes 1.. = brotli-compressed segments)
 //!
 //! # Chain verification (Arbitrum One, 2026-06-26)

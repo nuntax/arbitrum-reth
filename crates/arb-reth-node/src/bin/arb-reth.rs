@@ -1,8 +1,8 @@
-//! `arb-reth` — runnable entrypoint for the no-engine Arbitrum node (D.3b.4).
+//! `arb-reth`: runnable entrypoint for the no-engine Arbitrum node (D.3b.4).
 //!
 //! This wires the CLI to the [`ArbLauncher`] custom `LaunchNode` (D.3b): it opens
 //! an on-disk MDBX database under the data directory, boots reth's `LaunchContext`
-//! provider/blockchain-db stack (NO engine — see `launcher.rs`), spawns the
+//! provider/blockchain-db stack (no engine; see `launcher.rs`), spawns the
 //! `ArbChainDriver` block producer, and optionally serves the `eth_*` JSON-RPC API.
 //!
 //! ## What this is (and isn't) yet
@@ -41,10 +41,8 @@ use reth_node_core::{
 use reth_tracing::tracing::info;
 use reth_tracing::{RethTracer, Tracer};
 
-/// Stack-probe shim for x86_64. wasmer's vm crate (pulled in transitively via
-/// arb_revm's Stylus support) references the LLVM `__rust_probestack` intrinsic
-/// that recent `compiler-builtins` no longer exports; defining an empty function
-/// here satisfies the linker. No-op on aarch64.
+/// Stack-probe shim for x86_64: wasmer references `__rust_probestack` which recent
+/// `compiler-builtins` no longer exports; this satisfies the linker. No-op on aarch64.
 ///
 /// # Safety
 ///
@@ -53,7 +51,7 @@ use reth_tracing::{RethTracer, Tracer};
 #[no_mangle]
 pub unsafe extern "C" fn __rust_probestack() {}
 
-/// `arb-reth` — standalone no-engine Arbitrum (ArbOS-on-reth) node.
+/// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
 #[derive(Debug, Parser)]
 #[command(name = "arb-reth", about = "Standalone no-engine Arbitrum (ArbOS-on-reth) node")]
 struct Args {
@@ -93,7 +91,7 @@ struct Args {
     /// processes them, then the node stays alive for RPC inspection.
     ///
     /// Sender lifecycle: after pushing all messages the original sender is kept alive
-    /// (not dropped) so the driver does NOT exit — the node serves RPC until SIGTERM.
+    /// (not dropped) so the driver does NOT exit; the node serves RPC until SIGTERM.
     /// This lets you replay a finite file and then query the produced blocks.
     #[arg(long = "replay-feed", value_name = "PATH")]
     replay_feed: Option<PathBuf>,
@@ -109,8 +107,6 @@ fn main() -> eyre::Result<()> {
 
     let args = Args::parse();
 
-    // reth's runtime + ctrl-c harness: runs `run(..)` until it resolves or the
-    // process receives SIGINT/SIGTERM, then drives spawned tasks to shutdown.
     let runner = CliRunner::try_default_runtime()?;
     runner.run_command_until_exit(|ctx| run(ctx, args))
 }
@@ -118,13 +114,8 @@ fn main() -> eyre::Result<()> {
 async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
 
-    // Chain spec — either a real ArbOS genesis (from --chain) or the mainnet
-    // placeholder. The block driver uses the chain id for execution; the chain spec's
-    // primary role here is the genesis allocation and fork schedule.
-    //
-    // When --chain is provided the chain id is derived from the chain config JSON so
-    // that eth_chainId and the driver both see the same value. The --chain-id CLI arg
-    // is used only when --chain is not given.
+    // When --chain is provided the chain id is derived from the JSON so eth_chainId and the
+    // driver agree. When not provided, the mainnet placeholder is used with --chain-id.
     let (chain_spec, effective_chain_id) = match &args.chain_config {
         Some(path) => {
             let json = fs::read(path)
@@ -143,7 +134,6 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
         None => (MAINNET.clone(), args.chain_id),
     };
 
-    // Resolve the data directory and node config.
     let datadir_args = match args.datadir {
         Some(path) => {
             DatadirArgs { datadir: MaybePlatformPath::<DataDirPath>::from(path), ..Default::default() }
@@ -153,17 +143,13 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     let config = NodeConfig::new(chain_spec).with_datadir_args(datadir_args);
     let data_dir = config.datadir();
 
-    // Open the on-disk MDBX database (same recipe as reth's `node` command).
     let db_path = data_dir.db();
     info!(target: "arb-reth", path = ?db_path, "opening database");
     let db = init_db(db_path, DatabaseArguments::new(ClientVersion::default()))?;
 
-    // Build the `NodeBuilderWithComponents` our custom launcher consumes.
     let node_builder = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
-    // Sequencer-feed channel. The held sender keeps the driver parked (and the
-    // node alive) until SIGTERM. When --replay-feed is set we push all messages
-    // via a spawned task and then keep the sender alive for RPC inspection.
+    // The held sender keeps the driver parked (and the node alive) until SIGTERM.
     let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<(BroadcastFeedMessage, u8)>(4096);
 
     let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
@@ -183,12 +169,6 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
         None => info!(target: "arb-reth", "arb-reth node started (RPC disabled; pass --http to enable)"),
     }
 
-    // Replay-feed: push all messages from the NDJSON file via a spawned task,
-    // then keep the sender alive so the driver does not exit after draining.
-    //
-    // Sender lifecycle choice: we KEEP the feed_tx alive (held by the async block
-    // below) so the node stays up for RPC queries after all messages are pushed.
-    // Users can then `curl` the produced blocks and shut down with SIGTERM.
     if let Some(feed_path) = args.replay_feed {
         let tx = feed_tx.clone();
         let version = args.replay_version;
@@ -233,16 +213,12 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
                 }
             }
             info!(target: "arb-reth", pushed, "replay-feed push complete; node remains up for RPC");
-            // `tx` (clone) is dropped here; the original feed_tx below keeps the channel open.
+            // tx (clone) is dropped here; the original feed_tx below keeps the channel open.
         });
     }
 
-    // Keep the feed sender alive across the await so the driver task parks on the
-    // channel instead of flushing and exiting immediately. Stage F will hand this
-    // sender to the derivation pipeline.
+    // Hold feed_tx alive so the driver parks on the channel rather than exiting.
+    // Stage F will hand this sender to the derivation pipeline.
     let _feed_tx = feed_tx;
-
-    // Block until the driver task exits (it won't, while the sender is held) or
-    // until `run_command_until_exit` cancels us on SIGINT/SIGTERM.
     handle.wait_for_node_exit().await
 }

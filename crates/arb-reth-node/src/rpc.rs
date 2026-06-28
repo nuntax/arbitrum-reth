@@ -1,9 +1,9 @@
 //! Arbitrum `eth_*` RPC layer.
 //!
 //! Provides:
-//! - [`ArbReceiptConverter`] — converts `ArbReceiptEnvelope<Log>` primitives to
+//! - [`ArbReceiptConverter`]: converts `ArbReceiptEnvelope<Log>` primitives to
 //!   [`ArbTransactionReceipt`] RPC responses, surfacing `gas_used_for_l1`.
-//! - [`serve_rpc`] — standalone helper that wires an [`EthApi`] with the Arb
+//! - [`serve_rpc`]: standalone helper that wires an [`EthApi`] with the Arb
 //!   converter into a jsonrpsee HTTP server and returns its handle.
 //!
 //! The helper is intentionally isolated: it does not use `RpcAddOns`, does not touch
@@ -48,15 +48,10 @@ use reth_storage_api::{
 use reth_tasks::Runtime;
 use reth_tokio_util::EventSender;
 
-// ---------------------------------------------------------------------------
-// ArbReceiptConverter
-// ---------------------------------------------------------------------------
-
 /// Converts `ArbReceiptEnvelope<Log>` primitives into [`ArbTransactionReceipt`] RPC responses.
 ///
-/// This is the Arbitrum analogue of op-reth's `OpReceiptConverter`.
-/// Arbitrum is simpler: no L1-fee hardfork math. The `gas_used_for_l1` value
-/// is already stored on the receipt by the block executor at execution time.
+/// Analogous to op-reth's `OpReceiptConverter`. `gas_used_for_l1` is stored on the receipt
+/// by the block executor; no L1-fee hardfork math is needed.
 #[derive(Debug, Clone)]
 pub struct ArbReceiptConverter<Provider> {
     provider: Provider,
@@ -96,17 +91,15 @@ where
     }
 }
 
-/// Maps a consensus-layer `ArbReceiptEnvelope<Log>` to an RPC `ArbReceiptEnvelope<RpcLog>`,
-/// extracting the `gas_used_for_l1` from the inner `ArbReceipt` before the mapping.
-///
-/// Returns `(gas_used_for_l1, rpc_envelope)`.
+/// Maps a consensus `ArbReceiptEnvelope<Log>` to an RPC `ArbReceiptEnvelope<RpcLog>`,
+/// returning `(gas_used_for_l1, rpc_envelope)`.
 fn map_arb_receipt_envelope(
     envelope: ArbReceiptEnvelope<Log>,
     next_log_index: usize,
     meta: reth_primitives_traits::TransactionMeta,
 ) -> (u64, ArbReceiptEnvelope<RpcLog>) {
-    /// Maps a `ReceiptWithBloom<ArbReceipt<Log>>` → `ReceiptWithBloom<ArbReceipt<RpcLog>>`
-    /// while capturing the `gas_used_for_l1` field.
+    /// Maps `ReceiptWithBloom<ArbReceipt<Log>>` to `ReceiptWithBloom<ArbReceipt<RpcLog>>`
+    /// while capturing `gas_used_for_l1`.
     fn map_rwb(
         rwb: ReceiptWithBloom<ArbReceipt<Log>>,
         next_log_index: usize,
@@ -191,17 +184,13 @@ fn map_arb_receipt_envelope(
 }
 
 /// Builds a single [`ArbTransactionReceipt`] from a [`ConvertReceiptInput`].
-///
-/// Uses reth's `build_receipt` helper to fill all the standard Ethereum fields,
-/// then wraps the result into `ArbTransactionReceipt`, surfacing `gas_used_for_l1`.
 fn build_arb_receipt<N>(
     input: ConvertReceiptInput<'_, N>,
 ) -> Result<ArbTransactionReceipt, EthApiError>
 where
     N: NodePrimitives<Receipt = ArbReceiptEnvelope<Log>>,
 {
-    // `gas_used_for_l1` lives inside the receipt and is consumed by the mapping closure.
-    // We use a Cell to stash it while build_receipt drives the closure.
+    // Use a Cell to capture gas_used_for_l1 from within the mapping closure.
     let gas_cell = std::cell::Cell::new(0u64);
 
     let core = build_receipt::<N, _>(input, None, |envelope, next_log_index, meta| {
@@ -220,41 +209,18 @@ where
     })
 }
 
-// ---------------------------------------------------------------------------
-// ArbRpcConverter type alias
-// ---------------------------------------------------------------------------
-
 /// Convenience type alias for the Arb [`RpcConverter`].
-///
-/// Uses `Arbitrum` as the network, `ArbEvmConfig` as the EVM, and
-/// [`ArbReceiptConverter<Provider>`] for receipt conversion.
-/// All other converters are left as `()` (blanket defaults from reth-rpc-convert).
 pub type ArbRpcConverter<Provider> = RpcConverter<
     Arbitrum,
     ArbEvmConfig,
     ArbReceiptConverter<Provider>,
 >;
 
-// ---------------------------------------------------------------------------
-// serve_rpc
-// ---------------------------------------------------------------------------
-
 /// Starts a jsonrpsee HTTP server exposing `eth_*` methods for Arbitrum.
 ///
 /// Isolated from the engine and `RpcAddOns`. Returns a [`RpcServerHandle`] whose
-/// lifetime controls the server.
-///
-/// The function is generic over `Pool` and `Network` so callers can pass their own
-/// pool/network implementations. For a sequencer-only node that doesn't expose the
-/// p2p layer, pass a custom noop pool whose `Transaction::Consensus = ArbTxEnvelope`.
-///
-/// # Arguments
-/// * `provider` — the `BlockchainProvider` shared by the driver and RPC server.
-/// * `pool` — transaction pool (generic; must have `Consensus = ArbTxEnvelope`).
-/// * `network` — network interface.
-/// * `evm_config` — the `ArbEvmConfig` for gas/call simulation.
-/// * `addr` — the HTTP bind address. Use `127.0.0.1:0` for an OS-assigned port.
-/// * `runtime` — the tokio `Runtime` for blocking tasks inside the eth API.
+/// lifetime controls the server. Generic over `Pool` and `Network`; pass a noop pool
+/// with `Consensus = ArbTxEnvelope` for sequencer-only nodes.
 pub async fn serve_rpc<Provider, Pool, Network>(
     provider: Provider,
     pool: Pool,
@@ -333,10 +299,9 @@ where
         .task_spawner(runtime.clone())
         .build();
 
-    // No-op engine events: required by RpcModuleBuilder::build but we never emit engine events.
+    // Required by RpcModuleBuilder::build; we never emit engine events.
     let engine_events = EventSender::<ConsensusEngineEvent<ArbPrimitives>>::default();
 
-    // Build transport modules (HTTP only, eth namespace).
     let module_config =
         TransportRpcModuleConfig::default().with_http([RethRpcModule::Eth]);
 
@@ -350,9 +315,6 @@ where
     )
     .build(module_config, eth_api, engine_events);
 
-    // Start the HTTP server.
-    // Use `RpcServerConfig::default().with_http(...)` since `RpcServerConfig::http` takes a
-    // `jsonrpsee::server::ServerConfigBuilder` which isn't re-exported from reth-rpc-builder.
     let handle = RpcServerConfig::default()
         .with_http(jsonrpsee::server::ServerConfigBuilder::default())
         .with_http_address(addr)
@@ -362,10 +324,6 @@ where
 
     Ok(handle)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -380,19 +338,11 @@ mod tests {
 
     use crate::{ArbLauncher, ArbNode};
 
-    /// D.5 integration test: `eth_*` JSON-RPC is live after node launch.
-    ///
-    /// Boots the full `ArbLauncher` stack with RPC enabled on an ephemeral port,
-    /// feeds two deposit fixtures, then verifies:
-    ///  1. `eth_getBlockByNumber("latest", false)` returns a non-null block.
-    ///  2. `eth_getBalance(recipient, "latest")` matches the cumulative deposit amount.
-    ///  3. `eth_getTransactionReceipt(tx_hash)` returns a non-null receipt with
-    ///     `gas_used_for_l1: 0` (test deposit — L1 cost is zero).
+    /// D.5: `eth_*` JSON-RPC is live after node launch. Boots `ArbLauncher` with RPC on an
+    /// ephemeral port, feeds two deposits, and verifies `eth_getBlockByNumber` and
+    /// `eth_getBalance`.
     #[tokio::test(flavor = "multi_thread")]
     async fn rpc_serves_eth_queries() {
-        // ------------------------------------------------------------------ //
-        // 1. Build fixture messages.
-        // ------------------------------------------------------------------ //
         let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../arb_revm/testdata/fixtures");
         let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
@@ -400,18 +350,12 @@ mod tests {
         let feed_msg: BroadcastFeedMessage =
             serde_json::from_str(&json).expect("parse BroadcastFeedMessage");
 
-        // ------------------------------------------------------------------ //
-        // 2. Runtime + feed channel.
-        // ------------------------------------------------------------------ //
         let task_executor = Runtime::test();
         let (tx, rx) = tokio::sync::mpsc::channel::<(BroadcastFeedMessage, u8)>(4);
         tx.send((feed_msg.clone(), 0)).await.unwrap();
         tx.send((feed_msg.clone(), 0)).await.unwrap();
         drop(tx);
 
-        // ------------------------------------------------------------------ //
-        // 3. Temp datadir + database.
-        // ------------------------------------------------------------------ //
         let datadir = reth_db::test_utils::tempdir_path();
         let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
 
@@ -426,15 +370,9 @@ mod tests {
         );
         let data_dir = maybe_path.unwrap_or_chain_default(MAINNET.chain(), config.datadir.clone());
 
-        // ------------------------------------------------------------------ //
-        // 4. Build NodeBuilderWithComponents.
-        // ------------------------------------------------------------------ //
         let node_builder_with_components =
             NodeBuilder::new(config).with_database(db).node(ArbNode);
 
-        // ------------------------------------------------------------------ //
-        // 5. Launch with RPC on an OS-assigned port.
-        // ------------------------------------------------------------------ //
         let rpc_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
         let launcher = ArbLauncher {
             ctx: reth_node_builder::LaunchContext::new(task_executor.clone(), data_dir),
@@ -449,31 +387,21 @@ mod tests {
             .await
             .expect("launch must succeed");
 
-        // Wait for the driver to finish processing all messages.
         let rpc_handle = handle.rpc_handle.expect("RPC server should be running");
         let http_url = rpc_handle.http_url().expect("HTTP URL must be present");
 
-        // ------------------------------------------------------------------ //
-        // 6. Query eth_getBlockByNumber("latest", false).
-        // ------------------------------------------------------------------ //
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
             .build(&http_url)
             .expect("build http client");
 
-        // Wait for the RPC server to serve requests (tiny delay for the server bind).
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // eth_getBlockByNumber("latest", false)
         let block: serde_json::Value = client
             .request("eth_getBlockByNumber", jsonrpsee::rpc_params!["latest", false])
             .await
             .expect("eth_getBlockByNumber should succeed");
         assert!(block.get("number").is_some(), "block must have a number field");
 
-        // ------------------------------------------------------------------ //
-        // 7. Query eth_getBalance(recipient, "latest").
-        // ------------------------------------------------------------------ //
-        // Same deposit recipient used in the launcher test.
         let deposit_recipient = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
         let balance_hex: String = client
             .request(
@@ -488,12 +416,8 @@ mod tests {
 
         let balance = U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16)
             .expect("parse balance hex");
-        // Two deposit messages, each crediting 111_000_000_000_000_000 wei.
         assert!(balance > U256::ZERO, "deposit recipient must have non-zero balance");
 
-        // ------------------------------------------------------------------ //
-        // 8. Done.
-        // ------------------------------------------------------------------ //
-        drop(rpc_handle); // shuts down the server
+        drop(rpc_handle);
     }
 }

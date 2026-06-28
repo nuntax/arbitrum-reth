@@ -1,12 +1,9 @@
 //! Stage C exit proof: a block's worth of transactions executes through [`ArbBlockExecutor`]
-//! producing per-tx receipts whose `gas_used` + `status` + `logs` + `gas_used_for_l1` match
-//! `arb_revm`'s own block-execution path (`execute_message`), and whose committed account state
-//! matches.
+//! producing per-tx receipts whose `gas_used`, `status`, `logs`, and `gas_used_for_l1` match
+//! `arb_revm::executor::execute_message`, and whose committed account state matches.
 //!
-//! Both paths run the **same** sequencer message (StartBlock prelude + N user txs) over identical
-//! funded databases. The oracle is `arb_revm::executor::execute_message` (the path `replay_block`
-//! and `ArbRunner` drive). The Stage C path drives the same txs through
-//! `ArbBlockExecutorFactory → ArbBlockExecutor`.
+//! Oracle: `arb_revm::executor::execute_message`. Stage C path:
+//! `ArbBlockExecutorFactory` → `ArbBlockExecutor`.
 
 use super::*;
 use crate::ArbEvmFactory;
@@ -61,8 +58,7 @@ fn funded_db() -> CacheDB<EmptyDB> {
     db
 }
 
-/// The user transactions in the block: two unsigned (type 0x65) value transfers with explicit
-/// senders (so both paths derive an identical caller without secp256k1 recovery).
+/// Two unsigned (type 0x65) value transfers with explicit senders (no secp256k1 recovery needed).
 fn user_txs() -> Vec<ArbTxEnvelope> {
     let mk = |from: Address, nonce: u64, value: u128| {
         ArbTxEnvelope::from(TxUnsigned {
@@ -116,10 +112,9 @@ fn message() -> ArbMessageEnvelope {
     }
 }
 
-/// Independent poster-gas oracle: drive the same StartBlock prelude + user txs through a directly
-/// built `arb_revm` EVM (the `ArbBuilder` surface, not the Stage C executor) and read
-/// `chain().poster_gas` after each user tx. This exercises the same `arb_revm::handler` accounting
-/// from a different driver, so it confirms Stage C captures `poster_gas` faithfully.
+/// Poster-gas oracle: drives the same StartBlock prelude + user txs through a directly built
+/// `arb_revm` EVM (the `ArbBuilder` surface) and reads `chain().poster_gas` after each user tx.
+/// Confirms Stage C captures `poster_gas` faithfully.
 fn oracle_poster_gas_per_tx() -> Vec<u64> {
     use arb_revm::api::default_ctx::ArbContext;
     use arb_revm::{ArbBuilder, ArbChainContext};
@@ -135,7 +130,7 @@ fn oracle_poster_gas_per_tx() -> Vec<u64> {
         .with_tx(ArbTransaction::<TxEnv>::default());
     let mut evm = ctx.build_arb();
 
-    // StartBlock prelude (so per-tx state lines up with Stage C / execute_message).
+    // StartBlock prelude aligns per-tx state with Stage C / execute_message.
     let bctx = block_ctx();
     let l2_block_number = PARENT_NUMBER + 1;
     let derived = arb_revm::executor::hooks::ArbStartBlockDerived {
@@ -165,8 +160,7 @@ fn oracle_poster_gas_per_tx() -> Vec<u64> {
     poster_gas
 }
 
-/// Oracle: run the message through `execute_message`, returning the per-tx outcome and the
-/// committed db.
+/// Oracle: run the message through `execute_message`.
 fn oracle() -> (arb_revm::executor::ArbExecOutcome, CacheDB<EmptyDB>) {
     let cfg = exec_cfg();
     let input = ArbExecutionInput::new(parent_header(), message(), cfg);
@@ -175,7 +169,7 @@ fn oracle() -> (arb_revm::executor::ArbExecOutcome, CacheDB<EmptyDB>) {
     (outcome, db)
 }
 
-/// Builds the EVM env exactly as `execute_message` does for a fresh db at ArbOS v51.
+/// EVM env matching what `execute_message` builds for a fresh db at ArbOS v51.
 fn evm_env() -> EvmEnv<ArbSpecId> {
     let next_timestamp = L1_TIMESTAMP.max(PARENT_TIMESTAMP);
     let mut block = BlockEnv::default();
@@ -187,9 +181,7 @@ fn evm_env() -> EvmEnv<ArbSpecId> {
     block.difficulty = U256::ZERO;
     block.prevrandao = Some(revm::primitives::B256::ZERO);
 
-    // Mirror `execute_message`'s cfg for a fresh db: spec = cfg.spec_id (db version reads 0),
-    // priority-fee check off, balance check on, EIP-7623 off (calldata-price-increase reads false
-    // on a fresh db, so Arbitrum prices calldata via its own poster fee instead of the floor).
+    // Priority-fee check off; EIP-7623 off (fresh db: Arbitrum prices calldata via poster fee).
     let mut cfg_env = CfgEnv::new_with_spec(ArbSpecId::ARBOS_51)
         .with_chain_id(CHAIN_ID)
         .with_disable_priority_fee_check(true);
@@ -199,7 +191,7 @@ fn evm_env() -> EvmEnv<ArbSpecId> {
     EvmEnv::new(cfg_env, block)
 }
 
-/// The Stage C block-execution context derived from the same message.
+/// Stage C block-execution context derived from the same message.
 fn block_ctx() -> ArbBlockExecutionCtx {
     ArbBlockExecutionCtx {
         parent_hash: B256::ZERO,
@@ -218,7 +210,7 @@ fn block_ctx() -> ArbBlockExecutionCtx {
 fn block_executor_matches_execute_message() {
     let (oracle_outcome, oracle_db) = oracle();
 
-    // Stage C: drive the same txs through ArbBlockExecutor over reth's `State<DB>`.
+    // Stage C: same txs through ArbBlockExecutor over reth's `State<DB>`.
     let factory = ArbBlockExecutorFactory::new(ArbEvmFactory, CHAIN_ID);
     let mut state = State::builder()
         .with_database(funded_db())
@@ -232,8 +224,7 @@ fn block_executor_matches_execute_message() {
         .apply_pre_execution_changes()
         .expect("pre-execution (EIP-2935)");
 
-    // The InternalTxStartBlock (0x6a) is now a real block tx — run it first, like the driver does
-    // (and like Nitro, where it is the block's first transaction with its own receipt).
+    // InternalTxStartBlock (0x6a) is a real block tx; run it first (like Nitro).
     let start_tx = executor.start_block_tx().expect("start-block tx");
     let sb_sender = start_tx.sender().expect("start-block tx carries explicit from");
     executor
@@ -249,7 +240,6 @@ fn block_executor_matches_execute_message() {
             .expect("execute_transaction");
     }
 
-    // Per-user-tx gas_used_for_l1, skipping the start-block receipt at index 0.
     let mut stage_c_l1 = Vec::new();
     for r in executor.receipts().iter().skip(1) {
         stage_c_l1.push(gas_used_for_l1(r));
@@ -257,7 +247,6 @@ fn block_executor_matches_execute_message() {
 
     let (_evm, result) = executor.finish().expect("finish");
 
-    // --- per-tx parity vs the oracle ---
     assert_eq!(
         oracle_outcome.txs.len(),
         txs.len(),
@@ -269,7 +258,7 @@ fn block_executor_matches_execute_message() {
         "one receipt per user tx, plus the start-block (0x6a) tx"
     );
 
-    // Receipt[0] is the start-block tx: internal (0x6a), uses zero gas, no logs.
+    // Receipt[0]: start-block tx (0x6a), zero gas, no logs.
     {
         use alloy_consensus::TxReceipt;
         assert_eq!(
@@ -280,8 +269,6 @@ fn block_executor_matches_execute_message() {
         assert_eq!(result.receipts[0].ty(), 0x6a, "first receipt is the internal start-block tx");
     }
 
-    // Cumulative gas in receipts -> per-tx gas. Compare per-user-tx gas_used + status,
-    // skipping the start-block receipt at index 0.
     let mut prev_cum = result.receipts[0].cumulative_gas_used();
     for (i, receipt) in result.receipts.iter().skip(1).enumerate() {
         use alloy_consensus::TxReceipt;
@@ -298,16 +285,12 @@ fn block_executor_matches_execute_message() {
             oracle_outcome.txs[i].success,
             "tx {i}: status must match oracle"
         );
-        // these transfers emit no logs
         assert!(receipt.logs().is_empty(), "tx {i}: no logs expected");
     }
 
-    // gas_used_for_l1 is the tx's ArbOS `poster_gas`, read off the chain context after `transact`
-    // and written onto the receipt body. On a bare in-memory db (no initialized ArbOS L1-pricing
-    // state) the poster cost resolves to 0 — the same in both paths, since the per-tx accounting is
-    // the SAME `arb_revm::handler` code. The load-bearing parity check is that the field is wired
-    // and the total/per-tx compute gas matches the oracle (asserted above). We additionally cross-
-    // check parity by re-running the oracle txs one at a time and reading poster_gas directly.
+    // `gas_used_for_l1` (poster_gas) resolves to 0 on a bare in-memory db (no initialized ArbOS
+    // L1-pricing state), the same in both paths. Cross-check by re-running oracle txs one at a
+    // time and reading poster_gas directly.
     let oracle_l1 = oracle_poster_gas_per_tx();
     assert_eq!(
         stage_c_l1, oracle_l1,
@@ -321,8 +304,7 @@ fn block_executor_matches_execute_message() {
         "block gas_used must equal the sum of per-tx gas"
     );
 
-    // --- state parity: every account touched by the oracle has the same balance/nonce in the
-    // Stage C State<DB>. ---
+    // State parity: every account touched by the oracle has the same balance/nonce in Stage C.
     state.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
     let bundle = state.take_bundle();
     for who in [SENDER_A, SENDER_B, RECIPIENT, POSTER] {

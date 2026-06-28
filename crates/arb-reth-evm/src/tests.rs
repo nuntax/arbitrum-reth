@@ -19,8 +19,8 @@ const RECIPIENT: Address = Address::with_last_byte(0x22);
 const TRANSFER_VALUE: u128 = 1_000_000_000_000_000_000; // 1 ETH
 const START_BALANCE: u128 = 10_000_000_000_000_000_000; // 10 ETH
 
-/// A funded-sender cache db with priority-fee/base-fee checks disabled so a zero-gas-price value
-/// transfer executes deterministically (Stage B is a transact-level proof, not a fee-accuracy one).
+/// Funded-sender cache db; priority-fee check disabled so a zero-gas-price transfer executes
+/// deterministically.
 fn funded_db() -> CacheDB<EmptyDB> {
     let mut db = CacheDB::new(EmptyDB::default());
     db.insert_account_info(
@@ -57,8 +57,7 @@ fn transfer_tx() -> ArbTransaction<TxEnv> {
     })
 }
 
-/// Oracle: run the same tx through `arb_revm` directly (the path `replay_block` uses), via the
-/// `ArbBuilder` + `ExecuteEvm` surface this bridge wraps.
+/// Oracle: run the same tx through `arb_revm` directly via the `ArbBuilder` + `ExecuteEvm` surface.
 fn oracle_result() -> (u64, U256, U256) {
     let mut db = funded_db();
     let ctx: ArbContext<&mut _> = Context::mainnet()
@@ -83,7 +82,7 @@ fn oracle_result() -> (u64, U256, U256) {
 fn arb_evm_factory_transact_matches_arb_revm() {
     let (oracle_gas, oracle_sender_bal, oracle_recipient_bal) = oracle_result();
 
-    // Bridge path: build the EVM exactly as reth would, then transact_raw an ArbTx.
+    // Bridge path: build the EVM as reth would, then transact_raw an ArbTx.
     let db = funded_db();
     let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
     let mut evm: ArbEvm<_, _> = ArbEvmFactory.create_evm(db, evm_env);
@@ -94,14 +93,12 @@ fn arb_evm_factory_transact_matches_arb_revm() {
 
     assert!(out.result.is_success(), "transfer must succeed: {:?}", out.result);
 
-    // gas_used must be identical to arb_revm running the same tx.
     assert_eq!(
         out.result.gas_used(),
         oracle_gas,
         "bridge gas_used must match arb_revm oracle"
     );
 
-    // Balances must update consistently with the oracle.
     let sender_bal = out.state.get(&SENDER).expect("sender in state").info.balance;
     let recipient_bal = out
         .state
@@ -112,7 +109,6 @@ fn arb_evm_factory_transact_matches_arb_revm() {
     assert_eq!(sender_bal, oracle_sender_bal, "sender balance must match oracle");
     assert_eq!(recipient_bal, oracle_recipient_bal, "recipient balance must match oracle");
 
-    // And the value actually moved.
     assert_eq!(
         recipient_bal,
         U256::from(TRANSFER_VALUE),
@@ -123,17 +119,15 @@ fn arb_evm_factory_transact_matches_arb_revm() {
         "sender debited value (plus any fee)"
     );
 
-    // chain_id / block accessors are wired.
     assert_eq!(evm.chain_id(), CHAIN_ID);
 }
 
-/// End-to-end proof of the node-path precompile bridge (#36): a tx that CALLs an ArbOS precompile
-/// (`ArbSys.arbOSVersion()`, which reads `arbos_version` from ArbOS storage) executes through the
-/// `PrecompilesMap` → `DynPrecompile` → `run_dispatch`-over-`EvmInternals` path and must match the
-/// in-EVM `arb_revm` oracle (`ArbPrecompiles`) bit-for-bit in both output and gas. Because the
-/// `arbos_version` slot is **seeded** to a known non-default value, a correct result proves the
-/// node-path `ArbInternals` adapter actually `sload`s the right slot through `EvmInternals` (not a
-/// coincidental zero), and that the `InterpreterResult`→`PrecompileResult` conversion preserves gas.
+/// End-to-end proof of the node-path precompile bridge: a tx that CALLs `ArbSys.arbOSVersion()`
+/// executes through `PrecompilesMap` → `DynPrecompile` → `run_dispatch`-over-`EvmInternals` and
+/// must match the in-EVM `arb_revm` oracle bit-for-bit in both output and gas. The `arbos_version`
+/// slot is seeded to a known non-default value, proving the `ArbInternals` adapter actually
+/// `sload`s the correct slot (not a coincidental zero) and that gas is preserved through the
+/// `InterpreterResult` → `PrecompileResult` conversion.
 #[test]
 fn arbos_precompile_through_precompiles_map_matches_oracle() {
     use arb_revm::ArbosState;
@@ -157,7 +151,6 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
         db
     };
 
-    // calldata = selector of arbOSVersion() (no args).
     let selector = keccak256("arbOSVersion()");
     let call_tx = || {
         ArbTransaction::new(TxEnv {
@@ -174,7 +167,7 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
         })
     };
 
-    // Oracle: arb_revm direct (in-EVM `ArbPrecompiles` path — the parity-validated one).
+    // Oracle: arb_revm direct (in-EVM `ArbPrecompiles` path).
     let mut odb = seed_db();
     let octx: ArbContext<&mut _> = Context::mainnet()
         .with_chain(ArbChainContext::default())
@@ -185,7 +178,7 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
     let mut oracle_evm = octx.build_arb();
     let oracle = oracle_evm.transact(call_tx()).expect("oracle precompile call");
 
-    // Bridge: ArbEvmFactory (node `PrecompilesMap` path).
+    // Bridge: ArbEvmFactory (node PrecompilesMap path).
     let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
     let mut bridge_evm = ArbEvmFactory.create_evm(seed_db(), evm_env);
     let bridge = bridge_evm
@@ -198,18 +191,16 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
     let oracle_out = oracle.result.output().cloned().unwrap_or_default();
     let bridge_out = bridge.result.output().cloned().unwrap_or_default();
 
-    // The node path must match the validated in-EVM oracle exactly.
     assert_eq!(
         bridge_out, oracle_out,
         "node-path precompile output must match the in-EVM oracle"
     );
-    // ...and must reflect the seeded ArbOS state (proves the sload hit the right slot via EvmInternals).
+    // Must reflect the seeded ArbOS state (proves sload hit the right slot via EvmInternals).
     assert_eq!(
         U256::from_be_slice(&bridge_out),
         U256::from(55 + SEEDED_ARBOS_VERSION),
         "arbOSVersion() must return 55 + the seeded ArbOS version"
     );
-    // Gas must survive the InterpreterResult -> PrecompileResult conversion identically.
     assert_eq!(
         bridge.result.gas_used(),
         oracle.result.gas_used(),

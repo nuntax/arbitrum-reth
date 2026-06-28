@@ -78,7 +78,7 @@ pub enum BatchError {
 
 /// Parsed fields from the non-indexed data of a `SequencerBatchDelivered` L1 event.
 ///
-/// Layout: 7 × 32-byte ABI words —
+/// Layout: 7 × 32-byte ABI words:
 /// `[delayedAcc(32), afterDelayedMessagesRead(32), minTimestamp(32), maxTimestamp(32),
 ///   minL1Block(32), maxL1Block(32), dataLocation(32)]`.
 /// Each timeBounds field is a `uint64` right-aligned in its 32-byte word.
@@ -167,7 +167,7 @@ pub fn parse_sequencer_batch_delivered(log_data: &[u8]) -> Result<SequencerBatch
 /// Handles the brotli (`0x00`) path. The blob (`0x50`), zeroheavy (`0x20`) and DA
 /// flags are resolved upstream (blob hashes need external blob retrieval first);
 /// after that resolution the recovered bytes re-enter here starting at their own
-/// flag byte — which for mainnet sequencer batches is `0x00` brotli.
+/// flag byte (mainnet sequencer batches use `0x00` brotli).
 pub fn decompress_payload(payload: &[u8]) -> Result<Vec<u8>, BatchError> {
     let (&flag, body) = payload.split_first().ok_or(BatchError::Truncated)?;
     match flag {
@@ -185,7 +185,7 @@ pub struct Segment {
     pub data: Vec<u8>,
 }
 
-/// Parse a decompressed batch body — a stream of consecutive RLP byte strings,
+/// Parse a decompressed batch body: a stream of consecutive RLP byte strings,
 /// each one segment whose first byte is the [`segment_kind`]. Matches Nitro's
 /// `rlp.NewStream(...).Decode(&segment)` loop. Empty (zero-length) items are
 /// skipped, as in Nitro.
@@ -295,10 +295,6 @@ mod tests {
         assert_eq!(segs[0].data, vec![0xff]);
     }
 
-    // ──────────────────────────────────────────────────────────────────────
-    // parse_sequencer_batch_delivered tests
-    // ──────────────────────────────────────────────────────────────────────
-
     /// Verify wrong-length rejection.
     #[test]
     fn event_parse_rejects_wrong_len() {
@@ -314,7 +310,7 @@ mod tests {
 
     /// Parse the real `SequencerBatchDelivered` log data from Arbitrum One blob batch
     /// seq 1277861 (L1 block 25398052, tx 0x20eae1f4…). This is the same batch used
-    /// by `blob_batch_fixture.rs` — the fixture `*_meta.json` was captured from this
+    /// by `blob_batch_fixture.rs`; the fixture `*_meta.json` was captured from this
     /// event. Verified 2026-06-26 via `eth_getTransactionReceipt`.
     ///
     /// Non-indexed log data (224 bytes / 7 × 32 words):
