@@ -50,8 +50,15 @@ pub fn extract_messages(
     before_delayed_count: u64,
     delayed: &dyn DelayedSource,
 ) -> Result<Vec<DerivedMessage>, MultiplexerError> {
-    let mut timestamp = header.min_timestamp;
-    let mut block = header.min_l1_block;
+    // Nitro `arbstate/inbox.go`: the running timestamp/L1-block start at 0 (per batch),
+    // accumulate the Advance* segment deltas, and are clamped to the batch's
+    // [min, max] bounds only at message-emit time (see `make_l2_message`). Seeding from
+    // `min_*` instead double-counts the base: the first Advance segment carries the
+    // absolute value, so `min + absolute` overshoots `max` and clamps to `max`, giving
+    // every message the wrong (ceiling) L1 block number — which corrupts the ArbOS
+    // Blockhashes state on the very first derived block.
+    let mut timestamp = 0u64;
+    let mut block = 0u64;
     let mut delayed_read = before_delayed_count;
     let mut out = Vec::new();
 
@@ -144,10 +151,13 @@ mod tests {
     #[test]
     fn emits_l2_messages_with_running_timestamp_and_poster() {
         let h = header();
+        // Running timestamp/block accumulate from 0 (Nitro semantics); the first Advance
+        // carries the absolute value. tx-a is emitted before the L1-block advance, so its
+        // block is still 0 and clamps up to min (100); tx-b sees the absolute 150 (in range).
         let segs = vec![
-            advance(segment_kind::ADVANCE_TIMESTAMP, 250),
+            advance(segment_kind::ADVANCE_TIMESTAMP, 1_250),
             Segment { kind: segment_kind::L2_MESSAGE, data: b"tx-a".to_vec() },
-            advance(segment_kind::ADVANCE_L1_BLOCK, 5),
+            advance(segment_kind::ADVANCE_L1_BLOCK, 150),
             Segment { kind: segment_kind::L2_MESSAGE, data: b"tx-b".to_vec() },
         ];
         let msgs = extract_messages(&h, &segs, 7, &NoDelayed).unwrap();
@@ -157,7 +167,9 @@ mod tests {
         assert_eq!(msgs[0].header.block_number, 100);
         assert_eq!(msgs[0].delayed_messages_read, 7);
         assert!(msgs[0].header.request_id.is_none());
-        assert_eq!(msgs[1].header.block_number, 105);
+        // 0 + 150 = 150, in [100, 200]. The pre-fix code seeded from min (100) and would
+        // have produced 100 + 150 = 250 → clamped to the max (200) — the derivation bug.
+        assert_eq!(msgs[1].header.block_number, 150);
     }
 
     #[test]

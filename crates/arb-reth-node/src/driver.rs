@@ -199,6 +199,7 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         // NOTE: parent block must have been flushed to MDBX before its child is executed.
         // With threshold=1 this is guaranteed; larger thresholds would require serving parent
         // state from CanonicalInMemoryState instead.
+        let msg_l1_block = attrs.l1_block_number;
         let parent_number = parent_header.number;
         let state_provider_for_trie = self
             .factory
@@ -283,8 +284,8 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
         // the bundle; we recover it here for persistence.
         let bundle = state.take_bundle();
 
+
         let block_hash = outcome.block.hash();
-        let _state_root = outcome.block.header().state_root;
         let expected_number = parent_number + 1;
         let actual_number = outcome.block.header().number;
         if actual_number != expected_number {
@@ -292,6 +293,20 @@ impl<N: ProviderNodeTypes<Primitives = ArbPrimitives>> ArbChainDriver<N> {
                 "assembled block has number {actual_number}, expected {expected_number}"
             ));
         }
+
+        // Per-block trace for differential state-root parity against canonical Arbitrum One
+        // (diff `state_root` vs an archive RPC to localize ArbOS-version execution drift).
+        tracing::info!(
+            target: "arb-reth::driver",
+            number = actual_number,
+            %block_hash,
+            state_root = %outcome.block.header().state_root,
+            gas_used = outcome.block.header().gas_used,
+            txs = outcome.block.body().transactions.len(),
+            msg_l1_block,
+            msg_timestamp = next_timestamp,
+            "produced block",
+        );
 
         let recovered_block: RecoveredBlock<ArbBlock> = outcome.block;
         let trie_data = ComputedTrieData::new(
