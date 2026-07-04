@@ -33,7 +33,10 @@ use std::time::Duration;
 
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
-use arb_reth_l1::sync::{derive_from_resolved, resolve_batches, DEFAULT_DELAYED_WINDOW};
+use arb_reth_l1::sync::{
+    derive_from_resolved_cached, resolve_batches, DelayedCache, ReportStatsCache,
+    DEFAULT_DELAYED_WINDOW,
+};
 use arb_reth_l1::{BeaconClient, DelayedInboxReader, DeliveredBatch, SequencerInboxReader};
 use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
 use eyre::{eyre, Context as _};
@@ -134,6 +137,10 @@ where
 
     // The ORDERED tail (delayed-map + assembly) threads these window-to-window.
     let mut delayed = cfg.start_delayed_count;
+    // Forward-carried caches so the delayed scan and report-stat fetches — the dominant
+    // `getLogs` cost — are paid once per L1 range instead of re-paid on every window.
+    let mut delayed_cache = DelayedCache::new();
+    let mut report_cache = ReportStatsCache::new();
     let mut consume_cursor = cfg.start_block;
     // The prefetcher runs ahead: the next L1 window to spawn a `resolve_batches` for.
     let mut spawn_cursor = cfg.start_block;
@@ -200,13 +207,15 @@ where
         let resolved = handle
             .await
             .map_err(|e| eyre!("resolve_batches task [{from}, {to}] failed: {e}"))??;
-        let derived = derive_from_resolved(
+        let derived = derive_from_resolved_cached(
             &seq_reader,
             &delayed_reader,
             resolved,
             to,
             delayed,
             cfg.delayed_window,
+            &mut delayed_cache,
+            &mut report_cache,
         )
         .await
         .wrap_err_with(|| format!("derive_from_resolved [{from}, {to}]"))?;

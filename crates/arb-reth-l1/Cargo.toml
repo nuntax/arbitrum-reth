@@ -27,7 +27,12 @@ base64 = "0.22"
 arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
 # ArbTxEnvelope::tx_hash for the digest-path equivalence test.
 arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth", "std"] }
+# cu_profile: transport-level RPC method counter (measures the per-method CU mix).
+alloy-rpc-client = { version = "2.1", default-features = false }
+alloy-json-rpc = { version = "2.1", default-features = false }
+alloy-transport = { version = "2.1", default-features = false }
+tower = { version = "0.5", features = ["util"] }

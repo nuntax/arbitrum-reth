@@ -151,10 +151,126 @@ pub async fn derive_range<P: Provider>(
     .await
 }
 
+/// `data_hash -> stats` for batches already resolved from L1, persistent across windows so a
+/// `BatchPostingReport` naming an earlier window's batch is served from memory instead of
+/// re-fetched. Threaded by the catch-up runtime; see [`derive_from_resolved_cached`].
+pub type ReportStatsCache = BTreeMap<B256, BatchDataStats>;
+
+/// Forward-carried delayed-message cache, threaded across consecutive windows so the dominant
+/// `getLogs` cost is paid once per L1 range rather than re-paid on every consuming window.
+///
+/// The original derive path re-scanned the delayed inbox *backward* from each consuming
+/// window's `to_block`, re-fetching heavily overlapping ranges (crippling on a provider that
+/// caps the `getLogs` span). This cache instead scans each L1 range exactly once: it extends
+/// *forward* as the sync advances (picking up deliveries since the last scan) and only walks
+/// backward for the rare deposit delivered before the earliest scan.
+///
+/// Invariant: the scanned L1 interval `[scanned_lo, scanned_hi]` is contiguous — it extends
+/// forward from `scanned_hi` or backward from `scanned_lo`, never leaving a hole — so a block's
+/// delayed logs are fetched at most once over the whole sync.
+#[derive(Debug, Default)]
+pub struct DelayedCache {
+    msgs: BTreeMap<u64, DelayedMessage>,
+    scanned_lo: Option<u64>,
+    scanned_hi: Option<u64>,
+}
+
+impl DelayedCache {
+    /// A fresh, empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn covers(&self, need_from: u64, need_to: u64) -> bool {
+        (need_from..need_to).all(|i| self.msgs.contains_key(&i))
+    }
+
+    /// Scan `[lo, hi]` for delayed messages in `window`-sized `getLogs` chunks (providers cap
+    /// the getLogs span), folding them into the cache and extending the scanned interval.
+    async fn scan_range<P: Provider>(
+        &mut self,
+        reader: &DelayedInboxReader<P>,
+        lo: u64,
+        hi: u64,
+        window: u64,
+    ) -> Result<(), L1Error> {
+        let window = window.max(1);
+        let mut chunk_hi = hi;
+        loop {
+            let chunk_lo = chunk_hi.saturating_sub(window - 1).max(lo);
+            for m in reader.fetch_delayed(chunk_lo, chunk_hi).await? {
+                self.msgs.insert(m.inbox_seq_num, m);
+            }
+            if chunk_lo == lo {
+                break;
+            }
+            chunk_hi = chunk_lo - 1;
+        }
+        self.scanned_lo = Some(self.scanned_lo.map_or(lo, |x| x.min(lo)));
+        self.scanned_hi = Some(self.scanned_hi.map_or(hi, |x| x.max(hi)));
+        Ok(())
+    }
+
+    /// Ensure delayed indices `[need_from, need_to)` are cached and return them as a
+    /// [`DelayedMap`], fetching only L1 ranges not scanned before. Consumed entries
+    /// (`< need_from`) are pruned afterward to bound memory.
+    ///
+    /// Delayed messages are delivered in ascending index order at L1 blocks no later than the
+    /// batch that consumes them, so extending forward to `to_block` captures everything a
+    /// window needs; the backward walk only fires for a deposit that predates the first scan.
+    pub async fn cover<P: Provider>(
+        &mut self,
+        reader: &DelayedInboxReader<P>,
+        to_block: u64,
+        need_from: u64,
+        need_to: u64,
+        window: u64,
+    ) -> Result<DelayedMap, L1Error> {
+        if need_to <= need_from {
+            return Ok(DelayedMap::default());
+        }
+        let window = window.max(1);
+
+        if !self.covers(need_from, need_to) {
+            // Extend forward over the gap since the last scan (each block scanned once).
+            match self.scanned_hi {
+                Some(hi) if hi < to_block => self.scan_range(reader, hi + 1, to_block, window).await?,
+                Some(_) => {}
+                None => {
+                    self.scan_range(reader, to_block.saturating_sub(window - 1), to_block, window).await?
+                }
+            }
+            // Still missing a low index → a deposit delivered before the earliest scan.
+            while !self.covers(need_from, need_to) {
+                let lo = self.scanned_lo.expect("scanned after forward extend");
+                if lo == 0 {
+                    return Err(L1Error::Missing(
+                        "delayed messages: scan reached block 0 without coverage",
+                    ));
+                }
+                let next_hi = lo - 1;
+                let next_lo = next_hi.saturating_sub(window - 1);
+                self.scan_range(reader, next_lo, next_hi, window).await?;
+            }
+        }
+
+        let map = DelayedMap::from_messages(
+            (need_from..need_to).map(|i| self.msgs.get(&i).expect("covered above").clone()),
+        );
+        self.msgs.retain(|&i, _| i >= need_from);
+        Ok(map)
+    }
+}
+
 /// The delayed-message + assembly tail of [`derive_range`], split out so the catch-up
 /// runtime can PREFETCH [`resolve_batches`] for many L1 windows concurrently (it is the
 /// dominant `getLogs`/blob RPC cost and is independent of the delayed cursor) and then run
 /// this ordered tail sequentially, threading `start_delayed_count` window-to-window.
+///
+/// This is the one-shot form: it allocates fresh caches, so its behavior is identical to
+/// deriving the window in isolation. The catch-up runtime uses [`derive_from_resolved_cached`]
+/// with caches threaded across windows so the delayed scan and report-stat fetches are paid
+/// once per L1 range instead of re-paid per window.
 ///
 /// `resolved` is one window's [`resolve_batches`] output; `to_block` is that window's end.
 pub async fn derive_from_resolved<P: Provider>(
@@ -165,6 +281,35 @@ pub async fn derive_from_resolved<P: Provider>(
     start_delayed_count: u64,
     window: u64,
 ) -> Result<DerivedRange, L1Error> {
+    let mut delayed_cache = DelayedCache::new();
+    let mut report_cache = ReportStatsCache::new();
+    derive_from_resolved_cached(
+        seq_reader,
+        delayed_reader,
+        resolved,
+        to_block,
+        start_delayed_count,
+        window,
+        &mut delayed_cache,
+        &mut report_cache,
+    )
+    .await
+}
+
+/// As [`derive_from_resolved`], but with the [`DelayedCache`] and [`ReportStatsCache`] threaded
+/// in by the caller so they persist across consecutive windows. This is the CU-efficient path:
+/// each L1 range's delayed logs are fetched once (forward-carried), and a `BatchPostingReport`
+/// naming an already-resolved batch is served from `report_cache` instead of re-fetched.
+pub async fn derive_from_resolved_cached<P: Provider>(
+    seq_reader: &SequencerInboxReader<P>,
+    delayed_reader: &DelayedInboxReader<P>,
+    resolved: Vec<(DeliveredBatch, Vec<u8>)>,
+    to_block: u64,
+    start_delayed_count: u64,
+    window: u64,
+    delayed_cache: &mut DelayedCache,
+    report_cache: &mut ReportStatsCache,
+) -> Result<DerivedRange, L1Error> {
     if resolved.is_empty() {
         return Ok(DerivedRange { messages: Vec::new(), next_delayed_count: start_delayed_count, batches: 0 });
     }
@@ -172,29 +317,31 @@ pub async fn derive_from_resolved<P: Provider>(
     let next_delayed_count = resolved.last().unwrap().0.event.after_delayed_messages_read;
     let batches = resolved.len();
 
+    // Record each in-range batch's stats by data hash (local, no RPC) so a later window's
+    // BatchPostingReport naming one of them — a report is delivered in its batch's L1 block, so
+    // it lands out-of-range one window later — hits `report_cache` instead of re-fetching L1.
+    // Reports for in-range batches are covered by `assemble_feed_messages` itself, so `in_range`
+    // still excludes them from `seed_report_stats`.
+    let in_range: BTreeSet<B256> = resolved
+        .iter()
+        .map(|(b, _)| {
+            let dh = batch_data_hash(b);
+            report_cache.entry(dh).or_insert_with(|| batch_data_stats(&serialize_batch(b)));
+            dh
+        })
+        .collect();
+
     // No delayed messages consumed across the range: skip the (expensive) delayed scan.
     if next_delayed_count <= start_delayed_count {
         let messages = assemble_feed_messages_with_seed(&resolved, &NoDelayed, start_delayed_count, BTreeMap::new())?;
         return Ok(DerivedRange { messages, next_delayed_count, batches });
     }
 
-    let delayed = fetch_delayed_map_covering(
-        delayed_reader,
-        to_block,
-        start_delayed_count,
-        next_delayed_count,
-        window,
-    )
-    .await?;
+    let delayed = delayed_cache
+        .cover(delayed_reader, to_block, start_delayed_count, next_delayed_count, window)
+        .await?;
 
-    // Seed stats for BatchPostingReports that report on batches posted *before* this
-    // range. A report is a delayed message delivered in the same L1 block (and tx) as
-    // the batch it reports; ArbOS fills its stats from that batch (matched by
-    // keccak256(serialized) == data_hash). Reports for in-range batches are covered by
-    // `assemble_feed_messages` itself, so they are skipped here.
-    let in_range: BTreeSet<B256> = resolved.iter().map(|(b, _)| batch_data_hash(b)).collect();
-    let seed_stats =
-        seed_report_stats(seq_reader, &delayed, &in_range).await?;
+    let seed_stats = seed_report_stats(seq_reader, &delayed, &in_range, report_cache).await?;
 
     let messages =
         assemble_feed_messages_with_seed(&resolved, &delayed, start_delayed_count, seed_stats)?;
@@ -202,13 +349,14 @@ pub async fn derive_from_resolved<P: Provider>(
 }
 
 /// Build the `data_hash -> stats` seed for any `BatchPostingReport` in `delayed` whose
-/// reported batch lies outside the current range. Each report names its batch's
-/// sequence number and was delivered in that batch's L1 block, so the batch is fetched
-/// from `report.block_number` and verified by `keccak256(serialized) == data_hash`.
+/// reported batch lies outside the current range. Served from `report_cache` when the batch was
+/// resolved in an earlier window; otherwise the batch is fetched from `report.block_number`
+/// (verified by `keccak256(serialized) == data_hash`) and the result is cached.
 async fn seed_report_stats<P: Provider>(
     seq_reader: &SequencerInboxReader<P>,
     delayed: &DelayedMap,
     in_range: &BTreeSet<B256>,
+    report_cache: &mut ReportStatsCache,
 ) -> Result<BTreeMap<B256, BatchDataStats>, L1Error> {
     let mut seed: BTreeMap<B256, BatchDataStats> = BTreeMap::new();
     for m in delayed.0.values() {
@@ -219,8 +367,14 @@ async fn seed_report_stats<P: Provider>(
         if in_range.contains(&dh) || seed.contains_key(&dh) {
             continue;
         }
+        if let Some(stats) = report_cache.get(&dh) {
+            seed.insert(dh, stats.clone());
+            continue;
+        }
         let seq = report_batch_num(&m.data).ok_or(L1Error::Missing("report batch num"))?;
-        seed.insert(dh, stats_for_reported_batch(seq_reader, m.block_number, seq, dh).await?);
+        let stats = stats_for_reported_batch(seq_reader, m.block_number, seq, dh).await?;
+        report_cache.insert(dh, stats.clone());
+        seed.insert(dh, stats);
     }
     Ok(seed)
 }
