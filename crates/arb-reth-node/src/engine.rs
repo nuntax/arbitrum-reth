@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use alloy_consensus::Header;
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Typed2718;
-use alloy_primitives::{Address, B256, Bytes, Log};
+use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arb_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arb_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arb_reth_evm::ArbEvmConfig;
@@ -29,6 +29,7 @@ use eyre::{WrapErr as _, eyre};
 
 use reth_chain_state::{
     CanonicalInMemoryState, ComputedTrieData, ExecutedBlock, MemoryOverlayStateProviderRef,
+    StateTrieOverlayManager,
 };
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
@@ -41,21 +42,31 @@ use reth_evm::execute::BlockBuilder as _;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::BuiltPayloadExecutedBlock;
-use reth_primitives_traits::{RecoveredBlock, SealedHeader};
-use reth_provider::providers::{BlockchainProvider, ProviderNodeTypes};
+use reth_primitives_traits::{Account, Bytecode, RecoveredBlock, SealedHeader};
+use reth_provider::providers::{
+    BlockchainProvider, OverlayBuilder, OverlayStateProviderFactory, ProviderNodeTypes,
+};
 use reth_provider::{
     BalProvider, BlockNumReader, BlockReader, ChangeSetReader, DatabaseProviderFactory,
-    HashedPostStateProvider, LatestStateProviderRef, ProviderFactory, StateProviderFactory,
-    StateReader, StorageChangeSetReader,
+    HashedPostStateProvider, LatestStateProviderRef, ProviderFactory, ProviderResult,
+    StateProviderFactory, StateReader, StorageChangeSetReader,
 };
 use reth_prune::Pruner;
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
-    DBProvider, PruneCheckpointReader, StageCheckpointReader, StateProvider, StorageSettingsCache,
+    AccountReader, BlockHashReader, BytecodeReader, DBProvider, PruneCheckpointReader,
+    StageCheckpointReader, StateProofProvider, StateProvider, StateRootProvider,
+    StorageRootProvider, StorageSettingsCache,
 };
 use reth_tasks::Runtime;
+use reth_trie_common::{
+    AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage, MultiProof,
+    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput, updates::TrieUpdates,
+};
 use reth_trie_db::ChangesetCache;
+use reth_trie_parallel::root::ParallelStateRoot;
+use revm_database::BundleState;
 
 use crate::{ArbPayloadTypes, ArbPayloadValidator};
 
@@ -221,6 +232,191 @@ pub(crate) fn produce<'a>(
     })
 }
 
+/// A [`StateProvider`] that wraps the ring-overlay trie provider and overrides ONLY the
+/// state-root computation (`state_root_with_updates`) to run in PARALLEL over reth's overlay
+/// factory — the exact, bit-exact-proven recipe used by [`ArbEngineDriver::shadow_compare`].
+///
+/// Everything else delegates to `inner` (the `MemoryOverlayStateProviderRef`), so all reads and
+/// `hashed_post_state` are unchanged. `BlockBuilder::finish` calls `state_root_with_updates`
+/// specifically, so overriding just that method drives the parallel path while leaving `produce`,
+/// the serial `finish` contract, and every other provider method untouched.
+struct ParallelRootProvider<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> {
+    /// The `MemoryOverlayStateProviderRef` — all reads + `hashed_post_state`.
+    inner: Box<dyn StateProvider + 'a>,
+    provider_factory: ProviderFactory<N>,
+    changeset_cache: ChangesetCache,
+    runtime: Runtime,
+    state_trie_overlays: StateTrieOverlayManager<ArbPrimitives>,
+    /// The parent block hash (= current tip hash) the overlay anchors on.
+    parent_hash: B256,
+}
+
+impl<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> BlockHashReader
+    for ParallelRootProvider<'a, N>
+{
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        self.inner.block_hash(number)
+    }
+
+    fn canonical_hashes_range(
+        &self,
+        start: BlockNumber,
+        end: BlockNumber,
+    ) -> ProviderResult<Vec<B256>> {
+        self.inner.canonical_hashes_range(start, end)
+    }
+}
+
+impl<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> AccountReader
+    for ParallelRootProvider<'a, N>
+{
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        self.inner.basic_account(address)
+    }
+}
+
+impl<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> BytecodeReader
+    for ParallelRootProvider<'a, N>
+{
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        self.inner.bytecode_by_hash(code_hash)
+    }
+}
+
+impl<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> StorageRootProvider
+    for ParallelRootProvider<'a, N>
+{
+    fn storage_root(
+        &self,
+        address: Address,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<B256> {
+        self.inner.storage_root(address, hashed_storage)
+    }
+
+    fn storage_proof(
+        &self,
+        address: Address,
+        slot: B256,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageProof> {
+        self.inner.storage_proof(address, slot, hashed_storage)
+    }
+
+    fn storage_multiproof(
+        &self,
+        address: Address,
+        slots: &[B256],
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        self.inner.storage_multiproof(address, slots, hashed_storage)
+    }
+}
+
+impl<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> StateProofProvider
+    for ParallelRootProvider<'a, N>
+{
+    fn proof(
+        &self,
+        input: TrieInput,
+        address: Address,
+        slots: &[B256],
+    ) -> ProviderResult<AccountProof> {
+        self.inner.proof(input, address, slots)
+    }
+
+    fn multiproof(
+        &self,
+        input: TrieInput,
+        targets: MultiProofTargets,
+    ) -> ProviderResult<MultiProof> {
+        self.inner.multiproof(input, targets)
+    }
+
+    fn witness(
+        &self,
+        input: TrieInput,
+        target: HashedPostState,
+        mode: ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
+        self.inner.witness(input, target, mode)
+    }
+}
+
+impl<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> HashedPostStateProvider
+    for ParallelRootProvider<'a, N>
+{
+    fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
+        self.inner.hashed_post_state(bundle_state)
+    }
+}
+
+impl<'a, N> StateRootProvider for ParallelRootProvider<'a, N>
+where
+    N: ProviderNodeTypes<Primitives = ArbPrimitives>,
+    ProviderFactory<N>: DatabaseProviderFactory,
+    <ProviderFactory<N> as DatabaseProviderFactory>::Provider: StageCheckpointReader
+        + PruneCheckpointReader
+        + DBProvider
+        + BlockNumReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + StorageSettingsCache,
+{
+    fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
+        self.inner.state_root(hashed_state)
+    }
+
+    fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
+        self.inner.state_root_from_nodes(input)
+    }
+
+    /// The parallel override: reproduce `shadow_compare`'s proven recipe and return its root +
+    /// updates as the authoritative result (this is what `BlockBuilder::finish` consumes).
+    fn state_root_with_updates(
+        &self,
+        hashed_state: HashedPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        let prefix_sets = hashed_state.construct_prefix_sets().freeze();
+        let overlay_builder = OverlayBuilder::new(self.parent_hash, self.changeset_cache.clone())
+            .with_state_trie_overlay_manager(self.state_trie_overlays.clone())
+            .with_extended_hashed_state_overlay(hashed_state.into_sorted());
+        let overlay_factory =
+            OverlayStateProviderFactory::new(self.provider_factory.clone(), overlay_builder);
+        ParallelStateRoot::new(overlay_factory, prefix_sets, self.runtime.clone())
+            .incremental_root_with_updates()
+            .map_err(reth_provider::ProviderError::from)
+    }
+
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: TrieInput,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_from_nodes_with_updates(input)
+    }
+}
+
+impl<'a, N> StateProvider for ParallelRootProvider<'a, N>
+where
+    N: ProviderNodeTypes<Primitives = ArbPrimitives>,
+    ProviderFactory<N>: DatabaseProviderFactory,
+    <ProviderFactory<N> as DatabaseProviderFactory>::Provider: StageCheckpointReader
+        + PruneCheckpointReader
+        + DBProvider
+        + BlockNumReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + StorageSettingsCache,
+{
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        self.inner.storage(account, storage_key)
+    }
+}
+
 /// Poll the tree's view (events + `best_block_number` + in-memory head) until block `bn` with
 /// hash `expected_hash` is canonical, or a bounded timeout elapses.
 pub(crate) async fn wait_for_head<P>(
@@ -371,6 +567,26 @@ where
     /// Just-executed blocks not yet known to be persisted, oldest→newest, contiguous down to the
     /// persisted tip. Only maintained when `ring_overlay` is on; drained as persistence advances.
     ring: VecDeque<ExecutedBlock<ArbPrimitives>>,
+    /// Shadow validation of the PARALLEL state root against the serial one (env
+    /// `ARB_SHADOW_STATEROOT=1`, ring-overlay only). When on, every produced block also computes
+    /// its root via `reth_trie_parallel::ParallelStateRoot` over the reth overlay factory and
+    /// asserts it (and its `trie_updates`) equal the serial result. The serial result still drives
+    /// the chain — this is a zero-risk correctness+timing probe before flipping parallel on.
+    shadow_stateroot: bool,
+    /// PARALLEL state-root mode (env `ARB_PARALLEL_STATEROOT=1`, ring-overlay only). When on, the
+    /// ring branch of `build_block` wraps the trie provider in [`ParallelRootProvider`] so
+    /// `BlockBuilder::finish` computes the root in parallel (the proven `shadow_compare` recipe) and
+    /// that root DRIVES the produced block. Requires `state_trie_overlays` to be populated, so
+    /// `maintain_ring` feeds the manager when this OR `shadow_stateroot` is on.
+    parallel_stateroot: bool,
+    /// reth's native "ring" for the parallel/overlay path: resolves the (trie + hashed) overlay for
+    /// the unpersisted blocks between the persisted anchor and the parent. Kept in lockstep with
+    /// `ring` (insert on produce, remove on persist). Only populated when `shadow_stateroot` is on.
+    state_trie_overlays: StateTrieOverlayManager<ArbPrimitives>,
+    /// Cloned handles the parallel-root overlay factory needs (mirrors what the engine tree holds).
+    provider_factory: ProviderFactory<N>,
+    changeset_cache: ChangesetCache,
+    runtime: Runtime,
 }
 
 impl<N> ArbEngineDriver<N>
@@ -406,6 +622,17 @@ where
         runtime: Runtime,
         tuning: ArbEngineTuning,
     ) -> eyre::Result<Self> {
+        // Clones for the driver's own parallel-root overlay factory (the originals below are moved
+        // into the persistence service / engine tree). Must be taken before those moves.
+        let driver_factory = factory.clone();
+        let driver_runtime = runtime.clone();
+        let shadow_stateroot = std::env::var("ARB_SHADOW_STATEROOT")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false);
+        let parallel_stateroot = std::env::var("ARB_PARALLEL_STATEROOT")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false);
+
         // ---- persistence service (real MDBX writer, noop pruner) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
             tokio::sync::watch::channel(reth_exex_types::FinishedExExHeight::NoExExs);
@@ -423,12 +650,16 @@ where
         let consensus: Arc<dyn reth_consensus::FullConsensus<ArbPrimitives>> =
             Arc::new(reth_consensus::noop::NoopConsensus::default());
         let changeset_cache = ChangesetCache::new();
+        let driver_changeset_cache = changeset_cache.clone();
         let tree_config = tuning.to_tree_config();
         tracing::info!(
             target: "arb-reth::engine",
             persistence_threshold = tuning.persistence_threshold,
             memory_block_buffer_target = tuning.memory_block_buffer_target,
             persistence_backpressure_threshold = tuning.persistence_backpressure_threshold,
+            ring_overlay = tuning.ring_overlay,
+            shadow_stateroot,
+            parallel_stateroot,
             "engine-tree persistence tuning",
         );
 
@@ -491,6 +722,12 @@ where
             obs_rx,
             ring_overlay: tuning.ring_overlay,
             ring: VecDeque::new(),
+            shadow_stateroot,
+            parallel_stateroot,
+            state_trie_overlays: StateTrieOverlayManager::default(),
+            provider_factory: driver_factory,
+            changeset_cache: driver_changeset_cache,
+            runtime: driver_runtime,
         })
     }
 
@@ -540,7 +777,26 @@ where
                 Box::new(LatestStateProviderRef::new(&db_ro));
             let exec_sp = MemoryOverlayStateProviderRef::new(exec_hist, ring_vec.clone()).boxed();
             let trie_sp = MemoryOverlayStateProviderRef::new(trie_hist, ring_vec).boxed();
-            produce(&self.evm_config, self.chain_id, &self.tip, msg, exec_sp, trie_sp)
+            // Parallel state-root mode: wrap the trie provider so `finish`'s
+            // `state_root_with_updates` runs in parallel and DRIVES the block. Exec provider is
+            // left untouched. Off = the serial `finish` path exactly as before.
+            let trie_sp: Box<dyn StateProvider + '_> = if self.parallel_stateroot {
+                Box::new(ParallelRootProvider {
+                    inner: trie_sp,
+                    provider_factory: self.provider_factory.clone(),
+                    changeset_cache: self.changeset_cache.clone(),
+                    runtime: self.runtime.clone(),
+                    state_trie_overlays: self.state_trie_overlays.clone(),
+                    parent_hash: self.tip.hash(),
+                })
+            } else {
+                trie_sp
+            };
+            let built = produce(&self.evm_config, self.chain_id, &self.tip, msg, exec_sp, trie_sp)?;
+            // Zero-risk probe: also compute the root in parallel and assert it equals the serial
+            // one just produced (serial still drives the chain). No-op unless ARB_SHADOW_STATEROOT.
+            self.shadow_compare(&built);
+            Ok(built)
         } else {
             let exec_sp = self
                 .provider
@@ -554,6 +810,68 @@ where
         }
     }
 
+    /// SHADOW mode (`ARB_SHADOW_STATEROOT=1`): recompute this block's state root in PARALLEL over
+    /// reth's overlay factory (the same wiring the engine tree's `compute_state_root_parallel`
+    /// uses) and assert it — and its `trie_updates` — equal the serial result already in `built`.
+    /// The serial result is authoritative and drives the chain regardless; this only logs a
+    /// MATCH (with the parallel timing, so we can read the crossover) or a MISMATCH warning. This
+    /// is the correctness gate before we ever let the parallel root drive a produced block.
+    fn shadow_compare(&self, built: &BuiltPayloadExecutedBlock<ArbPrimitives>) {
+        if !self.shadow_stateroot {
+            return;
+        }
+        let number = built.recovered_block.header().number;
+        let serial_root = built.recovered_block.header().state_root;
+
+        // Prefix sets = which subtries this block changed; the overlay carries the state.
+        let hashed = built.hashed_state.as_ref();
+        let prefix_sets = hashed.construct_prefix_sets().freeze();
+        // parent_hash = the parent of this block (= current tip); the manager resolves the anchor
+        // (persisted tip) and the (anchor, parent] overlay internally, mirroring `trie_input()`.
+        let overlay_builder = OverlayBuilder::new(self.tip.hash(), self.changeset_cache.clone())
+            .with_state_trie_overlay_manager(self.state_trie_overlays.clone())
+            .with_extended_hashed_state_overlay(hashed.clone().into_sorted());
+        let overlay_factory =
+            OverlayStateProviderFactory::new(self.provider_factory.clone(), overlay_builder);
+
+        let started = std::time::Instant::now();
+        let result = ParallelStateRoot::new(overlay_factory, prefix_sets, self.runtime.clone())
+            .incremental_root_with_updates();
+        let us_parallel = started.elapsed().as_micros() as u64;
+
+        match result {
+            Ok((par_root, par_updates)) => {
+                let root_ok = par_root == serial_root;
+                let updates_ok =
+                    par_updates.into_sorted() == (*built.trie_updates).clone().into_sorted();
+                if root_ok && updates_ok {
+                    tracing::debug!(
+                        target: "arb-reth::engine::timing",
+                        number,
+                        us_parallel_root = us_parallel,
+                        "shadow state-root MATCH",
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "arb-reth::engine",
+                        number,
+                        %serial_root,
+                        %par_root,
+                        root_ok,
+                        updates_ok,
+                        "shadow state-root MISMATCH (serial drives the chain; parallel is wrong)",
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                target: "arb-reth::engine",
+                number,
+                error = %err,
+                "shadow parallel state-root errored",
+            ),
+        }
+    }
+
     /// Push the just-produced block onto the ring, then drop entries the DB has now persisted.
     /// No-op unless `ring_overlay` is on.
     fn maintain_ring(&mut self, built: &BuiltPayloadExecutedBlock<ArbPrimitives>) {
@@ -564,21 +882,34 @@ where
         // extends from sorted). `built` carries the unsorted forms; sort clones here.
         let hashed = Arc::new((*built.hashed_state).clone().into_sorted());
         let trie = Arc::new((*built.trie_updates).clone().into_sorted());
-        self.ring.push_back(ExecutedBlock::new(
+        let exec = ExecutedBlock::new(
             built.recovered_block.clone(),
             built.execution_output.clone(),
             ComputedTrieData::new(hashed, trie),
-        ));
+        );
+        // Mirror the block into reth's overlay manager (the parallel/shadow root path reads it),
+        // in lockstep with `ring`. Only when shadowing or driving the parallel root, to avoid its
+        // cache work otherwise.
+        if self.shadow_stateroot || self.parallel_stateroot {
+            self.state_trie_overlays.insert_block(exec.clone());
+        }
+        self.ring.push_back(exec);
         // Prune everything at/below the persisted (on-disk) tip. Use the RO provider's tip, NOT
         // `BlockchainProvider::best_block_number` (that's the in-memory canonical tip).
         if let Ok(db_ro) = self.provider.database_provider_ro() {
             if let Ok(persisted) = db_ro.best_block_number() {
+                let mut pruned: Vec<B256> = Vec::new();
                 while self
                     .ring
                     .front()
                     .is_some_and(|b| b.recovered_block.header().number <= persisted)
                 {
-                    self.ring.pop_front();
+                    if let Some(b) = self.ring.pop_front() {
+                        pruned.push(b.recovered_block.hash());
+                    }
+                }
+                if (self.shadow_stateroot || self.parallel_stateroot) && !pruned.is_empty() {
+                    self.state_trie_overlays.remove_blocks(pruned);
                 }
             }
         }
