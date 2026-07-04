@@ -21,6 +21,7 @@ use arb_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arb_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
+use arb_revm::ArbosState;
 use arb_revm::executor::{
     ArbExecCfg, ArbParentHeader, digest_message, scheduled_retries_from_redeem_logs,
 };
@@ -66,6 +67,7 @@ use reth_trie_common::{
 };
 use reth_trie_db::ChangesetCache;
 use reth_trie_parallel::root::ParallelStateRoot;
+use revm::context_interface::ContextTr as _;
 use revm_database::BundleState;
 
 use crate::{ArbPayloadTypes, ArbPayloadValidator};
@@ -158,6 +160,27 @@ pub fn produce<'a>(
     // (first observed as a state-root divergence at Arb One block 22476703; real cause at 22476646).
     let mut user_txs: VecDeque<ArbTxEnvelope> = input.message.txs.into_iter().collect();
     let mut redeems: VecDeque<ArbTxEnvelope> = VecDeque::new();
+    // Set the block's L2 base fee. ArbOS stores `L2PricingState.BaseFeeWei` = the fee for the NEXT
+    // block (each block's start-block `update_pricing_model` computes and stores the successor's
+    // fee). So THIS block's basefee is the value already in state at block start — what the PARENT's
+    // update produced — read here BEFORE the start-block tx overwrites it with the next block's fee.
+    // Our block env was seeded with the parent HEADER's basefee (`config.rs` `next_evm_env`), which
+    // is the fee from TWO blocks back and is only correct while the fee sits at the `minBaseFee`
+    // floor. Fixing it makes user txs pay the right L2 fee + L1 poster gas (posterCost / basefee),
+    // and the sealed header (assembler reads `block_env.basefee()`) carry it. First observed at Arb
+    // One 23204013, the first block the gas backlog pushed the fee above the floor: correct header
+    // basefee 100120000 (parent's stored fee) vs our stale 1e8 (parent header) → poster gas +537.
+    let block_base_fee = ArbosState::open()
+        .l2_pricing
+        .base_fee_wei
+        .get(builder.evm_mut().ctx_mut().journal_mut())
+        .map_err(|e| eyre!("read L2 base fee for block env: {e}"))?;
+    let block_base_fee = u64::try_from(block_base_fee).unwrap_or(u64::MAX);
+    builder
+        .evm_mut()
+        .ctx_mut()
+        .modify_block(|b| b.basefee = block_base_fee);
+
     let mut first = builder.executor().start_block_tx();
     loop {
         let tx = if let Some(t) = first.take() {
