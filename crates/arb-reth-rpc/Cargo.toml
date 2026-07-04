@@ -1,0 +1,40 @@
+[package]
+name = "arb-reth-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Arbitrum `eth_*` RPC layer: the `ArbReceiptConverter` (surfaces `gas_used_for_l1`) and the
+# standalone `serve_rpc` helper. Intentionally isolated from `RpcAddOns` and the engine so it can
+# be swapped for `RpcAddOns`-based wiring later. Split out of `arb-reth-node`.
+
+[dependencies]
+arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth"] }
+arb-alloy-network = { path = "../../../arb-alloy/crates/network" }
+arb-alloy-rpc-types = { path = "../../../arb-alloy/crates/rpc-types", features = ["reth-compat"] }
+arb-reth-evm = { path = "../arb-reth-evm", features = ["rpc"] }
+
+alloy-consensus = { version = "2.0", default-features = false }
+alloy-primitives = { version = "1", default-features = false }
+alloy-rpc-types-eth = { version = "2.0", default-features = false }
+eyre = "0.6.12"
+
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-primitives-traits = { version = "0.5.0", default-features = false }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["db-api"] }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-tokio-util = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-network-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }

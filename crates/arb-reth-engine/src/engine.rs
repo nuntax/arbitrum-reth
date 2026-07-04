@@ -1,6 +1,6 @@
 //! Tier-1 engine-tree driver: reusable production code lifted from the `engine_spike` gate.
 //!
-//! [`ArbEngineDriver`] stands up reth's [`EngineApiTreeHandler`] for [`crate::ArbNode`] and drives
+//! [`ArbEngineDriver`] stands up reth's [`EngineApiTreeHandler`] for `ArbNode` and drives
 //! `feed message → executed block → InsertExecutedBlock + ForkchoiceUpdated → canonicalize` with
 //! ASYNC persistence: production waits only for fast in-memory canonicalization while the tree's
 //! persistence service flushes to MDBX in the background.
@@ -70,7 +70,7 @@ use revm_database::BundleState;
 
 use crate::{ArbPayloadTypes, ArbPayloadValidator};
 
-/// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for [`crate::ArbNode`].
+/// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
 type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
 >;
@@ -83,7 +83,7 @@ type ToTree = crossbeam_channel::Sender<
 /// `provider.state_by_block_hash(parent)` path and the immune ring overlay. Returns a
 /// [`BuiltPayloadExecutedBlock`] (unsorted hashed/trie) ready to feed the tree via
 /// `InsertExecutedBlock` — it does NOT persist.
-pub(crate) fn produce<'a>(
+pub fn produce<'a>(
     evm_config: &ArbEvmConfig,
     chain_id: u64,
     parent: &SealedHeader<Header>,
@@ -419,7 +419,7 @@ where
 
 /// Poll the tree's view (events + `best_block_number` + in-memory head) until block `bn` with
 /// hash `expected_hash` is canonical, or a bounded timeout elapses.
-pub(crate) async fn wait_for_head<P>(
+pub async fn wait_for_head<P>(
     provider: &P,
     canonical: &CanonicalInMemoryState<ArbPrimitives>,
     obs_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(u64, B256)>,
@@ -526,7 +526,7 @@ impl ArbEngineTuning {
     }
 }
 
-/// Tier-1 engine-tree driver for [`crate::ArbNode`].
+/// Tier-1 engine-tree driver for `ArbNode`.
 ///
 /// Owns the tree's request sender, the current tip, and a receiver of canonicalization
 /// observations. Each [`advance`](ArbEngineDriver::advance) produces a block against the tree

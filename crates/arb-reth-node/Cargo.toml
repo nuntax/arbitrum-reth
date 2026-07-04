@@ -48,6 +48,7 @@ arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network" }
 
 # Stage F.3c: L1-derivation catch-up runtime (SequencerInbox + delayed inbox -> feed).
 arb-reth-l1 = { path = "../arb-reth-l1" }
+arb-reth-sync = { path = "../arb-reth-sync" }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
 
 # D.3b: NodeBuilder integration (Node<N> + noop components + custom LaunchNode)
@@ -83,7 +84,8 @@ reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
-# D.5: eth_* RPC layer (receipt converter + serve_rpc helper)
+# D.5: eth_* RPC layer (receipt converter + serve_rpc helper) — now in the arb-reth-rpc crate.
+arb-reth-rpc = { path = "../arb-reth-rpc" }
 arb-alloy-network = { path = "../../../arb-alloy/crates/network" }
 arb-alloy-rpc-types = { path = "../../../arb-alloy/crates/rpc-types", features = ["reth-compat"] }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
@@ -96,7 +98,8 @@ reth-network-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224
 reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-tokio-util = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
-# Tier-1 engine-tree driver (engine.rs): EngineApiTreeHandler + BasicEngineValidator + persistence.
+# Tier-1 engine-tree driver: now in the arb-reth-engine crate (payload stubs + ArbEngineDriver).
+arb-reth-engine = { path = "../arb-reth-engine" }
 reth-engine-tree = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-prune = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }

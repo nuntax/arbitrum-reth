@@ -1,0 +1,26 @@
+[package]
+name = "arb-reth-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Stage F.3c catch-up runtime: drives `arb-reth-l1`'s SequencerInbox/delayed-inbox readers over L1
+# windows (with prefetch) into a feed-message channel, and the `arb-l1-resume.json` checkpoint log
+# (`resume`) that makes the walk resumable. Split out of `arb-reth-node`; the fetch/derive primitives
+# stay in `arb-reth-l1`, the node just consumes `run_l1_sync`.
+
+[dependencies]
+arb-reth-l1 = { path = "../arb-reth-l1" }
+arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false, features = ["std"] }
+
+alloy-primitives = { version = "1", default-features = false }
+alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
+eyre = "0.6.12"
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+reth-db = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["test-utils"] }
