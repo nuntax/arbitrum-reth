@@ -95,6 +95,14 @@ reth-network-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224
 reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-tokio-util = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
+# Tier-1 engine-tree driver (engine.rs): EngineApiTreeHandler + BasicEngineValidator + persistence.
+reth-engine-tree = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-prune = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-exex-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-stages-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+crossbeam-channel = "0.5"
+
 [dev-dependencies]
 serde_json = { workspace = true }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["test-utils"] }
@@ -105,3 +113,6 @@ tempfile = "3"
 arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth", "k256"] }
 # Per-block replay-parity test: seed the real ArbOS genesis block into the test factory.
 reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+
+# engine_spike / engine: Tier-1 engine-tree deps live in [dependencies] now (used by engine.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

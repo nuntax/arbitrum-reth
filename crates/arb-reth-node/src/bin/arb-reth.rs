@@ -1,9 +1,9 @@
-//! `arb-reth`: runnable entrypoint for the no-engine Arbitrum node (D.3b.4).
+//! `arb-reth`: runnable entrypoint for the Arbitrum engine-tree node.
 //!
-//! This wires the CLI to the [`ArbLauncher`] custom `LaunchNode` (D.3b): it opens
-//! an on-disk MDBX database under the data directory, boots reth's `LaunchContext`
-//! provider/blockchain-db stack (no engine; see `launcher.rs`), spawns the
-//! `ArbChainDriver` block producer, and optionally serves the `eth_*` JSON-RPC API.
+//! This wires the CLI to the [`ArbLauncher`] custom `LaunchNode`: it opens an on-disk MDBX
+//! database under the data directory, boots reth's `LaunchContext` provider/blockchain-db
+//! stack, spawns the `ArbEngineDriver` block producer (which drives reth's engine tree; see
+//! `launcher.rs`), and optionally serves the `eth_*` JSON-RPC API.
 //!
 //! ## What this is (and isn't) yet
 //!
@@ -28,13 +28,15 @@ use alloy_provider::ProviderBuilder;
 use arb_reth_l1::SequencerInboxReader;
 use arb_reth_node::{
     arb_chain_spec, arbos_init_from_chain_config_json, ArbNode, ARB_ONE_CHAIN_ID,
+    L1ResumeLog,
 };
 use arb_reth_node::launcher::ArbLauncher;
+use reth_provider::BlockNumReader;
 use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
 use clap::Parser;
 use reth_chainspec::MAINNET;
 use reth_cli_runner::{CliContext, CliRunner};
-use reth_db::{init_db, mdbx::DatabaseArguments, ClientVersion};
+use reth_db::{init_db, mdbx::DatabaseArguments, mdbx::SyncMode, ClientVersion};
 use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
 use reth_node_core::{
     args::DatadirArgs,
@@ -74,9 +76,36 @@ struct Args {
     #[arg(long = "http.port", default_value_t = 8545)]
     http_port: u16,
 
-    /// Flush produced blocks to disk every N blocks (1 = every block).
-    #[arg(long, default_value_t = 1)]
+    /// Engine-tree persistence threshold: persist once the canonical tip is this many blocks
+    /// ahead of the last persisted block (larger = bigger, less frequent commit batches).
+    /// WARNING: deep buffers are not parity-safe — the overlay read in produce() goes stale and
+    /// crashes with "lack of funds". Keep shallow until that read-path bug is fixed.
+    #[arg(long, default_value_t = 2)]
     persistence_threshold: u64,
+
+    /// Engine-tree memory buffer target: keep this many recent blocks in memory before flushing.
+    #[arg(long = "memory-buffer-target", default_value_t = 0)]
+    memory_buffer_target: u64,
+
+    /// Engine-tree backpressure threshold: stall block production once this many blocks are
+    /// unpersisted (bounds memory; larger = production runs further ahead of the disk).
+    #[arg(long = "persistence-backpressure", default_value_t = 16)]
+    persistence_backpressure: u64,
+
+    /// EXPERIMENTAL: read parent state for block production from a driver-held ring of just-executed
+    /// blocks overlaid on the immune latest state provider, instead of `state_by_block_hash(parent)`.
+    /// Eliminates the torn-read hazard so deep buffers become parity-safe. A/B against the default.
+    #[arg(long = "ring-overlay", default_value_t = false)]
+    ring_overlay: bool,
+
+    /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
+    /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
+    /// child), but the OS flushes lazily — cutting ~50ms fsync latency off every block. Stays
+    /// crash-consistent (MDBX rolls back to the last synced meta page on restart); the only loss
+    /// on a crash is a suffix of recently-produced blocks, which the L1 derivation re-produces.
+    /// Do NOT use for a node expected to be durable across power loss without re-sync.
+    #[arg(long = "no-fsync", default_value_t = false)]
+    no_fsync: bool,
 
     /// Arbitrum execution chain id used by the block driver.
     #[arg(long, default_value_t = ARB_ONE_CHAIN_ID)]
@@ -111,15 +140,21 @@ struct Args {
     #[arg(long = "l1-beacon", value_name = "URL")]
     l1_beacon: Option<String>,
 
-    /// First L1 block to derive from. Optional override: for a genesis snapshot the resume point
-    /// is resolved from the chain (batch 0's delivery block), so it need not be supplied. Required
-    /// for a non-genesis snapshot until arbitrumdata-based auto-resume lands.
+    /// First L1 block to derive from. Optional override: normally the resume point comes from the
+    /// persisted `arb-l1-resume.json` checkpoint (updated as the node syncs), or, on the first sync
+    /// of a genesis snapshot, from the chain (batch 0's delivery block). Pass this only to force a
+    /// start block — it must be the batch boundary the current L2 tip was built from.
     #[arg(long = "l1-start-block")]
     l1_start_block: Option<u64>,
 
     /// Last L1 block to derive (inclusive). Omit to follow the L1 head indefinitely.
     #[arg(long = "l1-end-block")]
     l1_end_block: Option<u64>,
+
+    /// Concurrent L1 `resolve_batches` prefetch depth during catch-up (overlaps getLogs/blob
+    /// RPC latency). Higher = faster catch-up until the L1 provider rate-limits. 1 = serial.
+    #[arg(long = "l1-prefetch", default_value_t = 6)]
+    l1_prefetch: u64,
 
     /// Delayed cursor before the start block. Optional override: defaults to the snapshot tip
     /// header's nonce (the L2 tip's `delayedMessagesRead`), so it need not be supplied.
@@ -154,12 +189,10 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     // `snapshot_delayed` carries the L2 tip's `delayedMessagesRead` (the header nonce) so the
     // L1-sync delayed cursor defaults to it without a manual flag.
     let mut snapshot_delayed: Option<u64> = None;
-    let mut snapshot_tip: Option<u64> = None;
     let (chain_spec, effective_chain_id) = match (&args.snapshot_head, &args.chain_config) {
         (Some(head_path), _) => {
             let (num, hash, header) = arb_reth_node::read_head_header(head_path)?;
             snapshot_delayed = Some(u64::from_be_bytes(header.nonce.0));
-            snapshot_tip = Some(num);
             info!(
                 target: "arb-reth",
                 head_block = num, %hash, chain_id = args.chain_id,
@@ -194,9 +227,16 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     let config = NodeConfig::new(chain_spec).with_datadir_args(datadir_args);
     let data_dir = config.datadir();
 
+    // Resolve the L1-derivation resume log path before `data_dir` is moved into the launcher.
+    let resume_checkpoint_path = L1ResumeLog::path_in(data_dir.data_dir());
+
     let db_path = data_dir.db();
-    info!(target: "arb-reth", path = ?db_path, "opening database");
-    let db = init_db(db_path, DatabaseArguments::new(ClientVersion::default()))?;
+    info!(target: "arb-reth", path = ?db_path, no_fsync = args.no_fsync, "opening database");
+    let mut db_args = DatabaseArguments::new(ClientVersion::default());
+    if args.no_fsync {
+        db_args = db_args.with_sync_mode(Some(SyncMode::SafeNoSync));
+    }
+    let db = init_db(db_path, db_args)?;
 
     let node_builder = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
@@ -208,7 +248,12 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     let launcher = ArbLauncher {
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
         chain_id: effective_chain_id,
-        persistence_threshold: args.persistence_threshold,
+        tuning: arb_reth_node::ArbEngineTuning {
+            persistence_threshold: args.persistence_threshold,
+            memory_block_buffer_target: args.memory_buffer_target,
+            persistence_backpressure_threshold: args.persistence_backpressure,
+            ring_overlay: args.ring_overlay,
+        },
         messages: feed_rx,
         rpc_addr,
     };
@@ -271,68 +316,103 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     // same channel the driver drains, so derived blocks execute through the validated
     // STF path. The held sender keeps the node alive even after a bounded run finishes.
     if let Some(l1_rpc) = args.l1_rpc {
-        // Both the L1 start block and the delayed cursor are properties of the snapshot, not
-        // per-run inputs. The delayed cursor is the tip header's nonce. The start block is the
-        // resume point's batch boundary: for a genesis snapshot that is batch 0, whose L1 delivery
-        // block we resolve from the chain (anchored at the SequencerInbox deploy block) rather than
-        // assuming a literal. Flags override both; a non-genesis snapshot must supply the start
-        // block until arbitrumdata-based auto-resume lands.
-        let start_block = match args.l1_start_block {
-            Some(b) => b,
-            None => {
-                let tip = snapshot_tip.ok_or_else(|| {
-                    eyre::eyre!(
-                        "--l1-rpc without --l1-start-block needs --snapshot-head to resolve the \
-                         L1 resume point"
-                    )
-                })?;
-                if tip != arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET {
+        // The current durable L2 tip (`last_block_number` = the persisted DB head, not the
+        // in-memory canonical head). The driver already boots its production tip from this block
+        // (via reth's `lookup_head`), so L1 derivation must resume so that its first NEW block is
+        // `db_tip + 1`. Every block at or below `db_tip` that gets re-derived is dropped downstream.
+        let db_tip = handle.provider.last_block_number()?;
+
+        // The resume log lives in the data directory and is updated as sync advances, so a restart
+        // lifts off where it stopped instead of re-deriving from Nitro genesis.
+        let checkpoint_path = resume_checkpoint_path;
+        let resume_log = L1ResumeLog::load(&checkpoint_path);
+
+        // Resolve the L1 derivation resume point: (start_block, start_delayed, start_l2_block).
+        // `start_l2_block` is the L2 block the start point sits *after*; derived blocks are numbered
+        // from it so already-present ones can be dropped. Precedence: an explicit --l1-start-block
+        // override, else the persisted checkpoint, else the genesis-snapshot bootstrap.
+        let (start_block, start_delayed, start_l2_block) = if let Some(b) = args.l1_start_block {
+            // Manual override: the operator asserts `b` is the batch boundary the tip was built
+            // from, so the next derived block is `db_tip + 1`.
+            let delayed = args.l1_start_delayed.or(snapshot_delayed).unwrap_or(0);
+            info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 resume point: --l1-start-block override");
+            (b, delayed, db_tip)
+        } else if let Some(log) = &resume_log {
+            // Persisted log: resume from the newest boundary at or below the durable tip. Boundaries
+            // are only logged once their blocks are durable, so normally that is the newest entry.
+            // If every boundary is ABOVE the tip (e.g. a `SafeNoSync` power-loss rolled the DB back
+            // further than the log reaches), refuse rather than silently leave a gap.
+            match log.resume_for(db_tip) {
+                Some(cp) => {
+                    info!(
+                        target: "arb-reth",
+                        l1_block = cp.l1_block, delayed = cp.delayed_count, l2_block = cp.l2_block, db_tip,
+                        "L1 resume point: persisted checkpoint",
+                    );
+                    (cp.l1_block, cp.delayed_count, cp.l2_block)
+                }
+                None => {
                     return Err(eyre::eyre!(
-                        "non-genesis snapshot (L2 tip {tip}) carries no embedded L1 resume \
-                         position; pass --l1-start-block (the batch boundary the tip was built \
-                         from) [arbitrumdata-based auto-resume not yet implemented]"
+                        "resume log at {} has no boundary at or below the durable L2 tip ({db_tip}); \
+                         the database was rolled back further than the log reaches — reset the \
+                         datadir and re-sync (or delete the log)",
+                        checkpoint_path.display(),
                     ));
                 }
-                // Genesis snapshot → resume from batch 0; resolve its delivery block on-chain.
-                let provider = ProviderBuilder::new().connect_http(
-                    l1_rpc.parse().map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?,
-                );
-                let reader =
-                    SequencerInboxReader::new(provider, arb_reth_l1::SEQUENCER_INBOX_MAINNET);
-                let block = reader
-                    .delivery_block_of_batch(
-                        0,
-                        arb_reth_l1::SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET,
-                        1_000,
-                    )
-                    .await
-                    .map_err(|e| eyre::eyre!("resolve batch 0 delivery block: {e}"))?
-                    .ok_or_else(|| {
-                        eyre::eyre!("batch 0 not found near the SequencerInbox deploy block")
-                    })?;
-                info!(
-                    target: "arb-reth",
-                    batch = 0, l1_block = block,
-                    "resolved genesis-snapshot L1 resume point",
-                );
-                block
             }
+        } else {
+            // No checkpoint: re-derive from Nitro genesis (batch 0), anchoring the L2 numbering at
+            // genesis. For a fresh genesis DB this is the normal bootstrap (nothing is skipped). For
+            // a DB that advanced past genesis but has no checkpoint — a rewound DB, or one synced by
+            // a build predating the resume log — the L1-sync runtime re-derives from genesis and
+            // DROPS every block <= db_tip (derivation only, no re-execution), producing just the new
+            // tail. Slower to start than a checkpoint resume, but always correct and self-healing;
+            // the first window past db_tip writes a fresh checkpoint so later restarts are fast.
+            if db_tip != arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET {
+                info!(
+                    target: "arb-reth", db_tip,
+                    genesis = arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET,
+                    "no resume checkpoint; re-deriving from Nitro genesis and skipping already-present blocks",
+                );
+            }
+            // Resolve batch 0's delivery block on-chain (anchored at the SequencerInbox deploy
+            // block) rather than assuming a literal.
+            let provider = ProviderBuilder::new().connect_http(
+                l1_rpc.parse().map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?,
+            );
+            let reader = SequencerInboxReader::new(provider, arb_reth_l1::SEQUENCER_INBOX_MAINNET);
+            let block = reader
+                .delivery_block_of_batch(0, arb_reth_l1::SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET, 1_000)
+                .await
+                .map_err(|e| eyre::eyre!("resolve batch 0 delivery block: {e}"))?
+                .ok_or_else(|| eyre::eyre!("batch 0 not found near the SequencerInbox deploy block"))?;
+            // Genesis delayed cursor is 0; anchor L2 numbering at genesis so the skip threshold
+            // (db_tip) lines up with the absolute block numbers derivation produces.
+            let delayed = args.l1_start_delayed.unwrap_or(0);
+            info!(target: "arb-reth", batch = 0, l1_block = block, delayed, "L1 resume point: genesis (batch 0)");
+            (block, delayed, arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET)
         };
-        let start_delayed = args
-            .l1_start_delayed
-            .or(snapshot_delayed)
-            .unwrap_or(0);
+
         let mut sync_cfg = arb_reth_node::L1SyncConfig::mainnet(l1_rpc, start_block, start_delayed);
         sync_cfg.l1_beacon = args.l1_beacon;
         sync_cfg.end_block = args.l1_end_block;
+        sync_cfg.prefetch_windows = args.l1_prefetch;
+        sync_cfg.start_l2_block = start_l2_block;
+        sync_cfg.db_tip_l2 = db_tip;
+        sync_cfg.checkpoint_path = Some(checkpoint_path);
+
+        // Read the durable L2 tip on demand so checkpoint writes only advance past blocks that are
+        // actually on disk (`last_block_number`, not the in-memory canonical head).
+        let tip_provider = handle.provider.clone();
+        let persisted_tip = move || tip_provider.last_block_number().unwrap_or(0);
 
         let tx = feed_tx.clone();
         task_executor.spawn_task(async move {
-            if let Err(e) = arb_reth_node::run_l1_sync(sync_cfg, tx).await {
+            if let Err(e) = arb_reth_node::run_l1_sync(sync_cfg, tx, persisted_tip).await {
                 reth_tracing::tracing::error!(target: "arb-reth", err = %e, "L1 sync failed");
             }
         });
-        info!(target: "arb-reth", start_block, start_delayed, "L1-derivation catch-up started");
+        info!(target: "arb-reth", start_block, start_delayed, start_l2_block, db_tip, "L1-derivation catch-up started");
     }
 
     // Hold feed_tx alive so the driver parks on the channel rather than exiting.

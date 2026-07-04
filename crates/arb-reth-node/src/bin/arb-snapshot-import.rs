@@ -43,20 +43,21 @@ use alloy_genesis::{ChainConfig, Genesis};
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_db::{init_db, mdbx::DatabaseArguments, ClientVersion};
 use reth_db_api::{
-    cursor::{DbCursorRW, DbDupCursorRW},
+    cursor::DbCursorRW,
     tables,
-    transaction::{DbTx, DbTxMut},
+    transaction::DbTxMut,
 };
 use reth_primitives_traits::{Account, Bytecode, SealedHeader};
 use reth_provider::{
     providers::{RocksDBProvider, StaticFileProvider},
-    DBProvider, ProviderFactory, StorageSettingsCache, TrieWriter,
+    DBProvider, MetadataWriter, ProviderFactory, StorageSettingsCache, TrieWriter,
 };
+use reth_db_api::models::StorageSettings;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::StorageEntry;
 use reth_tasks::Runtime;
 use reth_trie::{IntermediateStateRootState, StateRoot as StateRootComputer, StateRootProgress};
-use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter};
+use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, PackedKeyAdapter};
 
 // Boot-wiring (#52): write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
@@ -74,9 +75,12 @@ use reth_storage_api::HeaderProvider;
 #[no_mangle]
 pub unsafe extern "C" fn __rust_probestack() {}
 
-// Arbitrum One Nitro uses LegacyKeyAdapter (storage v1) for genesis state.
+// Storage v2 keys trie nodes with `PackedKeyAdapter` (v1 used `LegacyKeyAdapter`). The state root
+// is adapter-independent (the MPT hash of key→value), so the genesis root still validates; only the
+// on-disk trie-node key encoding changes. The v2 flag must be cached on the factory *before* this
+// runs, so `write_trie_updates` (which follows the cached settings) writes packed keys too.
 type DbStateRoot<'a, TX> = StateRootComputer<
-    DatabaseTrieCursorFactory<&'a TX, LegacyKeyAdapter>,
+    DatabaseTrieCursorFactory<&'a TX, PackedKeyAdapter>,
     DatabaseHashedCursorFactory<&'a TX>,
 >;
 
@@ -157,7 +161,7 @@ fn run(args: Args) -> eyre::Result<()> {
     };
 
     let static_file_provider =
-        StaticFileProvider::read_write(static_files_path)?;
+        StaticFileProvider::read_write(static_files_path.clone())?;
     let rocksdb_provider = RocksDBProvider::builder(&rocksdb_path)
         .with_default_tables()
         .build()
@@ -173,7 +177,18 @@ fn run(args: Args) -> eyre::Result<()> {
     )
     .map_err(|e| eyre::eyre!("ProviderFactory::new: {e}"))?;
 
-    tracing::info!(path = ?args.state, "streaming state import");
+    // Emit a storage-v2 database (reth's default going forward; also the more natural fit for our
+    // hashed-only import, since v2 treats the hashed-state tables as canonical). Cache the flag so
+    // every provider — and `write_trie_updates`' `with_adapter!` — uses `PackedKeyAdapter`, and
+    // persist it to metadata so the node reads v2 on boot (an unset flag defaults to v1).
+    factory.set_storage_settings_cache(StorageSettings::v2());
+    {
+        let provider_rw = factory.database_provider_rw()?;
+        provider_rw.write_storage_settings(StorageSettings::v2())?;
+        provider_rw.commit().map_err(|e| eyre::eyre!("persist storage settings: {e}"))?;
+    }
+
+    tracing::info!(path = ?args.state, "streaming state import (storage v2)");
     stream_import(&factory, &args.state)?;
 
     tracing::info!("computing state root (may take several minutes for large states)");
@@ -195,6 +210,50 @@ fn run(args: Args) -> eyre::Result<()> {
         verify_launch(&factory, head_hash)?;
     }
 
+    // The changeset segments were created in their fixed 500k slot (`_22000000_…`) but
+    // `set_expected_block_start(head)` moved their header's expected range to start at `head`.
+    // reth derives the on-disk filename from the header's expected range (via the index), so the
+    // file must be renamed to match or every changeset read fails with a missing-file error. Do it
+    // now, at the filesystem level, after all DB work — the factory is about to be dropped and the
+    // node re-scans on boot.
+    drop(factory);
+    rename_changeset_files_to_header(&static_files_path)?;
+
+    Ok(())
+}
+
+/// Rename the changeset static-file segments so their on-disk name matches the `expected_block_range`
+/// recorded in their header. The import creates them in the fixed 500k slot (e.g. `_22000000_…`) and
+/// then `set_expected_block_start(head)` shifts the header's expected start to `head`; reth resolves
+/// the file path from the header's expected range, so the name must agree or reads miss the file.
+/// Idempotent: only renames when the name doesn't already match the header.
+fn rename_changeset_files_to_header(static_files: &std::path::Path) -> eyre::Result<()> {
+    for seg in ["account-change-sets", "storage-change-sets"] {
+        let prefix = format!("static_file_{seg}_");
+        let data_name = std::fs::read_dir(static_files)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with(&prefix) && !n.contains('.'));
+        let Some(data_name) = data_name else { continue };
+        let conf = std::fs::read(static_files.join(format!("{data_name}.conf")))?;
+        if conf.len() < 24 {
+            continue;
+        }
+        let exp_start = u64::from_le_bytes(conf[8..16].try_into().unwrap());
+        let exp_end = u64::from_le_bytes(conf[16..24].try_into().unwrap());
+        let want = format!("static_file_{seg}_{exp_start}_{exp_end}");
+        if data_name == want {
+            continue; // already matches header
+        }
+        for ext in ["", ".conf", ".off", ".csoff"] {
+            let src = static_files.join(format!("{data_name}{ext}"));
+            let dst = static_files.join(format!("{want}{ext}"));
+            if src.exists() && src != dst {
+                std::fs::rename(&src, &dst)?;
+            }
+        }
+        tracing::info!(seg, from = %data_name, to = %want, "renamed changeset file to match header expected range");
+    }
     Ok(())
 }
 
@@ -258,8 +317,7 @@ fn read_head_header(path: &PathBuf) -> eyre::Result<(u64, B256, Header)> {
 /// no re-write), confirming a node would open this DB cleanly.
 fn verify_launch(factory: &ProviderFactory<ArbNodeTypesWithDB>, head_hash: B256) -> eyre::Result<()> {
     use reth_db_common::init::init_genesis_with_settings_and_validate;
-    use reth_db_api::models::StorageSettings;
-    let got = init_genesis_with_settings_and_validate(factory, StorageSettings::v1(), true)
+    let got = init_genesis_with_settings_and_validate(factory, StorageSettings::v2(), true)
         .map_err(|e| eyre::eyre!("init_genesis (launch genesis check) rejected the DB: {e}"))?;
     println!("init_genesis (validate=true) = {got:#x}");
     if got == head_hash {
@@ -317,17 +375,46 @@ fn write_head_blocks(
         count += 1;
     }
 
-    // Initialize the Transactions + Receipts static-file segments to the head block. Without
-    // this, reth's launch `check_consistency` sees those segments empty (highest block None)
-    // while the stage checkpoints say `head_num`, and unwinds to block 0. The head block has no
-    // txs/receipts, so the segments stay empty — only the block range needs setting. Mirrors
-    // reth `init_genesis`'s non-zero-genesis path (db-common init.rs).
+    // Initialize the per-block static-file segments to the head block. Without this, reth's launch
+    // `check_consistency` sees those segments empty (highest block None) while the stage checkpoints
+    // say `head_num`, and unwinds to block 0. The head block has no txs/receipts, so the segments
+    // stay empty — only the block range / expected start needs setting. Mirrors reth `init_genesis`'s
+    // non-zero-genesis v2 path (db-common init.rs): Receipts/Transactions/TransactionSenders use
+    // `set_block_range`; the changeset segments use `set_expected_block_start` (their block range is
+    // established lazily on the first append, but `next_block_number` must start at `head_num`, else
+    // the first per-block append during sync tries to write block 0).
     sfp.get_writer(head_num, StaticFileSegment::Receipts)?
         .user_header_mut()
         .set_block_range(head_num, head_num);
     sfp.get_writer(head_num, StaticFileSegment::Transactions)?
         .user_header_mut()
         .set_block_range(head_num, head_num);
+    sfp.get_writer(head_num, StaticFileSegment::TransactionSenders)?
+        .user_header_mut()
+        .set_block_range(head_num, head_num);
+    // Changeset segments need all three of these to be true, or the DB is broken for stock reth's
+    // v2 unwind/rewind (all invisible to forward sync — hashed state / state root are unaffected):
+    //   (a) highest_static_file_block == head, or launch `check_consistency` sees highest=None while
+    //       the Execution checkpoint says head and unwinds to block 0 (panic).
+    //   (b) expected_block_start == the actual data start, or `truncate_changesets` (which keys off
+    //       expected_block_start, = the fixed 500k slot 22000000) over-counts and corrupts the
+    //       offset map on every unwind.
+    //   (c) csoff[0] must map to `head`, or `changeset_offset_index(N) = N - block_range.start` is
+    //       shifted (genesis carries no changeset, so a naive first-append lands csoff[0] at head+1).
+    // We satisfy all three by giving genesis an explicit EMPTY changeset entry (matching reth's
+    // init_genesis model): `set_expected_block_start(head)` aligns (b), and appending an empty
+    // changeset for `head` sets block_range=[head,head] with csoff[0]=head — giving highest=head (a)
+    // and an aligned map (c). The file is then renamed to match its new expected range.
+    for seg in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets] {
+        let mut w = sfp.get_writer(head_num, seg)?;
+        w.user_header_mut().set_expected_block_start(head_num);
+        match seg {
+            StaticFileSegment::AccountChangeSets => w.append_account_changeset(Vec::new(), head_num)?,
+            StaticFileSegment::StorageChangeSets => w.append_storage_changeset(Vec::new(), head_num)?,
+            _ => unreachable!(),
+        }
+        w.commit()?;
+    }
 
     // Mark every stage complete at the head so reth treats the DB as synced to that block.
     let cp = StageCheckpoint::new(head_num);

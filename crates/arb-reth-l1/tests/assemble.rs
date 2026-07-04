@@ -10,7 +10,6 @@ use alloy_primitives::{b256, hex, B256};
 use arb_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_reth_derive::batch::parse_sequencer_batch_delivered;
 use arb_reth_derive::delayed::NoDelayed;
-use arb_reth_derive::l2message::parse_l2_message;
 use arb_reth_derive::message::{DerivedMessage, L1IncomingMessageHeader};
 use arb_sequencer_network::reader::parse_message;
 use arb_sequencer_network::sequencer::feed::BatchDataStats;

@@ -37,19 +37,16 @@ pub use genesis::{
 };
 
 pub mod hashed_db;
-pub use hashed_db::{HashedStateDb, account_by_address, code_of, storage_at};
+pub use hashed_db::{account_by_address, code_of, storage_at};
 
 pub mod persist;
 pub use persist::persist_executed_block;
 
-pub mod driver;
-pub use driver::ArbChainDriver;
+pub mod resume;
+pub use resume::{L1ResumeCheckpoint, L1ResumeLog};
 
 pub mod l1_sync;
-pub use l1_sync::{run_l1_sync, L1SyncConfig};
-
-pub mod node;
-pub use node::run as run_node;
+pub use l1_sync::{L1SyncConfig, run_l1_sync};
 
 pub mod launcher;
 pub use launcher::{ArbLauncher, ArbNodeHandle};
@@ -63,16 +60,18 @@ pub use pooled::ArbPooledTransaction;
 pub mod rpc;
 pub use rpc::{ArbReceiptConverter, serve_rpc};
 
+pub mod engine_spike;
+pub use engine_spike::ArbPayloadValidator;
+
+pub mod engine;
+pub use engine::{ArbEngineDriver, ArbEngineTuning};
+
 use alloy_consensus::Header;
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Bytes, U256};
-use alloy_rpc_types_engine::{
-    ExecutionData, ExecutionPayload as AlloyExecutionPayload, PayloadId,
-};
+use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload as AlloyExecutionPayload, PayloadId};
 use reth_node_types::NodeTypes;
-use reth_payload_primitives::{
-    BuiltPayload, ExecutionPayload, PayloadAttributes, PayloadTypes,
-};
+use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadAttributes, PayloadTypes};
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedBlock};
 use reth_storage_api::EthStorage;
 
@@ -127,13 +126,13 @@ impl From<ArbBuiltPayload> for ArbExecutionData {
     fn from(payload: ArbBuiltPayload) -> Self {
         let block_hash = payload.block.hash();
         let block = Arc::unwrap_or_clone(payload.block).into_block();
-        let (execution_payload, sidecar) =
-            AlloyExecutionPayload::from_block_unchecked_with_extras(
-                block_hash,
-                &block,
-                None, // no block access list
-            );
-        ArbExecutionData(ExecutionData { payload: execution_payload, sidecar })
+        let (execution_payload, sidecar) = AlloyExecutionPayload::from_block_unchecked_with_extras(
+            block_hash, &block, None, // no block access list
+        );
+        ArbExecutionData(ExecutionData {
+            payload: execution_payload,
+            sidecar,
+        })
     }
 }
 
@@ -233,17 +232,21 @@ impl PayloadTypes for ArbPayloadTypes {
     type PayloadAttributes = ArbPayloadAttributes;
 
     fn block_to_payload(
-        block: SealedBlock<<<ArbBuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>,
+        block: SealedBlock<
+            <<ArbBuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
+        >,
         _bal: Option<Bytes>,
     ) -> Self::ExecutionData {
         let block_hash = block.hash();
-        let (execution_payload, sidecar) =
-            AlloyExecutionPayload::from_block_unchecked_with_extras(
-                block_hash,
-                &block.into_block(),
-                None,
-            );
-        ArbExecutionData(ExecutionData { payload: execution_payload, sidecar })
+        let (execution_payload, sidecar) = AlloyExecutionPayload::from_block_unchecked_with_extras(
+            block_hash,
+            &block.into_block(),
+            None,
+        );
+        ArbExecutionData(ExecutionData {
+            payload: execution_payload,
+            sidecar,
+        })
     }
 }
 
@@ -271,9 +274,10 @@ pub type ArbNetworkPrimitives =
 // impl Node<N> for ArbNode: required so `builder.node(ArbNode)` produces the
 // `NodeBuilderWithComponents` our `ArbLauncher` consumes. All components are noop
 // except the executor (Arbitrum has no tx gossip, p2p, or fork-choice engine).
-// `ArbLauncher` reuses reth's `LaunchContext` for DB/provider/tasks but skips the
-// engine pipeline and spawns `ArbChainDriver` directly; AddOns = () (no engine-coupled
-// RpcAddOns). See `launcher.rs` and `docs/stage-d2-handoff.md` §12.
+// `ArbLauncher` reuses reth's `LaunchContext` for DB/provider/tasks but skips the sync
+// pipeline and consensus-engine orchestrator, spawning `ArbEngineDriver` to drive reth's
+// engine tree directly; AddOns = () (no engine-coupled RpcAddOns). See `launcher.rs` and
+// `docs/stage-d2-handoff.md` §12.
 
 use reth_node_builder::components::{
     ComponentsBuilder, NoopConsensusBuilder, NoopNetworkBuilder, NoopPayloadBuilder,
@@ -318,13 +322,14 @@ mod tests {
     #[test]
     fn provider_factory_stands_up() {
         let chain_spec = MAINNET.clone();
-        let factory =
-            reth_provider::test_utils::create_test_provider_factory_with_node_types::<ArbNode>(
-                chain_spec,
-            );
+        let factory = reth_provider::test_utils::create_test_provider_factory_with_node_types::<
+            ArbNode,
+        >(chain_spec);
         let provider = factory.provider().expect("provider should open");
         use reth_provider::BlockNumReader;
-        let best = provider.best_block_number().expect("best_block_number should succeed");
+        let best = provider
+            .best_block_number()
+            .expect("best_block_number should succeed");
         assert_eq!(best, 0, "fresh DB should have block 0 as best");
     }
 }

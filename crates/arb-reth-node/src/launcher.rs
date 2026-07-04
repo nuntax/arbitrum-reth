@@ -1,10 +1,11 @@
-//! D.3b.2: `ArbLauncher`, a custom `LaunchNode` for the no-engine Arbitrum node.
+//! `ArbLauncher`, a custom `LaunchNode` for the Arbitrum engine-tree node.
 //!
 //! Mirrors reth's `EngineNodeLauncher::launch_node` type-state chain but stops after
-//! `.with_components(...)` (no pipeline, no engine orchestrator, no RpcAddOns; AddOns = ()).
-//! After standing up the provider stack it extracts `ProviderFactory` + `BlockchainProvider`,
-//! constructs an `ArbChainDriver` wired to the provider's `CanonicalInMemoryState`, and spawns
-//! a background task that calls `driver.advance()` per message and `driver.flush()` on close.
+//! `.with_components(...)` (no pipeline, no consensus-engine orchestrator, no RpcAddOns;
+//! AddOns = ()). After standing up the provider stack it extracts `ProviderFactory` +
+//! `BlockchainProvider`, spawns reth's engine tree via [`ArbEngineDriver::spawn`], and runs a
+//! background task that calls `driver.advance()` per feed message (produce → InsertExecutedBlock
+//! → ForkchoiceUpdated); the tree owns async persistence and the in-memory overlay.
 //!
 //! Deadlock rule: never hold a read provider across a `provider_rw()`/`save_blocks()` call.
 
@@ -28,17 +29,24 @@ use reth_node_builder::hooks::NodeHooks;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
-    ProviderFactory,
+    BalProvider, BlockNumReader, BlockReader, ChangeSetReader, DatabaseProviderFactory,
+    HashedPostStateProvider, ProviderFactory, StateProviderFactory, StateReader,
+    StorageChangeSetReader,
 };
 use reth_rpc_builder::RpcServerHandle;
-use reth_storage_api::HeaderProvider;
+use reth_storage_api::{
+    HeaderProvider, MetadataProvider, MetadataWriter, PruneCheckpointReader, StageCheckpointReader,
+    StorageSettingsCache,
+};
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::noop::NoopTransactionPool;
 use reth_trie_db::ChangesetCache;
 use tokio::sync::oneshot;
 
+use arb_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
+
 use crate::{
-    driver::ArbChainDriver,
+    engine::{ArbEngineDriver, ArbEngineTuning},
     pooled::ArbPooledTransaction,
     rpc::serve_rpc,
 };
@@ -73,16 +81,16 @@ impl<P> ArbNodeHandle<P> {
 /// A custom `LaunchNode` for the no-engine Arbitrum node.
 ///
 /// Reuses reth's `LaunchContext` type-state chain for DB/provider/blockchain-db/task
-/// infrastructure but skips the engine pipeline and consensus-engine task. Spawns
-/// an [`ArbChainDriver`] background task that processes sequencer feed messages exactly
-/// once per block.
+/// infrastructure but skips the sync pipeline and consensus-engine orchestrator. Spawns
+/// an [`ArbEngineDriver`] background task that drives reth's engine tree, producing exactly
+/// one block per sequencer feed message.
 pub struct ArbLauncher {
     /// Base launch context: task executor + data directory.
     pub ctx: LaunchContext,
     /// Arbitrum chain id (42161 = mainnet, 421614 = Sepolia).
     pub chain_id: u64,
-    /// Flush every `persistence_threshold` blocks (1 = flush every block).
-    pub persistence_threshold: u64,
+    /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
+    pub tuning: ArbEngineTuning,
     /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
     /// tip, so no per-message version is carried.
     pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
@@ -112,6 +120,28 @@ where
     // from NodeTypesWithDBAdapter<N, DB>.
     NodeTypesWithDBAdapter<N, DB>: NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
     NodeTypesWithDBAdapter<N, DB>: reth_node_api::NodeTypesWithDB<DB = DB>,
+    // Engine-tree (Tier-1) bounds: mirror `EngineApiTreeHandler::spawn_new`'s P-bounds with
+    // P = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> (see engine.rs).
+    BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>: DatabaseProviderFactory<DB = DB>
+        + BlockReader<Block = ArbBlock, Header = Header>
+        + reth_storage_api::TransactionsProvider<Transaction = arb_alloy_consensus::ArbTxEnvelope>
+        + reth_storage_api::ReceiptProvider<Receipt = ArbReceiptEnvelope>
+        + StateProviderFactory
+        + StateReader<Receipt = ArbReceiptEnvelope>
+        + HashedPostStateProvider
+        + BalProvider
+        + ChangeSetReader
+        + BlockNumReader
+        + Clone
+        + 'static,
+    <BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> as DatabaseProviderFactory>::Provider:
+        BlockReader<Block = ArbBlock, Header = Header>
+            + StageCheckpointReader
+            + PruneCheckpointReader
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + BlockNumReader
+            + StorageSettingsCache,
 {
     type Node = ArbNodeHandle<BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>>;
     type Future = Pin<Box<dyn Future<Output = eyre::Result<Self::Node>> + Send>>;
@@ -146,7 +176,7 @@ impl ArbLauncher {
         NodeTypesWithDBAdapter<N, DB>: NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
         NodeTypesWithDBAdapter<N, DB>: reth_node_api::NodeTypesWithDB<DB = DB>,
     {
-        let Self { ctx, chain_id, persistence_threshold, messages, rpc_addr } = self;
+        let Self { ctx, chain_id, tuning, messages, rpc_addr } = self;
 
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
@@ -170,7 +200,30 @@ impl ArbLauncher {
                 rocksdb_provider,
                 disabled_stages,
             )
-            .await?
+            .await?;
+
+        // Part 3: open the DB in storage v2 (hashed-state canonical, `PackedKeyAdapter`). This
+        // MUST happen before `with_genesis()` uses the factory. Cache the flag so every provider
+        // uses v2, and persist it idempotently: an importer-made DB already has v2 in metadata, so
+        // we only write when no settings flag is persisted (fresh DB) or it differs.
+        {
+            let factory = ctx.provider_factory();
+            factory.set_storage_settings_cache(reth_db_api::models::StorageSettings::v2());
+            let current = {
+                let p = factory.database_provider_ro()?;
+                p.storage_settings()?
+            };
+            if current != Some(reth_db_api::models::StorageSettings::v2()) {
+                let provider_rw = factory.provider_rw()?;
+                provider_rw
+                    .write_storage_settings(reth_db_api::models::StorageSettings::v2())?;
+                provider_rw
+                    .commit()
+                    .map_err(|e| eyre!("persist storage settings v2: {e}"))?;
+            }
+        }
+
+        let ctx = ctx
             .with_genesis()?
             .with_metrics_task()
             .with_blockchain_db::<T, _>(move |provider_factory| {
@@ -186,8 +239,8 @@ impl ArbLauncher {
         let task_executor: TaskExecutor = ctx.task_executor().clone();
         let head = ctx.head();
 
-        // Clone the in-memory state from the provider so the driver updates
-        // the SAME instance that BlockchainProvider serves for RPC queries.
+        // Clone the in-memory state from the provider so the tree updates the SAME instance that
+        // BlockchainProvider serves for RPC queries.
         let canonical: CanonicalInMemoryState<ArbPrimitives> =
             provider.canonical_in_memory_state();
 
@@ -195,26 +248,63 @@ impl ArbLauncher {
             HeaderProvider::sealed_header(&provider, head.number)?
                 .ok_or_else(|| eyre!("missing head header at block {}", head.number))?;
 
-        let mut driver: ArbChainDriver<NodeTypesWithDBAdapter<N, DB>> =
-            ArbChainDriver::with_canonical_state(
-                provider_factory,
-                chain_id,
-                genesis_tip,
-                persistence_threshold,
-                canonical,
-            );
+        // `arb_evm_config` (hoisted from the RPC block below): also drives the engine tree.
+        let arb_evm_config: arb_reth_evm::ArbEvmConfig =
+            ctx.node_adapter().components.evm_config().clone().into();
+
+        // Part 2: stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
+        // sequencer feed through it. Persistence to MDBX is async (tree background service).
+        let mut driver: ArbEngineDriver<NodeTypesWithDBAdapter<N, DB>> = ArbEngineDriver::spawn(
+            provider_factory,
+            provider.clone(),
+            arb_evm_config.clone(),
+            chain_id,
+            genesis_tip,
+            canonical,
+            task_executor.clone(),
+            tuning,
+        )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
         let mut messages_rx = messages;
 
         task_executor.spawn_critical_task(
-            "arb-chain-driver",
+            "arb-engine-driver",
             async move {
                 let res: eyre::Result<()> = async {
-                    while let Some(msg) = messages_rx.recv().await {
-                        driver.advance(&msg)?;
+                    // Bench accounting: separate time spent WAITING for the next derived feed
+                    // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
+                    // Emitted every 1000 blocks at target "arb-reth::bench"; harmless at info off.
+                    let mut bench_recv_us: u128 = 0;
+                    let mut bench_work_us: u128 = 0;
+                    let mut bench_n: u64 = 0;
+                    let mut bench_wall = std::time::Instant::now();
+                    loop {
+                        let __r = std::time::Instant::now();
+                        let Some(msg) = messages_rx.recv().await else { break };
+                        bench_recv_us += __r.elapsed().as_micros();
+                        let __w = std::time::Instant::now();
+                        driver.advance(&msg).await?;
+                        bench_work_us += __w.elapsed().as_micros();
+                        bench_n += 1;
+                        if bench_n % 1000 == 0 {
+                            let wall_ms = bench_wall.elapsed().as_millis().max(1);
+                            tracing::info!(
+                                target: "arb-reth::bench",
+                                blocks = bench_n,
+                                blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
+                                recv_ms = (bench_recv_us / 1000) as u64,
+                                work_ms = (bench_work_us / 1000) as u64,
+                                recv_pct = (100 * bench_recv_us
+                                    / (bench_recv_us + bench_work_us).max(1)) as u64,
+                                "bench: 1000-block window",
+                            );
+                            bench_recv_us = 0;
+                            bench_work_us = 0;
+                            bench_wall = std::time::Instant::now();
+                        }
                     }
-                    driver.flush()?;
+                    driver.shutdown().await;
                     Ok(())
                 }
                 .await;
@@ -224,8 +314,6 @@ impl ArbLauncher {
 
         let rpc_handle = if let Some(addr) = rpc_addr {
             let runtime = ctx.task_executor().clone();
-            let arb_evm_config: arb_reth_evm::ArbEvmConfig =
-                ctx.node_adapter().components.evm_config().clone().into();
             let rpc_provider = provider.clone();
             let handle = serve_rpc(
                 rpc_provider,
@@ -301,7 +389,7 @@ mod tests {
         let launcher = ArbLauncher {
             ctx: LaunchContext::new(task_executor.clone(), data_dir),
             chain_id: crate::ARB_ONE_CHAIN_ID,
-            persistence_threshold: 1,
+            tuning: ArbEngineTuning::reth_defaults(),
             messages: rx,
             rpc_addr: None,
         };
@@ -313,6 +401,18 @@ mod tests {
 
         let provider = handle.provider.clone();
         handle.wait_for_node_exit().await.expect("driver task must succeed");
+
+        // Part 3: the launcher opens the DB in storage v2; confirm the flag is persisted.
+        {
+            use reth_provider::DatabaseProviderFactory;
+            use reth_storage_api::MetadataProvider;
+            let p = provider.database_provider_ro().expect("ro provider");
+            assert_eq!(
+                p.storage_settings().expect("storage_settings"),
+                Some(reth_db_api::models::StorageSettings::v2()),
+                "launcher DB must be storage v2"
+            );
+        }
 
         assert_eq!(provider.best_block_number().unwrap(), 2, "best block must be 2");
         assert!(provider.header_by_number(1).unwrap().is_some(), "block 1 must exist");

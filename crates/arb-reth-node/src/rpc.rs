@@ -31,7 +31,7 @@ use reth_primitives_traits::SealedBlock;
 use reth_rpc::EthApi;
 use reth_rpc::eth::EthApiBuilder;
 use reth_rpc_builder::{
-    RpcModuleBuilder, RpcServerConfig, RpcServerHandle, ServerBuilder,
+    RpcModuleBuilder, RpcServerConfig, RpcServerHandle,
     TransportRpcModuleConfig,
 };
 use reth_rpc_convert::{RpcConverter, transaction::{ConvertReceiptInput, ReceiptConverter}};
@@ -377,7 +377,7 @@ mod tests {
         let launcher = ArbLauncher {
             ctx: reth_node_builder::LaunchContext::new(task_executor.clone(), data_dir),
             chain_id: crate::ARB_ONE_CHAIN_ID,
-            persistence_threshold: 1,
+            tuning: crate::ArbEngineTuning::reth_defaults(),
             messages: rx,
             rpc_addr: Some(rpc_addr),
         };
@@ -394,7 +394,19 @@ mod tests {
             .build(&http_url)
             .expect("build http client");
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The engine tree canonicalizes + persists asynchronously, so wait (bounded) until the
+        // node has produced both feed blocks before querying `latest`. This is a robustness wait,
+        // not an assertion change: the balance/number assertions below are unchanged.
+        {
+            use reth_provider::BlockNumReader;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while handle.provider.best_block_number().unwrap_or(0) < 2 {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
 
         let block: serde_json::Value = client
             .request("eth_getBlockByNumber", jsonrpsee::rpc_params!["latest", false])

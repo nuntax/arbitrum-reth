@@ -140,6 +140,31 @@ pub async fn derive_range<P: Provider>(
     window: u64,
 ) -> Result<DerivedRange, L1Error> {
     let resolved = resolve_batches(seq_reader, beacon, from_block, to_block).await?;
+    derive_from_resolved(
+        seq_reader,
+        delayed_reader,
+        resolved,
+        to_block,
+        start_delayed_count,
+        window,
+    )
+    .await
+}
+
+/// The delayed-message + assembly tail of [`derive_range`], split out so the catch-up
+/// runtime can PREFETCH [`resolve_batches`] for many L1 windows concurrently (it is the
+/// dominant `getLogs`/blob RPC cost and is independent of the delayed cursor) and then run
+/// this ordered tail sequentially, threading `start_delayed_count` window-to-window.
+///
+/// `resolved` is one window's [`resolve_batches`] output; `to_block` is that window's end.
+pub async fn derive_from_resolved<P: Provider>(
+    seq_reader: &SequencerInboxReader<P>,
+    delayed_reader: &DelayedInboxReader<P>,
+    resolved: Vec<(DeliveredBatch, Vec<u8>)>,
+    to_block: u64,
+    start_delayed_count: u64,
+    window: u64,
+) -> Result<DerivedRange, L1Error> {
     if resolved.is_empty() {
         return Ok(DerivedRange { messages: Vec::new(), next_delayed_count: start_delayed_count, batches: 0 });
     }
