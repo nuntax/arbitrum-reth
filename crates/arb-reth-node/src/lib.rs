@@ -124,7 +124,7 @@ where
     fn components_builder(&self) -> Self::ComponentsBuilder {
         ComponentsBuilder::<(), (), (), (), (), ()>::default()
             .node_types::<N>()
-            .executor(ArbExecutorBuilder::new(ARB_ONE_CHAIN_ID))
+            .executor(ArbExecutorBuilder::default())
             .noop_pool::<ArbPooledTransaction>()
             .noop_payload()
             .noop_network::<ArbNetworkPrimitives>()

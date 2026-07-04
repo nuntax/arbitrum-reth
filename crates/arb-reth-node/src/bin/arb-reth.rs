@@ -24,12 +24,14 @@
 
 use std::{fs, net::IpAddr, path::PathBuf};
 
-use alloy_provider::ProviderBuilder;
-use arb_reth_l1::SequencerInboxReader;
+use alloy_primitives::Address;
+use alloy_provider::{Provider, ProviderBuilder};
+use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
 use arb_reth_node::{
-    arb_chain_spec, arbos_init_from_chain_config_json, ArbNode, ARB_ONE_CHAIN_ID,
-    L1ResumeLog,
+    arb_chain_spec, arbos_init_from_chain_config_json, arbos_init_from_parsed, ArbNode,
+    ARB_ONE_CHAIN_ID, L1ResumeLog,
 };
+use arb_sequencer_network::init_message::parse_init_message_from_body;
 use arb_reth_node::launcher::ArbLauncher;
 use reth_provider::BlockNumReader;
 use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
@@ -117,6 +119,13 @@ struct Args {
     #[arg(long = "chain", value_name = "PATH")]
     chain_config: Option<PathBuf>,
 
+    /// Initial L1 base fee (wei) baked into the ArbOS genesis when booting from --chain.
+    /// Defaults to Nitro's `DefaultInitialL1BaseFee` of 50 GWei. This value is part of the
+    /// genesis state, so a chain created with a different initial base fee (a nitro-testnode
+    /// commonly uses a tiny value) needs this set to reproduce its genesis root.
+    #[arg(long = "initial-l1-base-fee", value_name = "WEI")]
+    initial_l1_base_fee: Option<u128>,
+
     /// Path to an NDJSON replay-feed file (one `BroadcastFeedMessage` JSON per line).
     /// After launch all messages are pushed into the feed channel so the block driver
     /// processes them, then the node stays alive for RPC inspection.
@@ -161,6 +170,29 @@ struct Args {
     #[arg(long = "l1-start-delayed")]
     l1_start_delayed: Option<u64>,
 
+    /// `SequencerInbox` contract address on L1. This and --l1-bridge are one rollup deployment:
+    /// set both to target a custom chain (a nitro-testnode or an Orbit chain), or neither to use
+    /// the built-in Arbitrum One deployment. Setting only one is an error.
+    #[arg(long = "l1-sequencer-inbox", value_name = "ADDR")]
+    l1_sequencer_inbox: Option<Address>,
+
+    /// `Bridge` contract address on L1 (delayed-inbox metadata source). Paired with
+    /// --l1-sequencer-inbox; see its help for the set-together rule.
+    #[arg(long = "l1-bridge", value_name = "ADDR")]
+    l1_bridge: Option<Address>,
+
+    /// L1 block the rollup was deployed at, used as the anchor for reading batch 0 and the
+    /// Initialize message (Nitro's `DeployedAt`). Defaults to the Arbitrum One deploy height when
+    /// targeting Arbitrum One, or block 0 for a custom deployment.
+    #[arg(long = "l1-inbox-deploy-block")]
+    l1_inbox_deploy_block: Option<u64>,
+
+    /// L2 block the chain's genesis sits at, the L2-numbering anchor on a no-checkpoint genesis
+    /// sync. Defaults to the Arbitrum One Nitro genesis (22207817) when targeting Arbitrum One, or
+    /// block 0 for a custom deployment (a fresh chain).
+    #[arg(long = "l2-genesis-block")]
+    l2_genesis_block: Option<u64>,
+
     /// Boot on a snapshot-imported datadir: path to the `reth-export --mode blocks` head stream
     /// (`H <num> <hash> <headerRLP>`). The node builds its chain spec from that head header so the
     /// genesis-hash check accepts the imported DB, and resumes from the snapshot's head block.
@@ -179,8 +211,98 @@ fn main() -> eyre::Result<()> {
     runner.run_command_until_exit(|ctx| run(ctx, args))
 }
 
+/// The L1 rollup deployment arb-reth reads from: the contract addresses plus the L1 block the
+/// rollup was deployed at, resolved as one coherent set the way Nitro resolves its
+/// `RollupAddresses` from chain info (`chaininfo.GetRollupAddressesConfig`). The addresses always
+/// travel together; you do not mix one chain's inbox with another's bridge.
+struct RollupDeployment {
+    sequencer_inbox: Address,
+    bridge: Address,
+    /// L1 block the rollup was deployed at; the anchor for reading batch 0 and the Initialize
+    /// message. Nitro's `RollupAddresses.DeployedAt`.
+    deployed_at: u64,
+    /// L2 block the chain's genesis sits at: 0 for a fresh chain, the Nitro-migration block for
+    /// Arbitrum One. Nitro's `ArbitrumChainParams.GenesisBlockNum`.
+    l2_genesis_block: u64,
+}
+
+/// Resolve the rollup deployment from the CLI, with Nitro-like set/unset semantics:
+///
+/// - Neither `--l1-sequencer-inbox` nor `--l1-bridge` set: the built-in Arbitrum One deployment,
+///   like Nitro resolving chain-id 42161 from its embedded chain info. `deployed_at` and the L2
+///   genesis default to Arbitrum One's heights.
+/// - Both set: a custom rollup. Since the addresses are one deployment, `deployed_at` and the L2
+///   genesis default to a fresh chain (block 0), not Arbitrum One's heights. Either can still be
+///   overridden explicitly.
+/// - Exactly one set: rejected, rather than pairing a custom address with an Arbitrum One one.
+fn resolve_rollup_deployment(args: &Args) -> eyre::Result<RollupDeployment> {
+    match (args.l1_sequencer_inbox, args.l1_bridge) {
+        (None, None) => Ok(RollupDeployment {
+            sequencer_inbox: arb_reth_l1::SEQUENCER_INBOX_MAINNET,
+            bridge: arb_reth_l1::BRIDGE_MAINNET,
+            deployed_at: args
+                .l1_inbox_deploy_block
+                .unwrap_or(arb_reth_l1::SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET),
+            l2_genesis_block: args.l2_genesis_block.unwrap_or(arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET),
+        }),
+        (Some(sequencer_inbox), Some(bridge)) => Ok(RollupDeployment {
+            sequencer_inbox,
+            bridge,
+            deployed_at: args.l1_inbox_deploy_block.unwrap_or(0),
+            l2_genesis_block: args.l2_genesis_block.unwrap_or(0),
+        }),
+        _ => Err(eyre::eyre!(
+            "--l1-sequencer-inbox and --l1-bridge are one rollup deployment and must be set \
+             together: set both for a custom chain, or neither for Arbitrum One"
+        )),
+    }
+}
+
+/// Build the genesis chain spec from the chain's Initialize message on L1, the way Nitro
+/// bootstraps a fresh chain. The Initialize message is delayed-inbox message 0; it carries the
+/// chain id, the serialized chain config, and the initial L1 base fee (version 1), so none of
+/// those need to be supplied by hand. Used for fresh chains (a nitro-testnode or a new Orbit
+/// chain) that start at L2 block 0; Arbitrum One instead boots from a snapshot, because its
+/// genesis is the classic-state migration block, not an Initialize message.
+async fn derive_genesis_from_l1(
+    l1_rpc: &str,
+    bridge: Address,
+    from_block: u64,
+    base_fee_override: Option<u128>,
+) -> eyre::Result<(std::sync::Arc<reth_chainspec::ChainSpec>, u64)> {
+    let provider = ProviderBuilder::new()
+        .connect_http(l1_rpc.parse().map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?);
+    let head = provider
+        .get_block_number()
+        .await
+        .map_err(|e| eyre::eyre!("l1 get_block_number: {e}"))?;
+    let reader = DelayedInboxReader::new(provider, bridge);
+    let msgs = reader
+        .fetch_delayed(from_block, head)
+        .await
+        .map_err(|e| eyre::eyre!("fetch delayed messages for L1 genesis: {e}"))?;
+    let init = msgs
+        .iter()
+        .find(|m| m.inbox_seq_num == 0)
+        .ok_or_else(|| eyre::eyre!("no delayed message 0 (Initialize) in L1 blocks {from_block}..={head}"))?;
+    let parsed = parse_init_message_from_body(init.kind, &init.data)
+        .map_err(|e| eyre::eyre!("parse Initialize message: {e}"))?;
+    let mut arbos_init = arbos_init_from_parsed(&parsed)?;
+    // The Initialize message carries the base fee; an explicit flag still wins if passed.
+    if let Some(fee) = base_fee_override {
+        arbos_init.initial_l1_base_fee = alloy_primitives::U256::from(fee);
+    }
+    let chain_id = arbos_init.chain_id.to::<u64>();
+    let spec = std::sync::Arc::new(arb_chain_spec(&arbos_init)?);
+    Ok((spec, chain_id))
+}
+
 async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
+
+    // Resolve the rollup addresses + deploy/genesis anchors as one set up front, so a
+    // half-specified custom deployment fails fast rather than mid-boot.
+    let rollup = resolve_rollup_deployment(&args)?;
 
     // --snapshot-head: boot on an imported snapshot DB by building the chain spec from its head
     // header (so reth's genesis-hash check accepts the DB). Takes precedence over --chain.
@@ -204,7 +326,10 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
         (None, Some(path)) => {
             let json = fs::read(path)
                 .map_err(|e| eyre::eyre!("failed to read chain config file {:?}: {}", path, e))?;
-            let init = arbos_init_from_chain_config_json(&json)?;
+            let mut init = arbos_init_from_chain_config_json(&json)?;
+            if let Some(fee) = args.initial_l1_base_fee {
+                init.initial_l1_base_fee = alloy_primitives::U256::from(fee);
+            }
             let derived_chain_id = init.chain_id.to::<u64>();
             info!(
                 target: "arb-reth",
@@ -215,7 +340,27 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
             let spec = std::sync::Arc::new(arb_chain_spec(&init)?);
             (spec, derived_chain_id)
         }
-        (None, None) => (MAINNET.clone(), args.chain_id),
+        (None, None) => match &args.l1_rpc {
+            // No genesis file given but an L1 is: bootstrap genesis from the chain's Initialize
+            // message on that L1 (chain id + config + base fee all come from it). This is the
+            // zero-config path for a fresh chain like a nitro-testnode.
+            Some(l1_rpc) => {
+                let (spec, cid) = derive_genesis_from_l1(
+                    l1_rpc,
+                    rollup.bridge,
+                    rollup.deployed_at,
+                    args.initial_l1_base_fee,
+                )
+                .await?;
+                info!(
+                    target: "arb-reth",
+                    chain_id = cid,
+                    "bootstrapped ArbOS genesis from the L1 Initialize message",
+                );
+                (spec, cid)
+            }
+            None => (MAINNET.clone(), args.chain_id),
+        },
     };
 
     let datadir_args = match args.datadir {
@@ -322,8 +467,13 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
         // `db_tip + 1`. Every block at or below `db_tip` that gets re-derived is dropped downstream.
         let db_tip = handle.provider.last_block_number()?;
 
+        // The rollup addresses and genesis anchors, resolved as one set (Arbitrum One by default,
+        // or a custom deployment when the addresses are supplied together).
+        let RollupDeployment { sequencer_inbox, bridge, deployed_at: inbox_deploy_block, l2_genesis_block } =
+            rollup;
+
         // The resume log lives in the data directory and is updated as sync advances, so a restart
-        // lifts off where it stopped instead of re-deriving from Nitro genesis.
+        // lifts off where it stopped instead of re-deriving from genesis.
         let checkpoint_path = resume_checkpoint_path;
         let resume_log = L1ResumeLog::load(&checkpoint_path);
 
@@ -368,11 +518,11 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
             // DROPS every block <= db_tip (derivation only, no re-execution), producing just the new
             // tail. Slower to start than a checkpoint resume, but always correct and self-healing;
             // the first window past db_tip writes a fresh checkpoint so later restarts are fast.
-            if db_tip != arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET {
+            if db_tip != l2_genesis_block {
                 info!(
                     target: "arb-reth", db_tip,
-                    genesis = arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET,
-                    "no resume checkpoint; re-deriving from Nitro genesis and skipping already-present blocks",
+                    genesis = l2_genesis_block,
+                    "no resume checkpoint; re-deriving from genesis and skipping already-present blocks",
                 );
             }
             // Resolve batch 0's delivery block on-chain (anchored at the SequencerInbox deploy
@@ -380,9 +530,9 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
             let provider = ProviderBuilder::new().connect_http(
                 l1_rpc.parse().map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?,
             );
-            let reader = SequencerInboxReader::new(provider, arb_reth_l1::SEQUENCER_INBOX_MAINNET);
+            let reader = SequencerInboxReader::new(provider, sequencer_inbox);
             let block = reader
-                .delivery_block_of_batch(0, arb_reth_l1::SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET, 1_000)
+                .delivery_block_of_batch(0, inbox_deploy_block, 1_000)
                 .await
                 .map_err(|e| eyre::eyre!("resolve batch 0 delivery block: {e}"))?
                 .ok_or_else(|| eyre::eyre!("batch 0 not found near the SequencerInbox deploy block"))?;
@@ -390,10 +540,12 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
             // (db_tip) lines up with the absolute block numbers derivation produces.
             let delayed = args.l1_start_delayed.unwrap_or(0);
             info!(target: "arb-reth", batch = 0, l1_block = block, delayed, "L1 resume point: genesis (batch 0)");
-            (block, delayed, arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET)
+            (block, delayed, l2_genesis_block)
         };
 
         let mut sync_cfg = arb_reth_node::L1SyncConfig::mainnet(l1_rpc, start_block, start_delayed);
+        sync_cfg.sequencer_inbox = sequencer_inbox;
+        sync_cfg.bridge = bridge;
         sync_cfg.l1_beacon = args.l1_beacon;
         sync_cfg.end_block = args.l1_end_block;
         sync_cfg.prefetch_windows = args.l1_prefetch;
