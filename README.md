@@ -10,11 +10,9 @@ This node did not grow out of that executor. What the executor did was show two 
 
 ## What it is
 
-arb-reth is a standalone, Nitro-style node. Arbitrum is execute-to-derive: a sequencer message is the input and the block, including its state root, is the output of executing that message. So instead of reth's download-then-execute pipeline, the node reads L1, derives the message stream, mints each block, and persists it. The state transition runs through `arb_revm`, a project which consumes revm and adds ArbOS precompiles, gas accounting, and retryable/redeem handling.
+arb-reth is a standalone, Nitro-style node. Arbitrum is execute-to-derive. Precisely, a sequencer message is the input and the block, including its state root, is the output of executing that message. So instead of reth's download-then-execute pipeline, the node reads L1, derives the message stream, mints each block, and persists it. The state transition runs through `arb_revm`, a project which consumes revm and adds ArbOS precompiles, gas accounting, and retryable/redeem handling.
 
-It reuses reth for what reth is good at: the database (MDBX plus static files), the trie and state-root machinery, the in-memory canonical chain, and the block writer. Everything Arbitrum-specific (transaction and receipt types, L1 derivation, ArbOS execution, poster-fee accounting) lives in this workspace and in the sibling `arb_revm` and `arb-alloy` crates.
-
-Standalone is the point of it. Other Arbitrum execution clients are as the naming suggets, execution clients. They still need a Nitro node next to them, in consensus mode, to derive the chain from L1 and drive them over the Engine API. arb-reth does that derivation itself, reading L1 directly, so it does not depend on Nitro to run. Nitro is used only as the parity reference to check the output against, not as a component in the pipeline.
+Standalone is the point of it. Other Arbitrum execution clients are as the naming suggets, execution clients. They still need a Nitro node next to them, in consensus mode, to derive the chain from L1 and drive them over the consensus api. arb-reth does that derivation itself, reading L1 directly, so it does not depend on Nitro to run. Nitro is used only as the parity reference to check the output against, not as a component in the pipeline.
 
 ## Architecture
 
@@ -30,8 +28,6 @@ Standalone is the point of it. Other Arbitrum execution clients are as the namin
 Binaries live under `arb-reth-node/src/bin`: `arb-reth` (the node), `arb-rewind` (roll the database back to a block), `arb-snapshot-import` / `arb-snapshot-read`, and `dump-blocks`.
 
 ## Performance
-
-Block production, not download, is the hot path here, so most of the work went there.
 
 - Execution is minted, not re-executed. Produced blocks go into reth's engine tree via `InsertExecutedBlock`, so the tree owns canonicalization and persistence without a second execution pass.
 - Parent state is threaded forward through an in-memory ring overlay anchored on a pinned read transaction, rather than read back through the provider. Reading it back races the tree's asynchronous persistence and can tear; the overlay avoids that and makes deeper in-memory buffering safe.
