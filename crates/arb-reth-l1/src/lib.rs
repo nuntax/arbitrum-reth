@@ -111,6 +111,11 @@ pub fn extract_calldata_payload(input: &[u8]) -> Result<Vec<u8>, L1Error> {
         let call = contracts::origin_legacy::addSequencerL2BatchFromOriginCall::abi_decode(input)?;
         return Ok(call.data.to_vec());
     }
+    if selector == contracts::origin_delay_proof::addSequencerL2BatchFromOriginDelayProofCall::SELECTOR
+    {
+        let call = contracts::origin_delay_proof::addSequencerL2BatchFromOriginDelayProofCall::abi_decode(input)?;
+        return Ok(call.data.to_vec());
+    }
     Err(L1Error::UnknownSelector(selector))
 }
 
@@ -160,4 +165,20 @@ pub fn decode_batch_messages(
         }
     };
     decode_payload_messages(&batch.event.batch_header(), payload, before_delayed_count, delayed)
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::contracts;
+    use alloy_sol_types::SolCall;
+
+    /// The delay-proof origin poster selector must match the on-chain 0x69cacded, or the reader
+    /// would fall through to `UnknownSelector` on a current nitro-testnode / Orbit chain.
+    #[test]
+    fn origin_delay_proof_selector() {
+        assert_eq!(
+            contracts::origin_delay_proof::addSequencerL2BatchFromOriginDelayProofCall::SELECTOR,
+            [0x69, 0xca, 0xcd, 0xed],
+        );
+    }
 }

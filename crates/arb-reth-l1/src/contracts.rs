@@ -118,3 +118,35 @@ pub mod origin_legacy {
         ) external;
     }
 }
+
+/// Origin poster with a trailing delay proof (selector `0x69cacded`), used by newer
+/// SequencerInbox deployments (a current nitro-testnode posts batches this way). The batch
+/// payload is still the `data` argument; the `delayProof` proves the delayed-message accumulator
+/// and is not needed to reconstruct the batch, so it is decoded but ignored.
+pub mod origin_delay_proof {
+    use alloy_sol_types::sol;
+    sol! {
+        struct DelayedMessage {
+            uint8 kind;
+            address sender;
+            uint64 blockNumber;
+            uint64 timestamp;
+            uint256 inboxSeqNum;
+            uint256 baseFeeL1;
+            bytes32 messageDataHash;
+        }
+        struct DelayProof {
+            bytes32 beforeDelayedAcc;
+            DelayedMessage delayedMessage;
+        }
+        function addSequencerL2BatchFromOriginDelayProof(
+            uint256 sequenceNumber,
+            bytes data,
+            uint256 afterDelayedMessagesRead,
+            address gasRefunder,
+            uint256 prevMessageCount,
+            uint256 newMessageCount,
+            DelayProof delayProof
+        ) external;
+    }
+}
