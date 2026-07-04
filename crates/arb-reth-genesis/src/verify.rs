@@ -45,13 +45,13 @@ pub fn state_root(accounts: &[ArbGenesisAccount]) -> B256 {
     state_root_unhashed(accounts.iter().map(|a| (a.address, trie_account(a))))
 }
 
-/// State root over leaves whose keys are ALREADY hashed (`keccak(addr) -> TrieAccount`).
+/// State root over leaves whose keys are already hashed (`keccak(addr) -> TrieAccount`).
 /// Used by the geth-DB converter, where the source state is hash-keyed (no preimages).
 pub fn state_root_hashed(accounts: impl IntoIterator<Item = (B256, TrieAccount)>) -> B256 {
     alloy_trie::root::state_root_unsorted(accounts)
 }
 
-/// Storage root over leaves whose keys are ALREADY hashed (`keccak(slot) -> value`).
+/// Storage root over leaves whose keys are already hashed (`keccak(slot) -> value`).
 pub fn storage_root_hashed(slots: impl IntoIterator<Item = (B256, U256)>) -> B256 {
     alloy_trie::root::storage_root_unsorted(slots)
 }

@@ -1,4 +1,4 @@
-//! Stage H: convert the Nitro classic-state export (the Arbitrum One Nitro-genesis snapshot)
+//! Convert the Nitro classic-state export (the Arbitrum One Nitro-genesis snapshot)
 //! into a reth-readable genesis and verify the resulting block-22207817 state root against the
 //! live chain.
 //!

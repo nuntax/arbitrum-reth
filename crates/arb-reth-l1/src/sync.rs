@@ -156,17 +156,17 @@ pub async fn derive_range<P: Provider>(
 /// re-fetched. Threaded by the catch-up runtime; see [`derive_from_resolved_cached`].
 pub type ReportStatsCache = BTreeMap<B256, BatchDataStats>;
 
-/// Forward-carried delayed-message cache, threaded across consecutive windows so the dominant
+/// Forward-carried delayed-message cache, threaded across consecutive windows so the
 /// `getLogs` cost is paid once per L1 range rather than re-paid on every consuming window.
 ///
-/// The original derive path re-scanned the delayed inbox *backward* from each consuming
-/// window's `to_block`, re-fetching heavily overlapping ranges (crippling on a provider that
+/// The original derive path re-scanned the delayed inbox backward from each consuming
+/// window's `to_block`, re-fetching heavily overlapping ranges (costly on a provider that
 /// caps the `getLogs` span). This cache instead scans each L1 range exactly once: it extends
-/// *forward* as the sync advances (picking up deliveries since the last scan) and only walks
+/// forward as the sync advances (picking up deliveries since the last scan) and only walks
 /// backward for the rare deposit delivered before the earliest scan.
 ///
-/// Invariant: the scanned L1 interval `[scanned_lo, scanned_hi]` is contiguous — it extends
-/// forward from `scanned_hi` or backward from `scanned_lo`, never leaving a hole — so a block's
+/// Invariant: the scanned L1 interval `[scanned_lo, scanned_hi]` is contiguous. It extends
+/// forward from `scanned_hi` or backward from `scanned_lo`, never leaving a hole, so a block's
 /// delayed logs are fetched at most once over the whole sync.
 #[derive(Debug, Default)]
 pub struct DelayedCache {
@@ -240,7 +240,7 @@ impl DelayedCache {
                     self.scan_range(reader, to_block.saturating_sub(window - 1), to_block, window).await?
                 }
             }
-            // Still missing a low index → a deposit delivered before the earliest scan.
+            // Still missing a low index: a deposit delivered before the earliest scan.
             while !self.covers(need_from, need_to) {
                 let lo = self.scanned_lo.expect("scanned after forward extend");
                 if lo == 0 {
@@ -263,8 +263,8 @@ impl DelayedCache {
 }
 
 /// The delayed-message + assembly tail of [`derive_range`], split out so the catch-up
-/// runtime can PREFETCH [`resolve_batches`] for many L1 windows concurrently (it is the
-/// dominant `getLogs`/blob RPC cost and is independent of the delayed cursor) and then run
+/// runtime can prefetch [`resolve_batches`] for many L1 windows concurrently (it is the
+/// main `getLogs`/blob RPC cost and is independent of the delayed cursor) and then run
 /// this ordered tail sequentially, threading `start_delayed_count` window-to-window.
 ///
 /// This is the one-shot form: it allocates fresh caches, so its behavior is identical to
@@ -299,7 +299,7 @@ pub async fn derive_from_resolved<P: Provider>(
 /// As [`derive_from_resolved`], but with the [`DelayedCache`] and [`ReportStatsCache`] threaded
 /// in by the caller so they persist across consecutive windows. This is the CU-efficient path:
 /// each L1 range's delayed logs are fetched once (forward-carried), and a `BatchPostingReport`
-/// naming an already-resolved batch is served from `report_cache` instead of re-fetched.
+/// naming an already-resolved batch is served from `report_cache` instead of being re-fetched.
 pub async fn derive_from_resolved_cached<P: Provider>(
     seq_reader: &SequencerInboxReader<P>,
     delayed_reader: &DelayedInboxReader<P>,
@@ -318,10 +318,10 @@ pub async fn derive_from_resolved_cached<P: Provider>(
     let batches = resolved.len();
 
     // Record each in-range batch's stats by data hash (local, no RPC) so a later window's
-    // BatchPostingReport naming one of them — a report is delivered in its batch's L1 block, so
-    // it lands out-of-range one window later — hits `report_cache` instead of re-fetching L1.
-    // Reports for in-range batches are covered by `assemble_feed_messages` itself, so `in_range`
-    // still excludes them from `seed_report_stats`.
+    // BatchPostingReport naming one of them hits `report_cache` instead of re-fetching L1.
+    // (A report is delivered in its batch's L1 block, so it lands out-of-range one window
+    // later.) Reports for in-range batches are covered by `assemble_feed_messages` itself,
+    // so `in_range` still excludes them from `seed_report_stats`.
     let in_range: BTreeSet<B256> = resolved
         .iter()
         .map(|(b, _)| {

@@ -1,16 +1,17 @@
 //! `arb-reth-evm`: bridges `arb_revm` (Arbitrum/ArbOS execution on revm) into reth's EVM and
 //! block-execution extension points.
 //!
-//! Stage B of the arb-reth roadmap (see `docs/arb-reth-roadmap.md`): wraps `arb_revm`'s ArbOS EVM
-//! as alloy-evm's [`EvmFactory`] + [`Evm`], so a single Arbitrum transaction can be executed
-//! through the same `create_evm(...).transact_raw(tx)` surface reth drives, with full `arb_revm`
-//! semantics (ArbOS handler, NUMBER=L1 block number, Arb precompiles).
+//! The EVM layer wraps `arb_revm`'s ArbOS EVM as alloy-evm's [`EvmFactory`] + [`Evm`], so a single
+//! Arbitrum transaction can be executed through the same `create_evm(...).transact_raw(tx)` surface
+//! reth drives, with full `arb_revm` semantics (ArbOS handler, NUMBER=L1 block number, Arb
+//! precompiles).
 //!
 //! Mirrors `alloy-op-evm`'s `OpEvm`/`OpEvmFactory`. `arb_revm` already exposes its EVM as a revm
 //! [`ExecuteEvm`]/[`InspectEvm`] impl over a concrete [`ArbContext`], so this crate is a thin
 //! adapter that owns the inner EVM and reconciles the result with the alloy-evm [`Evm`] trait.
 //!
-//! Stage C (`BlockExecutor`/`BlockAssembler`) and Stage D (`ConfigureEvm`) build on top of this.
+//! The `BlockExecutor`/`BlockAssembler` (block module) and `ConfigureEvm` (config module) build on
+//! top of this.
 
 // arb-alloy's `reth` feature satisfies the reth-primitives-traits surface; pull it into the graph
 // so unification stays exercised.
@@ -54,8 +55,8 @@ use revm::{ExecuteEvm, InspectEvm, Inspector, MainContext, SystemCallEvm};
 
 use arb_revm::ArbSpecId;
 
-/// The `arb_revm` EVM type the bridge owns: the ArbOS EVM over [`ArbContext<DB>`] with
-/// the Arbitrum precompile set.
+/// The `arb_revm` EVM type this owns: the ArbOS EVM over [`ArbContext<DB>`] with the Arbitrum
+/// precompile set.
 type ArbRethEvm<DB, I> =
     arb_revm::ArbEvm<ArbContext<DB>, I, EthInstructions<EthInterpreter, ArbContext<DB>>, PrecompilesMap>;
 
@@ -174,8 +175,8 @@ where
 
 /// Factory producing [`ArbEvm`]s. Mirrors `OpEvmFactory`.
 ///
-/// `Spec` is `arb_revm`'s [`ArbSpecId`] (ArbOS-version-keyed, derived from `ArbHeaderInfo` in
-/// Stage D); precompile set is the Arbitrum one (version-gated); tx type is [`ArbTx`].
+/// `Spec` is `arb_revm`'s [`ArbSpecId`] (ArbOS-version-keyed, derived from `ArbHeaderInfo` by
+/// `ArbEvmConfig`); precompile set is the Arbitrum one (version-gated); tx type is [`ArbTx`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ArbEvmFactory;
 
@@ -184,8 +185,8 @@ impl ArbEvmFactory {
     ///
     /// The [`ArbChainContext`] is defaulted here. Block-scoped inputs not representable in alloy's
     /// [`EvmEnv`] (notably the L1 block number read by `NUMBER`) are populated from `ArbHeaderInfo`
-    /// by `ConfigureEvm` in Stage D. A default chain context is sufficient for Stage B's
-    /// transact-level proof (a value transfer never reads `NUMBER`).
+    /// by `ConfigureEvm`. A default chain context suffices for a bare transact (a value transfer
+    /// never reads `NUMBER`).
     fn build_ctx<DB: Database>(db: DB, evm_env: EvmEnv<ArbSpecId, BlockEnv>) -> ArbContext<DB> {
         Context::mainnet()
             .with_chain(ArbChainContext::default())

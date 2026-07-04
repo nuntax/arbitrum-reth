@@ -1,10 +1,10 @@
-//! `arb-reth-derive`: Stage F, L1 inbox derivation.
+//! `arb-reth-derive`: L1 inbox derivation.
 //!
 //! Decodes Arbitrum L1 `SequencerInbox` batches into the canonical
 //! [`MessageWithMetadata`] stream (the trustless-sync half that `arbitrum-reth`
-//! lacks). First milestone: the **blob** path (EIP-4844), then calldata.
+//! lacks). Covers the blob path (EIP-4844) and calldata.
 //!
-//! Pipeline (see `docs/stage-f-handoff.md` + the blob-decode addendum):
+//! Pipeline:
 //! ```text
 //! blob sidecars --[field-element unpack]--> batch bytes
 //!   --[40-byte timeBounds header + 0x00 brotli flag]--> RLP segment list

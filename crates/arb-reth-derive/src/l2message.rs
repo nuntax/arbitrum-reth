@@ -1,6 +1,5 @@
 //! L2 message parsing: turn a derived message's `l2_msg` into its signed
 //! transaction encodings. Mirrors `nitro/arbos/parse_l2.go::parseL2Message`.
-//! (Also the foundation of Stage E message→block production.)
 
 use alloy_primitives::{keccak256, B256};
 

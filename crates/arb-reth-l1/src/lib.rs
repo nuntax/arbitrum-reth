@@ -1,4 +1,4 @@
-//! `arb-reth-l1`: Stage F, the L1-derivation fetch layer.
+//! `arb-reth-l1`: the L1-derivation fetch layer.
 //!
 //! Reads `SequencerInbox` batches from an L1 RPC and turns them into the
 //! [`DerivedMessage`](arb_reth_derive::message::DerivedMessage) stream that the
@@ -9,7 +9,7 @@
 //! What lives where:
 //! * [`contracts`] - the `SequencerInbox` ABI surface (event topic + call selectors).
 //! * [`reader`] - [`SequencerInboxReader`], which fetches batch logs and resolves
-//!   each batch's payload (calldata now; blob sidecars in a later slice).
+//!   each batch's payload (calldata or blob sidecars).
 //! * [`extract_calldata_payload`] / [`decode_batch_messages`] - the pure decode glue
 //!   bridging recovered calldata to the derive pipeline.
 
@@ -129,7 +129,7 @@ pub fn decode_payload_messages(
 ) -> Result<Vec<DerivedMessage>, L1Error> {
     // An empty payload is a valid empty sequencer message (Nitro `ParseSequencerMessage`
     // logs "empty sequencer message" and returns zero segments rather than erroring).
-    // Early Arbitrum One batches do this — batch 0 is a `SeparateBatchEvent` with empty
+    // Early Arbitrum One batches do this: batch 0 is a `SeparateBatchEvent` with empty
     // data. The multiplexer still runs so any delayed messages this batch reads
     // (force-inclusion: `afterDelayedMessages > before_delayed_count`) are emitted; only
     // the segment list is empty.

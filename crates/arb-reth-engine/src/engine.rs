@@ -1,8 +1,8 @@
-//! Tier-1 engine-tree driver: reusable production code lifted from the `engine_spike` gate.
+//! Engine-tree driver: the production block-production code, shared with the `engine_spike` gate.
 //!
 //! [`ArbEngineDriver`] stands up reth's [`EngineApiTreeHandler`] for `ArbNode` and drives
-//! `feed message → executed block → InsertExecutedBlock + ForkchoiceUpdated → canonicalize` with
-//! ASYNC persistence: production waits only for fast in-memory canonicalization while the tree's
+//! `feed message -> executed block -> InsertExecutedBlock + ForkchoiceUpdated -> canonicalize` with
+//! async persistence: production waits only for fast in-memory canonicalization while the tree's
 //! persistence service flushes to MDBX in the background.
 //!
 //! [`produce`] and [`wait_for_head`] are the single source of truth for the block-production and
@@ -77,14 +77,14 @@ type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
 >;
 
-/// Produce ONE executed Arbitrum block from a feed message.
+/// Produce one executed Arbitrum block from a feed message.
 ///
 /// The caller supplies the two parent-state providers (`exec_state_provider` for execution reads,
-/// `trie_state_provider` for the state-root `finish`) — they MUST be independent instances. The
+/// `trie_state_provider` for the state-root `finish`); they must be independent instances. The
 /// driver ([`ArbEngineDriver::build_block`]) selects between the legacy
 /// `provider.state_by_block_hash(parent)` path and the immune ring overlay. Returns a
 /// [`BuiltPayloadExecutedBlock`] (unsorted hashed/trie) ready to feed the tree via
-/// `InsertExecutedBlock` — it does NOT persist.
+/// `InsertExecutedBlock`; it does not persist.
 pub fn produce<'a>(
     evm_config: &ArbEvmConfig,
     chain_id: u64,
@@ -131,7 +131,7 @@ pub fn produce<'a>(
     // Bench sub-timing: overlay build vs execution vs state-root `finish`.
     let __ov0 = std::time::Instant::now();
 
-    // `exec_state_provider` / `trie_state_provider` are supplied by the caller and MUST be
+    // `exec_state_provider` / `trie_state_provider` are supplied by the caller and must be
     // independent instances (sharing one corrupts execution reads vs the trie build). The caller
     // built them either via `state_by_block_hash(parent)` (legacy) or the immune ring overlay.
     let mut state = State::builder()
@@ -150,26 +150,26 @@ pub fn produce<'a>(
         .wrap_err("apply_pre_execution_changes failed")?;
 
     // Tx-sequencing priority mirrors Nitro (arbos/block_processor.go:366-374): the start-block
-    // internal tx first, then—each iteration—any SCHEDULED REDEEM (FIFO) BEFORE the next sequenced
+    // internal tx first, then, each iteration, any scheduled redeem (FIFO) before the next sequenced
     // user tx. A user tx that calls `redeem()` schedules an `ArbitrumRetryTx` that Nitro runs
     // immediately after it. Appending scheduled retries to the back of a single user-tx queue runs
-    // them AFTER the remaining user txs, which does not change execution/state/gas (the txs are
+    // them after the remaining user txs, which does not change execution/state/gas (the txs are
     // independent) but reorders the block, diverging `transactionsRoot`/`receiptsRoot` and thus the
-    // block HASH from Nitro. That wrong hash is invisible to a state-root parity check until a later
+    // block hash from Nitro. That wrong hash is invisible to a state-root parity check until a later
     // L1-advancing block bakes the (wrong) parent hash into ArbOS state via `record_new_l1_block`
     // (first observed as a state-root divergence at Arb One block 22476703; real cause at 22476646).
     let mut user_txs: VecDeque<ArbTxEnvelope> = input.message.txs.into_iter().collect();
     let mut redeems: VecDeque<ArbTxEnvelope> = VecDeque::new();
-    // Set the block's L2 base fee. ArbOS stores `L2PricingState.BaseFeeWei` = the fee for the NEXT
+    // Set the block's L2 base fee. ArbOS stores `L2PricingState.BaseFeeWei` = the fee for the next
     // block (each block's start-block `update_pricing_model` computes and stores the successor's
-    // fee). So THIS block's basefee is the value already in state at block start — what the PARENT's
-    // update produced — read here BEFORE the start-block tx overwrites it with the next block's fee.
-    // Our block env was seeded with the parent HEADER's basefee (`config.rs` `next_evm_env`), which
-    // is the fee from TWO blocks back and is only correct while the fee sits at the `minBaseFee`
+    // fee). So this block's basefee is the value already in state at block start (what the parent's
+    // update produced), read here before the start-block tx overwrites it with the next block's fee.
+    // Our block env was seeded with the parent header's basefee (`config.rs` `next_evm_env`), which
+    // is the fee from two blocks back and is only correct while the fee sits at the `minBaseFee`
     // floor. Fixing it makes user txs pay the right L2 fee + L1 poster gas (posterCost / basefee),
     // and the sealed header (assembler reads `block_env.basefee()`) carry it. First observed at Arb
     // One 23204013, the first block the gas backlog pushed the fee above the floor: correct header
-    // basefee 100120000 (parent's stored fee) vs our stale 1e8 (parent header) → poster gas +537.
+    // basefee 100120000 (parent's stored fee) vs our stale 1e8 (parent header), poster gas +537.
     let block_base_fee = ArbosState::open()
         .l2_pricing
         .base_fee_wei
@@ -203,13 +203,13 @@ pub fn produce<'a>(
                 tx_success = res.result.result.is_success();
                 tx_logs = res.result.result.logs().to_vec();
             })
-            // In trusted replay every tx is known-valid, so an EVM *validation* failure here
-            // (NonceTooHigh / lack-of-funds) is definitionally a torn parent-state read — the
+            // In trusted replay every tx is known-valid, so an EVM validation failure here
+            // (NonceTooHigh / lack-of-funds) is definitionally a torn parent-state read: the
             // overlay `state_by_block_hash(parent)` snapshot raced the engine tree's async
-            // persistence (see `advance`'s retry loop, which rebuilds a fresh snapshot).
+            // persistence.
             .wrap_err("execute_transaction failed")?;
         if tx_success {
-            // FIFO, drained before the next user tx — matches Nitro's cascading-redeem order.
+            // FIFO, drained before the next user tx, matching Nitro's cascading-redeem order.
             let retries =
                 scheduled_retries_from_redeem_logs(builder.evm_mut().ctx_mut(), &tx_logs, chain_id);
             redeems.extend(retries);
@@ -246,7 +246,7 @@ pub fn produce<'a>(
         state: bundle,
     });
 
-    // BuiltPayloadExecutedBlock wants UNSORTED hashed_state / trie_updates.
+    // BuiltPayloadExecutedBlock wants unsorted hashed_state / trie_updates.
     Ok(BuiltPayloadExecutedBlock {
         recovered_block: Arc::new(recovered_block),
         execution_output,
@@ -255,16 +255,16 @@ pub fn produce<'a>(
     })
 }
 
-/// A [`StateProvider`] that wraps the ring-overlay trie provider and overrides ONLY the
-/// state-root computation (`state_root_with_updates`) to run in PARALLEL over reth's overlay
-/// factory — the exact, bit-exact-proven recipe used by [`ArbEngineDriver::shadow_compare`].
+/// A [`StateProvider`] that wraps the ring-overlay trie provider and overrides only the
+/// state-root computation (`state_root_with_updates`) to run in parallel over reth's overlay
+/// factory, the same bit-exact recipe used by [`ArbEngineDriver::shadow_compare`].
 ///
 /// Everything else delegates to `inner` (the `MemoryOverlayStateProviderRef`), so all reads and
 /// `hashed_post_state` are unchanged. `BlockBuilder::finish` calls `state_root_with_updates`
 /// specifically, so overriding just that method drives the parallel path while leaving `produce`,
 /// the serial `finish` contract, and every other provider method untouched.
 struct ParallelRootProvider<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> {
-    /// The `MemoryOverlayStateProviderRef` — all reads + `hashed_post_state`.
+    /// The `MemoryOverlayStateProviderRef`: all reads + `hashed_post_state`.
     inner: Box<dyn StateProvider + 'a>,
     provider_factory: ProviderFactory<N>,
     changeset_cache: ChangesetCache,
@@ -394,7 +394,7 @@ where
         self.inner.state_root_from_nodes(input)
     }
 
-    /// The parallel override: reproduce `shadow_compare`'s proven recipe and return its root +
+    /// The parallel override: reproduce `shadow_compare`'s recipe and return its root +
     /// updates as the authoritative result (this is what `BlockBuilder::finish` consumes).
     fn state_root_with_updates(
         &self,
@@ -484,22 +484,22 @@ where
 /// `persistence_backpressure_threshold=16`) suit a live validator: persist promptly, hold almost
 /// nothing in memory.
 ///
-/// **A deep in-memory buffer SILENTLY CORRUPTS THE CHAIN here — do not widen these.** Running
-/// production far ahead of persistence (e.g. 128/128/1024) ~doubled timing-run throughput, but a
-/// mainnet re-validation (2026-07-02) proved it wrong: `produce()` reads parent state via
-/// `state_by_block_hash(parent)`, which snapshots the tree's in-memory overlay + the DB
-/// *non-atomically*. Once the persisted DB tip runs ahead of the in-memory anchor (only possible
+/// A deep in-memory buffer silently corrupts the chain here, so do not widen these. Running
+/// production far ahead of persistence (e.g. 128/128/1024) roughly doubled timing-run throughput,
+/// but a mainnet re-validation proved it wrong: `produce()` reads parent state via
+/// `state_by_block_hash(parent)`, which snapshots the tree's in-memory overlay and the DB
+/// non-atomically. Once the persisted DB tip runs ahead of the in-memory anchor (only possible
 /// with a deep buffer), that read races the tree's async persistence thread (commit +
-/// `remove_persisted_blocks` + `remove_before`) and intermittently returns a *stale/empty* account.
-/// Two symptoms: (a) the stale read trips validation → `NonceTooHigh`/"lack of funds" crash; (b)
-/// WORSE, the stale read mis-executes WITHOUT erroring → a wrong-but-internally-consistent state
-/// root is baked in and the chain diverges from canonical (observed: roots matched to block
-/// 22212000 then MISMATCHED by 22214000, ~170 blocks before any crash). A retry cannot fix (b): the
-/// corruption is permanent once produced. At the shallow default below the anchor tracks the DB tip
-/// (`LatestStateProvider`, no gap), the racy path is never taken, and the sync produced 32,624
-/// blocks with 10/10 roots + hashes == canonical. Recovering throughput requires a state-read path
-/// that is NOT raced by persistence (e.g. thread the just-executed parent post-state forward in the
-/// driver instead of reading it back through the provider) — NOT a bigger buffer.
+/// `remove_persisted_blocks` + `remove_before`) and intermittently returns a stale/empty account.
+/// Two symptoms: (a) the stale read trips validation, giving a `NonceTooHigh`/"lack of funds"
+/// crash; (b) worse, the stale read mis-executes without erroring, so a wrong-but-internally-
+/// consistent state root is baked in and the chain diverges from canonical (observed: roots matched
+/// to block 22212000 then mismatched by 22214000, ~170 blocks before any crash). A retry cannot fix
+/// (b): the corruption is permanent once produced. At the shallow default below, the anchor tracks
+/// the DB tip (`LatestStateProvider`, no gap), the racy path is never taken, and the sync produced
+/// 32,624 blocks with 10/10 roots + hashes == canonical. Recovering throughput requires a
+/// state-read path that is not raced by persistence (e.g. thread the just-executed parent post-state
+/// forward in the driver instead of reading it back through the provider), not a bigger buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct ArbEngineTuning {
     /// Persist once the canonical tip is this many blocks ahead of the last persisted block.
@@ -508,21 +508,20 @@ pub struct ArbEngineTuning {
     pub memory_block_buffer_target: u64,
     /// Hard backpressure: stall block production once this many blocks are unpersisted.
     pub persistence_backpressure_threshold: u64,
-    /// EXPERIMENTAL toggle (`--ring-overlay`): read parent state for `produce()` from a driver-held
-    /// ring of just-executed blocks overlaid on the IMMUNE `LatestStateProvider` (MDBX-only, single
+    /// Experimental toggle (`--ring-overlay`): read parent state for `produce()` from a driver-held
+    /// ring of just-executed blocks overlaid on the immune `LatestStateProvider` (MDBX-only, single
     /// pinned tx), instead of `provider.state_by_block_hash(parent)` (which races async persistence
     /// at depth). When true, the torn-read hazard is eliminated by construction, so deep buffers
-    /// become safe. Default false = legacy path. See `arb-reth/docs/blockprod-decouple-spec.md` (#3).
+    /// become safe. Default false = legacy path.
     pub ring_overlay: bool,
 }
 
 impl Default for ArbEngineTuning {
     fn default() -> Self {
-        // Shallow buffer = the ONLY config proven parity-correct on mainnet (see the type doc):
+        // Shallow buffer = the only config proven parity-correct on mainnet (see the type doc):
         // deep buffers make produce()'s state_by_block_hash(parent) overlay read go stale and
-        // crash with "lack of funds". Matches reth's stock defaults. ~80 blk/s until the overlay
-        // read-path staleness is fixed; do NOT widen these without re-running the mainnet parity
-        // check (arb-check-progress.sh must show 10/10 == canonical).
+        // crash with "lack of funds". Matches reth's stock defaults. Do not widen these without
+        // re-running the mainnet parity check (arb-check-progress.sh must show 10/10 == canonical).
         Self::reth_defaults()
     }
 }
@@ -549,7 +548,7 @@ impl ArbEngineTuning {
     }
 }
 
-/// Tier-1 engine-tree driver for `ArbNode`.
+/// Engine-tree driver for `ArbNode`.
 ///
 /// Owns the tree's request sender, the current tip, and a receiver of canonicalization
 /// observations. Each [`advance`](ArbEngineDriver::advance) produces a block against the tree
@@ -587,20 +586,20 @@ where
     obs_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, B256)>,
     /// `--ring-overlay` mode: read parent state from `ring` overlaid on the immune latest provider.
     ring_overlay: bool,
-    /// Just-executed blocks not yet known to be persisted, oldest→newest, contiguous down to the
+    /// Just-executed blocks not yet known to be persisted, oldest to newest, contiguous down to the
     /// persisted tip. Only maintained when `ring_overlay` is on; drained as persistence advances.
     ring: VecDeque<ExecutedBlock<ArbPrimitives>>,
-    /// Shadow validation of the PARALLEL state root against the serial one (env
+    /// Shadow validation of the parallel state root against the serial one (env
     /// `ARB_SHADOW_STATEROOT=1`, ring-overlay only). When on, every produced block also computes
     /// its root via `reth_trie_parallel::ParallelStateRoot` over the reth overlay factory and
     /// asserts it (and its `trie_updates`) equal the serial result. The serial result still drives
-    /// the chain — this is a zero-risk correctness+timing probe before flipping parallel on.
+    /// the chain; this is a zero-risk correctness and timing probe before flipping parallel on.
     shadow_stateroot: bool,
-    /// PARALLEL state-root mode (env `ARB_PARALLEL_STATEROOT=1`, ring-overlay only). When on, the
+    /// Parallel state-root mode (env `ARB_PARALLEL_STATEROOT=1`, ring-overlay only). When on, the
     /// ring branch of `build_block` wraps the trie provider in [`ParallelRootProvider`] so
-    /// `BlockBuilder::finish` computes the root in parallel (the proven `shadow_compare` recipe) and
-    /// that root DRIVES the produced block. Requires `state_trie_overlays` to be populated, so
-    /// `maintain_ring` feeds the manager when this OR `shadow_stateroot` is on.
+    /// `BlockBuilder::finish` computes the root in parallel (the `shadow_compare` recipe) and
+    /// that root drives the produced block. Requires `state_trie_overlays` to be populated, so
+    /// `maintain_ring` feeds the manager when this or `shadow_stateroot` is on.
     parallel_stateroot: bool,
     /// reth's native "ring" for the parallel/overlay path: resolves the (trie + hashed) overlay for
     /// the unpersisted blocks between the persisted anchor and the parent. Kept in lockstep with
@@ -761,10 +760,10 @@ where
         msg: &BroadcastFeedMessage,
     ) -> eyre::Result<BuiltPayloadExecutedBlock<ArbPrimitives>> {
         if self.ring_overlay {
-            // Pin ONE MDBX RO tx: read the persisted tip and the immune latest state from the SAME
+            // Pin one MDBX RO tx: read the persisted tip and the immune latest state from the same
             // tx so the state-root path's historical anchor sits exactly at `persisted_tip` (the
             // ring adds `(persisted_tip, parent]` on top with no double-apply). `latest()` reads
-            // MDBX HashedAccounts only (no RocksDB) → not raced by async persistence.
+            // MDBX HashedAccounts only (no RocksDB), so it is not raced by async persistence.
             let db_ro = self
                 .provider
                 .database_provider_ro()
@@ -772,7 +771,7 @@ where
             let persisted_tip = db_ro.best_block_number().wrap_err("best_block_number failed")?;
             let parent_num = self.tip.number;
 
-            // Ring blocks strictly above the persisted tip, newest→oldest (MemoryOverlay order).
+            // Ring blocks strictly above the persisted tip, newest to oldest (MemoryOverlay order).
             let ring_vec: Vec<ExecutedBlock<ArbPrimitives>> = self
                 .ring
                 .iter()
@@ -781,8 +780,9 @@ where
                 .cloned()
                 .collect();
 
-            // Tripwire: the overlay MUST cover the whole gap (persisted_tip, parent]. A short ring
-            // means a read would fall through to `latest` for a block the ring should carry → stale.
+            // Tripwire: the overlay must cover the whole gap (persisted_tip, parent]. A short ring
+            // means a read would fall through to `latest` for a block the ring should carry, i.e.
+            // a stale read.
             let expected = parent_num.saturating_sub(persisted_tip);
             if ring_vec.len() as u64 != expected {
                 return Err(eyre!(
@@ -792,7 +792,7 @@ where
                 ));
             }
 
-            // `LatestStateProviderRef` over the pinned RO tx = the immune anchor (equivalent to the
+            // `LatestStateProviderRef` over the pinned RO tx is the immune anchor (equivalent to the
             // inherent `db_ro.latest()`, but callable under the generic Provider bounds).
             let exec_hist: Box<dyn StateProvider + '_> =
                 Box::new(LatestStateProviderRef::new(&db_ro));
@@ -817,7 +817,8 @@ where
             };
             let built = produce(&self.evm_config, self.chain_id, &self.tip, msg, exec_sp, trie_sp)?;
             // Zero-risk probe: also compute the root in parallel and assert it equals the serial
-            // one just produced (serial still drives the chain). No-op unless ARB_SHADOW_STATEROOT.
+            // one just produced (serial still drives the chain). No-op unless ARB_SHADOW_STATEROOT
+            // is set.
             self.shadow_compare(&built);
             Ok(built)
         } else {
@@ -833,11 +834,11 @@ where
         }
     }
 
-    /// SHADOW mode (`ARB_SHADOW_STATEROOT=1`): recompute this block's state root in PARALLEL over
+    /// Shadow mode (`ARB_SHADOW_STATEROOT=1`): recompute this block's state root in parallel over
     /// reth's overlay factory (the same wiring the engine tree's `compute_state_root_parallel`
-    /// uses) and assert it — and its `trie_updates` — equal the serial result already in `built`.
+    /// uses) and assert it, and its `trie_updates`, equal the serial result already in `built`.
     /// The serial result is authoritative and drives the chain regardless; this only logs a
-    /// MATCH (with the parallel timing, so we can read the crossover) or a MISMATCH warning. This
+    /// match (with the parallel timing, so we can read the crossover) or a mismatch warning. This
     /// is the correctness gate before we ever let the parallel root drive a produced block.
     fn shadow_compare(&self, built: &BuiltPayloadExecutedBlock<ArbPrimitives>) {
         if !self.shadow_stateroot {
@@ -849,7 +850,7 @@ where
         // Prefix sets = which subtries this block changed; the overlay carries the state.
         let hashed = built.hashed_state.as_ref();
         let prefix_sets = hashed.construct_prefix_sets().freeze();
-        // parent_hash = the parent of this block (= current tip); the manager resolves the anchor
+        // parent_hash is the parent of this block (= current tip); the manager resolves the anchor
         // (persisted tip) and the (anchor, parent] overlay internally, mirroring `trie_input()`.
         let overlay_builder = OverlayBuilder::new(self.tip.hash(), self.changeset_cache.clone())
             .with_state_trie_overlay_manager(self.state_trie_overlays.clone())
@@ -901,7 +902,7 @@ where
         if !self.ring_overlay {
             return;
         }
-        // ComputedTrieData wants SORTED hashed-state + trie-updates (MemoryOverlay's `trie_input`
+        // ComputedTrieData wants sorted hashed-state + trie-updates (MemoryOverlay's `trie_input`
         // extends from sorted). `built` carries the unsorted forms; sort clones here.
         let hashed = Arc::new((*built.hashed_state).clone().into_sorted());
         let trie = Arc::new((*built.trie_updates).clone().into_sorted());
@@ -917,7 +918,7 @@ where
             self.state_trie_overlays.insert_block(exec.clone());
         }
         self.ring.push_back(exec);
-        // Prune everything at/below the persisted (on-disk) tip. Use the RO provider's tip, NOT
+        // Prune everything at/below the persisted (on-disk) tip. Use the RO provider's tip, not
         // `BlockchainProvider::best_block_number` (that's the in-memory canonical tip).
         if let Ok(db_ro) = self.provider.database_provider_ro() {
             if let Ok(persisted) = db_ro.best_block_number() {
@@ -948,8 +949,8 @@ where
 
         // Legacy path (`ring_overlay=false`): `produce` reads parent state via
         // `provider.state_by_block_hash(parent)`, which snapshots the tree overlay + the DB
-        // non-atomically — SAFE only at a shallow buffer (see `ArbEngineTuning`). Do NOT paper over
-        // deep-buffer failures with a retry: some torn reads mis-execute WITHOUT erroring, baking a
+        // non-atomically, safe only at a shallow buffer (see `ArbEngineTuning`). Do not paper over
+        // deep-buffer failures with a retry: some torn reads mis-execute without erroring, baking a
         // wrong root into the chain. The `--ring-overlay` path reads from the driver-held ring over
         // the immune latest provider and is not raced by persistence.
         let built = self.build_block(msg)?;

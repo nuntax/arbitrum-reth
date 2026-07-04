@@ -6,8 +6,8 @@
 //! - [`serve_rpc`]: standalone helper that wires an [`EthApi`] with the Arb
 //!   converter into a jsonrpsee HTTP server and returns its handle.
 //!
-//! The helper is intentionally isolated: it does not use `RpcAddOns`, does not touch
-//! the engine, and can be swapped out later if we migrate to `RpcAddOns`-based wiring.
+//! The helper does not use `RpcAddOns` and does not touch the engine, so it can be
+//! swapped for `RpcAddOns`-based wiring later.
 
 use std::{fmt::Debug, net::SocketAddr};
 
@@ -51,7 +51,7 @@ use reth_tokio_util::EventSender;
 /// Converts `ArbReceiptEnvelope<Log>` primitives into [`ArbTransactionReceipt`] RPC responses.
 ///
 /// Analogous to op-reth's `OpReceiptConverter`. `gas_used_for_l1` is stored on the receipt
-/// by the block executor; no L1-fee hardfork math is needed.
+/// by the block executor, so no L1-fee hardfork math is needed here.
 #[derive(Debug, Clone)]
 pub struct ArbReceiptConverter<Provider> {
     provider: Provider,
@@ -202,8 +202,8 @@ where
     Ok(ArbTransactionReceipt {
         inner: core,
         gas_used_for_l1: gas_cell.get(),
-        // l1_block_number: not available at receipt-conversion time without reading block
-        // extra_data. Will be populated in Stage F from block metadata.
+        // l1_block_number is not available at receipt-conversion time without reading
+        // block extra_data; it gets populated from block metadata elsewhere.
         l1_block_number: None,
         timeboosted: None,
     })
@@ -218,7 +218,7 @@ pub type ArbRpcConverter<Provider> = RpcConverter<
 
 /// Starts a jsonrpsee HTTP server exposing `eth_*` methods for Arbitrum.
 ///
-/// Isolated from the engine and `RpcAddOns`. Returns a [`RpcServerHandle`] whose
+/// Independent of the engine and `RpcAddOns`. Returns a [`RpcServerHandle`] whose
 /// lifetime controls the server. Generic over `Pool` and `Network`; pass a noop pool
 /// with `Consensus = ArbTxEnvelope` for sequencer-only nodes.
 pub async fn serve_rpc<Provider, Pool, Network>(

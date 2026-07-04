@@ -1,21 +1,21 @@
-//! Tier-1 engine-tree adoption spike.
+//! Engine-tree adoption spike.
 //!
-//! Proves that reth's [`EngineApiTreeHandler`] can be stood up for [`ArbNode`] and fed
-//! already-executed Arbitrum blocks via the `InsertExecutedBlock` seam (NO re-execution),
+//! Checks that reth's [`EngineApiTreeHandler`] can be stood up for [`ArbNode`] and fed
+//! already-executed Arbitrum blocks via the `InsertExecutedBlock` seam (no re-execution),
 //! with the tree providing in-memory canonical state, overlay, and async persistence.
 //!
 //! # What this exercises
 //!
 //! For each of the testnode-replay feed messages we:
-//!   1. produce a block with an execute-once producer that reads state FROM THE TREE OVERLAY
-//!      (`provider.state_by_block_hash(parent_hash)` — auto-overlays pending in-memory blocks),
+//!   1. produce a block with an execute-once producer that reads state from the tree overlay
+//!      (`provider.state_by_block_hash(parent_hash)`, which auto-overlays pending in-memory blocks),
 //!   2. wrap the result in a [`BuiltPayloadExecutedBlock`],
 //!   3. send `InsertExecutedBlock` + a `ForkchoiceUpdated` (head = new block) to the tree,
 //!   4. wait for the tree to canonicalize the block, then assert its `state_root`/hash equal
 //!      the testnode's captured values (same fixtures as `driver::replay_feed_matches_testnode_per_block`).
 //!
-//! Reaching the gate proves the reth generics line up for ArbNode, the seam canonicalizes +
-//! persists without re-exec, and production-against-the-overlay yields correct roots.
+//! Reaching the gate shows the reth generics line up for ArbNode, the seam canonicalizes and
+//! persists without re-exec, and production against the overlay yields correct roots.
 
 use reth_evm::{ConfigureEngineEvm, EvmEnvFor};
 
@@ -26,14 +26,14 @@ use crate::ArbExecutionData;
 // ConfigureEngineEvm for ArbEvmConfig.
 //
 // `BasicEngineValidator<P, ArbEvmConfig, ArbPayloadValidator>` only satisfies `EngineValidator<T>`
-// when `ArbEvmConfig: ConfigureEngineEvm<ArbExecutionData>`. These methods are ONLY invoked on the
+// when `ArbEvmConfig: ConfigureEngineEvm<ArbExecutionData>`. These methods are only invoked on the
 // newPayload / execute-the-payload path; on the `InsertExecutedBlock` path (which this spike uses)
-// they are never called. We therefore provide trivial bodies. `ConfigureEvm::Error` is `Infallible`
+// they are never called, so we provide trivial bodies. `ConfigureEvm::Error` is `Infallible`
 // for ArbEvmConfig, so the `evm_env`/`context` methods cannot return an `Err`; they `unreachable!()`.
 // `tx_iterator_for_payload` returns an empty (never-yielding) iterator of the right concrete type.
 //
 // Orphan rule: `ConfigureEngineEvm` is foreign (reth_evm) and `ArbEvmConfig` is foreign
-// (arb-reth-evm), but the trait's type parameter `ArbExecutionData` is LOCAL to this crate, which
+// (arb-reth-evm), but the trait's type parameter `ArbExecutionData` is local to this crate, which
 // makes the impl legal (RFC 2451: a local type covers the impl).
 // -----------------------------------------------------------------------------------------------
 
@@ -58,8 +58,8 @@ impl ConfigureEngineEvm<ArbExecutionData> for ArbEvmConfig {
     ) -> Result<impl reth_evm::ExecutableTxIterator<Self>, Self::Error> {
         // A `(Vec<Recovered<ArbTxEnvelope>>, closure)` tuple is a valid `ExecutableTxIterator`:
         // `Recovered<ArbTxEnvelope>` is `ExecutableTxFor<ArbEvmConfig>` (the driver executes exactly
-        // this via `builder.execute_transaction`). Empty vec ⇒ the iterator never yields; the tuple
-        // just gives the opaque return type a nameable concrete type. Never actually called.
+        // this via `builder.execute_transaction`). Empty vec means the iterator never yields; the
+        // tuple just gives the opaque return type a nameable concrete type. Never actually called.
         use alloy_consensus::transaction::Recovered;
         use arb_alloy_consensus::ArbTxEnvelope;
         let txs: alloc::vec::Vec<Recovered<ArbTxEnvelope>> = alloc::vec::Vec::new();
@@ -101,7 +101,7 @@ impl PayloadValidator<crate::ArbPayloadTypes> for ArbPayloadValidator {
     }
 }
 
-// Compile-time proof that ArbEvmConfig satisfies ConfigureEngineEvm<ArbExecutionData>.
+// Compile-time check that ArbEvmConfig satisfies ConfigureEngineEvm<ArbExecutionData>.
 const _: fn() = || {
     fn assert_engine_evm<C: ConfigureEngineEvm<ArbExecutionData>>() {}
     assert_engine_evm::<ArbEvmConfig>();

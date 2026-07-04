@@ -1,6 +1,6 @@
-//! `arb-reth-evm` Stage D.1: [`ArbEvmConfig`], reth's [`ConfigureEvm`] for Arbitrum.
+//! [`ArbEvmConfig`], reth's [`ConfigureEvm`] for Arbitrum.
 //!
-//! Ties together Stage B ([`ArbEvmFactory`]/[`ArbEvm`](crate::ArbEvm)) and Stage C
+//! Ties together the EVM factory ([`ArbEvmFactory`]/[`ArbEvm`](crate::ArbEvm)) and the block layer
 //! ([`ArbBlockExecutorFactory`]/[`ArbBlockExecutor`](crate::ArbBlockExecutor)/[`ArbBlockAssembler`]).
 //!
 //! Mirrors `OpEvmConfig`. Unlike OP (which keys spec from a timestamp-keyed chain spec),
@@ -11,8 +11,7 @@
 //! ## L1 block number threading
 //!
 //! On Arbitrum the `NUMBER` opcode returns the L1 block number (not the L2 one). `arb_revm`
-//! overrides `opNumber` to read `chain().l1_block_number`. [`ArbEvmConfig`] resolves the deferral
-//! left by Stage B: [`evm_env`](ArbEvmConfig::evm_env) and
+//! overrides `opNumber` to read `chain().l1_block_number`. [`evm_env`](ArbEvmConfig::evm_env) and
 //! [`context_for_block`](ArbEvmConfig::context_for_block) decode the L1 block number from
 //! [`ArbHeaderInfo`] into [`ArbBlockExecutionCtx::l1_block_number`], and
 //! [`ArbBlockExecutorFactory::create_executor`](crate::ArbBlockExecutorFactory) threads it into the
@@ -52,8 +51,7 @@ pub type ArbEvmConfigError = Infallible;
 /// Additional attributes needed to configure the next Arbitrum block, beyond what the parent header
 /// carries. Mirrors `OpNextBlockEnvAttributes` / reth's `NextBlockEnvAttributes`.
 ///
-/// On Arbitrum these come from the sequencer message being executed. Stage E populates them from
-/// an `L1IncomingMessage`.
+/// On Arbitrum these come from the sequencer message being executed (an `L1IncomingMessage`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArbNextBlockEnvAttributes {
     /// Timestamp for the next block.
@@ -79,14 +77,15 @@ pub struct ArbNextBlockEnvAttributes {
     pub withdrawals: Option<Withdrawals>,
 }
 
-/// Arbitrum EVM configuration: implements reth's [`ConfigureEvm`], wiring Stage B + Stage C.
+/// Arbitrum EVM configuration: implements reth's [`ConfigureEvm`], wiring the EVM factory and block
+/// layer together.
 ///
-/// Holds the chain id plus the Stage C [`ArbBlockExecutorFactory`] and [`ArbBlockAssembler`].
+/// Holds the chain id plus the [`ArbBlockExecutorFactory`] and [`ArbBlockAssembler`].
 /// Mirrors `OpEvmConfig` but parameterised only by chain id (per-block spec and L1 block number
 /// are decoded from each header via [`ArbHeaderInfo`], not from a chain spec).
 #[derive(Debug, Clone)]
 pub struct ArbEvmConfig {
-    /// Inner Stage C block-executor factory (wraps [`ArbEvmFactory`]).
+    /// Inner block-executor factory (wraps [`ArbEvmFactory`]).
     executor_factory: ArbBlockExecutorFactory,
     /// Arbitrum block assembler.
     block_assembler: ArbBlockAssembler,
@@ -243,7 +242,7 @@ impl ArbEvmConfig {
             extra_data: header.extra_data().clone(),
             l1_block_number: l1_block_number_for_header(header),
             // Block-scoped ArbOS startBlock inputs not in the consensus header are defaulted here;
-            // Stage E populates them from the sequencer `L1IncomingMessage`.
+            // the sequencer `L1IncomingMessage` supplies them on the production path.
             l1_base_fee_wei: U256::ZERO,
             time_last_block: 0,
             sequence_number: None,

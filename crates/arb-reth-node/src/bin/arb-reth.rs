@@ -5,14 +5,14 @@
 //! stack, spawns the `ArbEngineDriver` block producer (which drives reth's engine tree; see
 //! `launcher.rs`), and optionally serves the `eth_*` JSON-RPC API.
 //!
-//! ## What this is (and isn't) yet
+//! ## Feed sources
 //!
-//! The sequencer-feed channel is created but left empty by default. Stage F
-//! (L1-inbox derivation / live feed following) is what fills it for production use.
+//! The sequencer-feed channel is created but left empty by default. L1-inbox derivation
+//! (`--l1-rpc`, below) or `--replay-feed` fills it.
 //!
 //! With `--replay-feed <NDJSON>` the binary reads a file of
 //! `BroadcastFeedMessage` JSON objects (one per line) and pushes them all into the
-//! feed channel immediately after launch, then **keeps the feed channel open** so the
+//! feed channel immediately after launch, then keeps the feed channel open so the
 //! driver can drain it while RPC queries remain servable. The held sender keeps the
 //! node alive until SIGTERM. This lets a user run a finite replay and then inspect
 //! the produced blocks via JSON-RPC.
@@ -78,7 +78,7 @@ struct Args {
 
     /// Engine-tree persistence threshold: persist once the canonical tip is this many blocks
     /// ahead of the last persisted block (larger = bigger, less frequent commit batches).
-    /// WARNING: deep buffers are not parity-safe — the overlay read in produce() goes stale and
+    /// Deep buffers are not parity-safe: the overlay read in produce() goes stale and
     /// crashes with "lack of funds". Keep shallow until that read-path bug is fixed.
     #[arg(long, default_value_t = 2)]
     persistence_threshold: u64,
@@ -100,10 +100,10 @@ struct Args {
 
     /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
     /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
-    /// child), but the OS flushes lazily — cutting ~50ms fsync latency off every block. Stays
+    /// child), but the OS flushes lazily, cutting ~50ms fsync latency off every block. Stays
     /// crash-consistent (MDBX rolls back to the last synced meta page on restart); the only loss
     /// on a crash is a suffix of recently-produced blocks, which the L1 derivation re-produces.
-    /// Do NOT use for a node expected to be durable across power loss without re-sync.
+    /// Not for a node expected to be durable across power loss without re-sync.
     #[arg(long = "no-fsync", default_value_t = false)]
     no_fsync: bool,
 
@@ -122,7 +122,7 @@ struct Args {
     /// processes them, then the node stays alive for RPC inspection.
     ///
     /// Sender lifecycle: after pushing all messages the original sender is kept alive
-    /// (not dropped) so the driver does NOT exit; the node serves RPC until SIGTERM.
+    /// (not dropped) so the driver does not exit; the node serves RPC until SIGTERM.
     /// This lets you replay a finite file and then query the produced blocks.
     #[arg(long = "replay-feed", value_name = "PATH")]
     replay_feed: Option<PathBuf>,
@@ -143,7 +143,7 @@ struct Args {
     /// First L1 block to derive from. Optional override: normally the resume point comes from the
     /// persisted `arb-l1-resume.json` checkpoint (updated as the node syncs), or, on the first sync
     /// of a genesis snapshot, from the chain (batch 0's delivery block). Pass this only to force a
-    /// start block — it must be the batch boundary the current L2 tip was built from.
+    /// start block: it must be the batch boundary the current L2 tip was built from.
     #[arg(long = "l1-start-block")]
     l1_start_block: Option<u64>,
 
@@ -164,7 +164,7 @@ struct Args {
     /// Boot on a snapshot-imported datadir: path to the `reth-export --mode blocks` head stream
     /// (`H <num> <hash> <headerRLP>`). The node builds its chain spec from that head header so the
     /// genesis-hash check accepts the imported DB, and resumes from the snapshot's head block.
-    /// Use with `--datadir <imported-dir>` (do NOT pass `--chain`).
+    /// Use with `--datadir <imported-dir>` (do not pass `--chain`).
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: Option<PathBuf>,
 }
@@ -312,7 +312,7 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
         });
     }
 
-    // Stage F.3c.2: trustless L1-derivation catch-up. Runs as a feed producer on the
+    // Trustless L1-derivation catch-up. Runs as a feed producer on the
     // same channel the driver drains, so derived blocks execute through the validated
     // STF path. The held sender keeps the node alive even after a bounded run finishes.
     if let Some(l1_rpc) = args.l1_rpc {
@@ -354,7 +354,7 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
                 None => {
                     return Err(eyre::eyre!(
                         "resume log at {} has no boundary at or below the durable L2 tip ({db_tip}); \
-                         the database was rolled back further than the log reaches — reset the \
+                         the database was rolled back further than the log reaches; reset the \
                          datadir and re-sync (or delete the log)",
                         checkpoint_path.display(),
                     ));
@@ -363,8 +363,8 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
         } else {
             // No checkpoint: re-derive from Nitro genesis (batch 0), anchoring the L2 numbering at
             // genesis. For a fresh genesis DB this is the normal bootstrap (nothing is skipped). For
-            // a DB that advanced past genesis but has no checkpoint — a rewound DB, or one synced by
-            // a build predating the resume log — the L1-sync runtime re-derives from genesis and
+            // a DB that advanced past genesis but has no checkpoint (a rewound DB, or one synced by
+            // a build predating the resume log) the L1-sync runtime re-derives from genesis and
             // DROPS every block <= db_tip (derivation only, no re-execution), producing just the new
             // tail. Slower to start than a checkpoint resume, but always correct and self-healing;
             // the first window past db_tip writes a fresh checkpoint so later restarts are fast.

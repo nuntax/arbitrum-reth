@@ -1,10 +1,9 @@
 //! Canonical (binary) Arbitrum L1 incoming message produced by derivation.
 //!
-//! NB (open design point): `arb-sequencer-network` currently models these as
-//! JSON *feed* DTOs (hex-string fields). This is the binary representation the
-//! decode pipeline naturally produces; the canonical type + `serialize`/`hash`
-//! (Nitro 113-byte header / RLP hash) will be unified into arb-sequencer-network
-//! once validated against a real fixture.
+//! `arb-sequencer-network` currently models these as JSON feed DTOs (hex-string
+//! fields). This is the binary representation the decode pipeline naturally
+//! produces; the canonical type plus `serialize`/`hash` (Nitro 113-byte header /
+//! RLP hash) may later be unified into arb-sequencer-network.
 
 use alloy_primitives::{address, Address, B256, U256};
 

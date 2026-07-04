@@ -1,6 +1,6 @@
 //! CU profiler: drive several consecutive L1 windows through the real derive path
 //! (`resolve_batches` + `derive_from_resolved`) exactly as `run_l1_sync` does, with a
-//! transport-level method counter so we can see the true per-method RPC mix — including
+//! transport-level method counter so we can see the true per-method RPC mix, including
 //! the cross-window re-fetch waste that only shows up over consecutive windows.
 //!
 //! Run (calldata era, ~pre-Dencun):
@@ -73,8 +73,8 @@ where
     }
 
     fn call(&mut self, req: RequestPacket) -> Self::Future {
-        // Count the LOGICAL request once (retries are transport overhead, not algorithm calls
-        // — and a 429-rejected retry consumes no CU, so once is the right CU accounting).
+        // Count the logical request once (retries are transport overhead, not algorithm
+        // calls, and a 429-rejected retry consumes no CU, so once is the right CU accounting).
         {
             let mut c = self.counts.lock().unwrap();
             match &req {
@@ -105,7 +105,7 @@ where
 }
 
 /// Rough per-method CU weights (Alchemy legacy CU) so the mix can be read as a CU share.
-/// drpc/other providers weight differently, but the *relative* mix is what we optimize.
+/// drpc/other providers weight differently, but the relative mix is what we optimize.
 fn cu_weight(method: &str) -> u64 {
     match method {
         "eth_getLogs" => 75,
@@ -181,10 +181,10 @@ async fn profile_cu_over_consecutive_windows() {
     counts.lock().unwrap().clear();
 
     // CU_CACHED=0 measures the old per-window path (fresh caches); default uses the
-    // forward-carried caches threaded across windows (the #1/#3 fix).
+    // forward-carried caches threaded across windows.
     let cached = std::env::var("CU_CACHED").ok().as_deref() != Some("0");
     // CU_VERIFY=1: also run the reference (fresh-cache) path per window and assert the derived
-    // output is byte-identical — proves the cache change preserves parity on real chain data.
+    // output is byte-identical, proving the cache change preserves parity on real chain data.
     let verify = std::env::var("CU_VERIFY").ok().as_deref() == Some("1");
     let mut delayed_cache = DelayedCache::new();
     let mut report_cache = ReportStatsCache::new();

@@ -1,4 +1,4 @@
-//! Stage D.1 exit proof for [`ArbEvmConfig`].
+//! Tests for [`ArbEvmConfig`].
 //!
 //! 1. `evm_env(header)` derives the [`ArbSpecId`] from the ArbOS version embedded in the header,
 //!    and `context_for_block(header)` carries the header's L1 block number.
@@ -178,7 +178,7 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
     assert_ne!(returned, U256::ZERO, "must not be the defaulted 0");
 }
 
-/// Stage D validation: a whole block executes through reth's generic high-level executor
+/// A whole block executes through reth's generic high-level executor
 /// (`ConfigureEvm::executor(db).execute(&RecoveredBlock)`), proving `impl ConfigureEvm` plugs into
 /// reth's block-execution machinery end-to-end, driven entirely from the header.
 #[test]

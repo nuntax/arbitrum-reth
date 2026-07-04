@@ -5,10 +5,10 @@
 //! byte `0` (the BLS modulus is ~254 bits, so only 254 of each 256 bits are
 //! usable). The reassembled byte stream is `RLP(payload)`.
 //!
-//! IMPORTANT (verified against the Go source): the two extraction passes are
-//! **interleaved per blob**: for each blob we first emit its 31-byte bodies, then
-//! its spare-bit bytes, then move to the next blob. Doing all bodies first and all
-//! spares second would corrupt any multi-blob batch.
+//! The two extraction passes are interleaved per blob: for each blob we first
+//! emit its 31-byte bodies, then its spare-bit bytes, then move to the next blob.
+//! Doing all bodies first and all spares second would corrupt any multi-blob
+//! batch.
 
 use alloy_rlp::Header;
 

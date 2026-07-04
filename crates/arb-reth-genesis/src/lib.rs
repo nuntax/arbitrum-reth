@@ -1,4 +1,4 @@
-//! Stage H: convert the Nitro classic-state export into a reth-readable Arbitrum One genesis.
+//! Convert the Nitro classic-state export into a reth-readable Arbitrum One genesis.
 //!
 //! See [`readers`] for the streaming JSONL parsers over the export
 //! (`state/0x152dd48/{accounts,addresstable,retryables}.json`), which yield the

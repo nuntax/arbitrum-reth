@@ -7,8 +7,8 @@
 //!
 //! This module persists that cursor to `<datadir>/arb-l1-resume.json` as the node syncs, at
 //! batch/window boundaries whose L2 blocks are durably persisted. A restart reads it back and
-//! resumes derivation from there — the file-based equivalent of Nitro's `arbitrumdata` mapping,
-//! for the common single-writer case.
+//! resumes derivation from there (the file-based equivalent of Nitro's `arbitrumdata` mapping,
+//! for the common single-writer case).
 //!
 //! ## Why a bounded history, not one checkpoint
 //!
@@ -51,7 +51,7 @@ pub const MAX_CHECKPOINTS: usize = 128;
 pub struct L1ResumeCheckpoint {
     /// Next L1 block to derive from (the consumed window's `to + 1`).
     pub l1_block: u64,
-    /// Delayed-inbox cursor (`delayedMessagesRead`) at this boundary — the `before` count the next
+    /// Delayed-inbox cursor (`delayedMessagesRead`) at this boundary: the `before` count the next
     /// range's assembly starts from.
     pub delayed_count: u64,
     /// Absolute L2 block number reached at this boundary (durably persisted when written).
@@ -160,7 +160,7 @@ mod tests {
     fn record_dedupes_empty_windows_and_caps_length() {
         let mut log = L1ResumeLog::default();
         log.record(cp(100, 10));
-        // Empty windows: same l2, advancing l1 — the newest l1 must win, no duplicate l2 entry.
+        // Empty windows: same l2, advancing l1, so the newest l1 must win, no duplicate l2 entry.
         log.record(cp(200, 10));
         log.record(cp(300, 10));
         assert_eq!(log.checkpoints, vec![cp(300, 10)]);

@@ -200,8 +200,8 @@ impl ArbLauncher {
             )
             .await?;
 
-        // Part 3: open the DB in storage v2 (hashed-state canonical, `PackedKeyAdapter`). This
-        // MUST happen before `with_genesis()` uses the factory. Cache the flag so every provider
+        // Open the DB in storage v2 (hashed-state canonical, `PackedKeyAdapter`). This has to
+        // happen before `with_genesis()` uses the factory. Cache the flag so every provider
         // uses v2, and persist it idempotently: an importer-made DB already has v2 in metadata, so
         // we only write when no settings flag is persisted (fresh DB) or it differs.
         {
@@ -237,7 +237,7 @@ impl ArbLauncher {
         let task_executor: TaskExecutor = ctx.task_executor().clone();
         let head = ctx.head();
 
-        // Clone the in-memory state from the provider so the tree updates the SAME instance that
+        // Clone the in-memory state from the provider so the tree updates the same instance that
         // BlockchainProvider serves for RPC queries.
         let canonical: CanonicalInMemoryState<ArbPrimitives> =
             provider.canonical_in_memory_state();
@@ -250,7 +250,7 @@ impl ArbLauncher {
         let arb_evm_config: arb_reth_evm::ArbEvmConfig =
             ctx.node_adapter().components.evm_config().clone().into();
 
-        // Part 2: stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
+        // Stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
         // sequencer feed through it. Persistence to MDBX is async (tree background service).
         let mut driver: ArbEngineDriver<NodeTypesWithDBAdapter<N, DB>> = ArbEngineDriver::spawn(
             provider_factory,
@@ -344,8 +344,8 @@ mod tests {
 
     use crate::ArbNode;
 
-    /// D.3b.2: `ArbLauncher` boots over reth's `LaunchContext`, processes two deposit messages,
-    /// and persists blocks 1 & 2 with cumulative balance = 2 × 111_000_000_000_000_000.
+    /// `ArbLauncher` boots over reth's `LaunchContext`, processes two deposit messages,
+    /// and persists blocks 1 & 2 with cumulative balance = 2 x 111_000_000_000_000_000.
     #[tokio::test(flavor = "multi_thread")]
     async fn launcher_boots_and_produces_blocks() {
         let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -400,7 +400,7 @@ mod tests {
         let provider = handle.provider.clone();
         handle.wait_for_node_exit().await.expect("driver task must succeed");
 
-        // Part 3: the launcher opens the DB in storage v2; confirm the flag is persisted.
+        // The launcher opens the DB in storage v2; confirm the flag is persisted.
         {
             use reth_provider::DatabaseProviderFactory;
             use reth_storage_api::MetadataProvider;

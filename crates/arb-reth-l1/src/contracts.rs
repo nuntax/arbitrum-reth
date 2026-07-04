@@ -16,8 +16,8 @@ pub const SEQUENCER_INBOX_MAINNET: Address =
 
 /// L1 block where the Arbitrum One `SequencerInbox` was deployed and posted batch 0
 /// (verified: first block with code == first `SequencerBatchDelivered` seq 0). This is
-/// the chain's L1-derivation lower bound — the deployment block from Nitro `chaininfo`.
-/// Used only as the *anchor* for resolving a resume point's batch on-chain, not as a
+/// the chain's L1-derivation lower bound, the deployment block from Nitro `chaininfo`.
+/// Used only as the anchor for resolving a resume point's batch on-chain, not as a
 /// literal start block (see `SequencerInboxReader::delivery_block_of_batch`).
 pub const SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET: u64 = 15_411_056;
 

@@ -1,17 +1,17 @@
-//! Stage F.3c.2: the L1-derivation catch-up runtime.
+//! The L1-derivation catch-up runtime.
 //!
 //! Drives trustless sync. Walks L1 block ranges with [`arb_reth_l1::sync::derive_range`]
 //! (SequencerInbox batches + delayed inbox + blob sidecars), and pushes each derived
 //! [`BroadcastFeedMessage`] into the same feed channel the `ArbEngineDriver` drains, so
-//! derived blocks execute through the exact path validated against the testnode (Stage
-//! G). It follows the L1 head once caught up.
+//! derived blocks execute through the same path the driver uses. It follows the L1 head
+//! once caught up.
 //!
 //! ## Resuming
 //!
 //! `start_block` / `start_delayed_count` are the L1 block and `delayedMessagesRead` the resume
 //! point was built from, and `start_l2_block` is the L2 block that point sits after. As the runtime
-//! consumes each L1 window it records an [`L1ResumeCheckpoint`](crate::resume) — once the window's
-//! blocks are durable — so a later restart resumes from the last checkpoint instead of Nitro
+//! consumes each L1 window it records an [`L1ResumeCheckpoint`](crate::resume), once the window's
+//! blocks are durable, so a later restart resumes from the last checkpoint instead of Nitro
 //! genesis. On a resume whose checkpoint predates the durable tip (persistence outran the last
 //! written checkpoint), the first re-derived blocks reproduce ones already on disk; they are
 //! numbered absolutely from `start_l2_block` and dropped up to `db_tip_l2`, so the driver only ever
@@ -24,8 +24,7 @@
 //! `produce()` (engine.rs) derives the message-parse version from the parent header's encoded
 //! ArbOS version, and the per-block start-block internal tx applies scheduled ArbOS state
 //! upgrades (`upgrade_arbos_version`, arb_revm `internal_tx.rs`) when due. So a catch-up across
-//! an upgrade boundary is wired; it just hasn't been validated against a real mainnet upgrade
-//! crossing yet (do that with a forward run under the parity monitor).
+//! an upgrade boundary is wired, though not yet validated against a real mainnet upgrade crossing.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -137,8 +136,8 @@ where
 
     // The ORDERED tail (delayed-map + assembly) threads these window-to-window.
     let mut delayed = cfg.start_delayed_count;
-    // Forward-carried caches so the delayed scan and report-stat fetches — the dominant
-    // `getLogs` cost — are paid once per L1 range instead of re-paid on every window.
+    // Forward-carried caches so the delayed scan and report-stat fetches (the dominant
+    // `getLogs` cost) are paid once per L1 range instead of re-paid on every window.
     let mut delayed_cache = DelayedCache::new();
     let mut report_cache = ReportStatsCache::new();
     let mut consume_cursor = cfg.start_block;
@@ -230,8 +229,8 @@ where
             );
         }
 
-        // Number each derived message with its absolute L2 block, then either send it or — when it
-        // reproduces a block already on disk (a resume that started before the DB tip) — drop it.
+        // Number each derived message with its absolute L2 block, then either send it or, when it
+        // reproduces a block already on disk (a resume that started before the DB tip), drop it.
         // The `next_l2` counter advances for dropped blocks too: they are real blocks in the chain.
         let mut skipped = 0u64;
         for mut msg in derived.messages {
@@ -284,8 +283,8 @@ where
 ///
 /// Moves each queued boundary with `l2_block <= persisted` (they are ascending) into the in-memory
 /// log, then rewrites the whole (bounded) log once. A save failure is logged, not fatal: the
-/// boundaries stay in the in-memory log, so the next window's save re-persists them — no re-queue
-/// (which would double-record).
+/// boundaries stay in the in-memory log, so the next window's save re-persists them, with no
+/// re-queue (which would double-record).
 fn maybe_write_checkpoint(
     path: Option<&std::path::Path>,
     log: &mut L1ResumeLog,

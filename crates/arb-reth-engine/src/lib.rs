@@ -1,12 +1,12 @@
-//! `arb-reth-engine`: the Tier-1 engine-tree driver and the payload-type plumbing it needs.
+//! `arb-reth-engine`: the engine-tree driver and the payload-type plumbing it needs.
 //!
-//! Split out of `arb-reth-node`. [`ArbEngineDriver`] stands up reth's `EngineApiTreeHandler` and
-//! mints execute-to-derive blocks by sending `InsertExecutedBlock` + `ForkchoiceUpdated` to the tree
-//! (no re-execution), reading parent state through the ring overlay with an optional parallel state
-//! root. This crate also owns the payload-type stubs ([`ArbPayloadTypes`] and friends) that exist
-//! only to satisfy `NodeTypes::Payload`, and the minimal [`ArbPayloadValidator`] /
-//! `ConfigureEngineEvm` impls the engine-tree generics require — they live here rather than in the
-//! node crate so the driver can depend on them without a dependency cycle.
+//! [`ArbEngineDriver`] stands up reth's `EngineApiTreeHandler` and mints execute-to-derive blocks
+//! by sending `InsertExecutedBlock` + `ForkchoiceUpdated` to the tree (no re-execution), reading
+//! parent state through the ring overlay with an optional parallel state root. This crate also owns
+//! the payload-type stubs ([`ArbPayloadTypes`] and friends) that exist only to satisfy
+//! `NodeTypes::Payload`, and the minimal [`ArbPayloadValidator`] / `ConfigureEngineEvm` impls the
+//! engine-tree generics require. They live here rather than in the node crate so the driver can
+//! depend on them without a dependency cycle.
 
 extern crate alloc;
 

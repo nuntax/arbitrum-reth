@@ -59,7 +59,7 @@ use reth_tasks::Runtime;
 use reth_trie::{IntermediateStateRootState, StateRoot as StateRootComputer, StateRootProgress};
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, PackedKeyAdapter};
 
-// Boot-wiring (#52): write head header + checkpoints so ProviderFactory opens at the block.
+// Boot-wiring: write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
 use alloy_rlp::Decodable;
 use reth_provider::{
@@ -179,7 +179,7 @@ fn run(args: Args) -> eyre::Result<()> {
 
     // Emit a storage-v2 database (reth's default going forward; also the more natural fit for our
     // hashed-only import, since v2 treats the hashed-state tables as canonical). Cache the flag so
-    // every provider — and `write_trie_updates`' `with_adapter!` — uses `PackedKeyAdapter`, and
+    // every provider (and `write_trie_updates`' `with_adapter!`) uses `PackedKeyAdapter`, and
     // persist it to metadata so the node reads v2 on boot (an unset flag defaults to v1).
     factory.set_storage_settings_cache(StorageSettings::v2());
     {
@@ -214,7 +214,7 @@ fn run(args: Args) -> eyre::Result<()> {
     // `set_expected_block_start(head)` moved their header's expected range to start at `head`.
     // reth derives the on-disk filename from the header's expected range (via the index), so the
     // file must be renamed to match or every changeset read fails with a missing-file error. Do it
-    // now, at the filesystem level, after all DB work — the factory is about to be dropped and the
+    // now, at the filesystem level, after all DB work: the factory is about to be dropped and the
     // node re-scans on boot.
     drop(factory);
     rename_changeset_files_to_header(&static_files_path)?;
@@ -378,7 +378,7 @@ fn write_head_blocks(
     // Initialize the per-block static-file segments to the head block. Without this, reth's launch
     // `check_consistency` sees those segments empty (highest block None) while the stage checkpoints
     // say `head_num`, and unwinds to block 0. The head block has no txs/receipts, so the segments
-    // stay empty — only the block range / expected start needs setting. Mirrors reth `init_genesis`'s
+    // stay empty; only the block range / expected start needs setting. Mirrors reth `init_genesis`'s
     // non-zero-genesis v2 path (db-common init.rs): Receipts/Transactions/TransactionSenders use
     // `set_block_range`; the changeset segments use `set_expected_block_start` (their block range is
     // established lazily on the first append, but `next_block_number` must start at `head_num`, else
@@ -393,7 +393,7 @@ fn write_head_blocks(
         .user_header_mut()
         .set_block_range(head_num, head_num);
     // Changeset segments need all three of these to be true, or the DB is broken for stock reth's
-    // v2 unwind/rewind (all invisible to forward sync — hashed state / state root are unaffected):
+    // v2 unwind/rewind (all invisible to forward sync; hashed state / state root are unaffected):
     //   (a) highest_static_file_block == head, or launch `check_consistency` sees highest=None while
     //       the Execution checkpoint says head and unwinds to block 0 (panic).
     //   (b) expected_block_start == the actual data start, or `truncate_changesets` (which keys off
@@ -401,9 +401,9 @@ fn write_head_blocks(
     //       offset map on every unwind.
     //   (c) csoff[0] must map to `head`, or `changeset_offset_index(N) = N - block_range.start` is
     //       shifted (genesis carries no changeset, so a naive first-append lands csoff[0] at head+1).
-    // We satisfy all three by giving genesis an explicit EMPTY changeset entry (matching reth's
+    // We satisfy all three by giving genesis an explicit empty changeset entry (matching reth's
     // init_genesis model): `set_expected_block_start(head)` aligns (b), and appending an empty
-    // changeset for `head` sets block_range=[head,head] with csoff[0]=head — giving highest=head (a)
+    // changeset for `head` sets block_range=[head,head] with csoff[0]=head, giving highest=head (a)
     // and an aligned map (c). The file is then renamed to match its new expected range.
     for seg in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets] {
         let mut w = sfp.get_writer(head_num, seg)?;

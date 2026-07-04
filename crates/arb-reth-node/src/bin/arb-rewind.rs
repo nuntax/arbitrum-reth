@@ -1,18 +1,18 @@
 //! `arb-rewind`: unwind the node's database to an earlier L2 block after a divergence.
 //!
 //! A state-root mismatch is deterministic and monotone-forward: if block `N` is wrong, every
-//! descendant `N+1…tip` was built on the bad state and is wrong too. The parity monitor pins the
+//! descendant `N+1..tip` was built on the bad state and is wrong too. The parity monitor pins the
 //! first divergent block `N`; this tool discards the poisoned suffix by unwinding the DB to keep
 //! `N-1` as the new tip, then truncates the L1-resume log to a boundary at or below `N-1` so a
-//! subsequent `arb-start-sync.sh` resumes derivation from there instead of re-syncing 200M blocks
+//! subsequent sync resumes derivation from there instead of re-syncing 200M blocks
 //! from Nitro genesis.
 //!
-//! It reuses reth's `remove_block_and_execution_above` — the exact storage-v2 unwind the engine
-//! tree runs on a reorg — so blocks, receipts, state, hashed state, trie, history indices, and
+//! It reuses reth's `remove_block_and_execution_above` (the exact storage-v2 unwind the engine
+//! tree runs on a reorg), so blocks, receipts, state, hashed state, trie, history indices, and
 //! stage checkpoints are all rolled back consistently.
 //!
-//! IMPORTANT: this does NOT fix the STF bug that caused the divergence. Re-syncing past `N` with the
-//! same binary will diverge again at `N`. Rewind is for *after* you have a fix (or to re-derive a
+//! Note: this does not fix the STF bug that caused the divergence. Re-syncing past `N` with the
+//! same binary will diverge again at `N`. Rewind is for after you have a fix (or to re-derive a
 //! suspicious range under the parity monitor). Run it only while the node is stopped (MDBX is
 //! single-writer).
 //!
@@ -61,7 +61,7 @@ struct Args {
     datadir: PathBuf,
 
     /// Snapshot head stream (`reth-export --mode blocks`), used to build the chain spec so the DB
-    /// opens — the same file passed to `arb-reth --snapshot-head`.
+    /// opens: the same file passed to `arb-reth --snapshot-head`.
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: PathBuf,
 
@@ -108,16 +108,16 @@ fn main() -> eyre::Result<()> {
         return Err(eyre::eyre!("no database at {} (is --datadir correct?)", db_path.display()));
     }
 
-    // Correct the genesis-import changeset-segment layout BEFORE opening the DB (so no reth code —
-    // `check_consistency` in particular — touches the mis-seeded files first). The snapshot import
+    // Correct the genesis-import changeset-segment layout before opening the DB (so no reth code,
+    // `check_consistency` in particular, touches the mis-seeded files first). The snapshot import
     // seeded the changeset segments with `set_block_range(head, head)`, which left
     // `expected_block_start` at the fixed 500k-slot boundary (22000000) and `block_range.start` at
     // genesis. That breaks stock reth two ways on unwind: `truncate_changesets` keys off
-    // `expected_block_start` (→ corrupts the offset map), and reads are shifted +1 (genesis carries
-    // no changeset, so csoff[0] is really block genesis+1). Realign both to genesis+1 (the first
-    // block that actually has a changeset) and rename the files to match — after which stock reth's
-    // unwind and reads are correct with no reth patch. Idempotent + guarded. See
-    // `arb-snapshot-import.rs`, which now mirrors reth's `init_genesis` for fresh imports.
+    // `expected_block_start` (which corrupts the offset map), and reads are shifted +1 (genesis
+    // carries no changeset, so csoff[0] is really block genesis+1). Realign both to genesis+1 (the
+    // first block that actually has a changeset) and rename the files to match, after which stock
+    // reth's unwind and reads are correct with no reth patch. Idempotent + guarded. See
+    // `arb-snapshot-import.rs`, which mirrors reth's `init_genesis` for fresh imports.
     migrate_changeset_layout(&static_files_path, genesis_num)?;
 
     let db = init_db(&db_path, DatabaseArguments::new(ClientVersion::default()))?;
@@ -134,8 +134,8 @@ fn main() -> eyre::Result<()> {
     factory.set_storage_settings_cache(StorageSettings::v2());
 
     // Heal a crash-torn datadir before unwinding. A `kill -9` during async persistence can leave the
-    // static files AHEAD of MDBX (commit order is static-files → RocksDB → MDBX) with a partially
-    // written trailing entry — reading that entry back during the unwind panics in the codec
+    // static files ahead of MDBX (commit order is static-files, RocksDB, MDBX) with a partially
+    // written trailing entry: reading that entry back during the unwind panics in the codec
     // (`len - 52` underflow). `check_consistency` truncates the partial static-file tail to match
     // MDBX (the same heal the node runs at startup). If it still reports the DB layers can't be
     // reconciled without a full pipeline unwind, bail with guidance rather than corrupt further.
@@ -187,7 +187,7 @@ fn main() -> eyre::Result<()> {
 
     // Diagnostic: the v2 state revert (`remove_state_above`) restores `HashedAccounts` from the
     // account/storage changesets in `(new_tip, current_tip]`. If those read back empty, the revert
-    // is a silent no-op (blocks removed, state left at the old tip) — the failure we hit. Log the
+    // is a silent no-op (blocks removed, state left at the old tip), the failure we hit. Log the
     // counts so a mis-read is obvious.
     {
         use reth_provider::{ChangeSetReader, StaticFileProviderFactory, StorageChangeSetReader};
@@ -225,7 +225,7 @@ fn main() -> eyre::Result<()> {
         );
         if accts.is_empty() {
             return Err(eyre::eyre!(
-                "no account changesets found in ({new_tip}, {current_tip}] — the v2 state revert \
+                "no account changesets found in ({new_tip}, {current_tip}]; the v2 state revert \
                  would be a no-op and leave the DB inconsistent; aborting before any write"
             ));
         }
@@ -246,7 +246,7 @@ fn main() -> eyre::Result<()> {
     if let Some(log) = log.as_mut() {
         log.truncate_to(new_tip);
         if log.checkpoints.is_empty() {
-            // Nothing survives — remove the stale log so the next start doesn't refuse on an
+            // Nothing survives: remove the stale log so the next start doesn't refuse on an
             // all-above-tip log; the operator resumes via --l1-start-block or reset.
             let _ = std::fs::remove_file(&log_path);
         } else {
@@ -258,7 +258,7 @@ fn main() -> eyre::Result<()> {
     info!(target: "arb-rewind", final_tip, "rewind complete");
     if final_tip != new_tip {
         return Err(eyre::eyre!(
-            "post-rewind tip is {final_tip}, expected {new_tip} — unwind did not land where expected"
+            "post-rewind tip is {final_tip}, expected {new_tip}; unwind did not land where expected"
         ));
     }
     println!("rewound {current_tip} -> {new_tip}  (removed {} blocks)", current_tip - new_tip);
@@ -266,7 +266,7 @@ fn main() -> eyre::Result<()> {
 }
 
 /// Realign the changeset static-file segments seeded by the snapshot import so stock reth's v2
-/// unwind and changeset reads are correct — no reth patch required.
+/// unwind and changeset reads are correct, with no reth patch required.
 ///
 /// The import seeded `AccountChangeSets`/`StorageChangeSets` with `set_block_range(head, head)`,
 /// leaving `expected_block_start` at the file's fixed 500k-slot boundary (e.g. 22000000) while the
@@ -276,7 +276,7 @@ fn main() -> eyre::Result<()> {
 /// +1. Both are fixed by moving `expected_block_start` and `block_range.start` to `head+1` (the first
 /// block that actually has a changeset) and renaming the files to match.
 ///
-/// This runs at the pure-filesystem level, BEFORE the DB is opened, so no reth code sees the
+/// This runs at the pure-filesystem level, before the DB is opened, so no reth code sees the
 /// mis-seeded layout. It is idempotent and guarded: it only rewrites a header whose fields match the
 /// recognized mis-seeded shape (`version == 1`, block_range present, `block_range.start == head`),
 /// and it re-renames on a resumed/partial run. The `.conf` is the NippyJar config whose leading bytes
@@ -302,11 +302,11 @@ fn migrate_changeset_layout(static_files: &Path, genesis: u64) -> eyre::Result<(
         let (version, some_tag, exp_start, exp_end, blk_start) =
             (rd(0), conf[24], rd(8), rd(16), rd(25));
 
-        // Only touch the OLD mis-seeded shape (expected_block_start at the fixed 500k slot while the
+        // Only touch the old mis-seeded shape (expected_block_start at the fixed 500k slot while the
         // data starts at genesis). Anything already aligned is left alone: a fresh import from the
         // fixed `arb-snapshot-import` sets expected_block_start == block_start == genesis (genesis
-        // gets an explicit empty changeset entry), and a prior migration set both to genesis+1 —
-        // both have `exp_start == blk_start`, so this is also the idempotency check.
+        // gets an explicit empty changeset entry), and a prior migration set both to genesis+1.
+        // Both have `exp_start == blk_start`, so this is also the idempotency check.
         if version != 1 || some_tag != 1 {
             continue;
         }

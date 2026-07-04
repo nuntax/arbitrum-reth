@@ -1,9 +1,9 @@
-//! `arb-reth-evm` Stage C: block executor + assembler for Arbitrum.
+//! Block executor + assembler for Arbitrum.
 //!
 //! Adapts `arb_revm`'s block-execution machinery (`executor::run::execute_message`,
 //! `executor::hooks::ArbStartBlockDerived`) to reth's alloy-evm
 //! [`BlockExecutor`]/[`BlockExecutorFactory`]/[`BlockAssembler`] trait surface, built on the
-//! Stage B [`ArbEvm`](crate::ArbEvm)/[`ArbEvmFactory`](crate::ArbEvmFactory).
+//! [`ArbEvm`](crate::ArbEvm)/[`ArbEvmFactory`](crate::ArbEvmFactory).
 //!
 //! Mirrors `alloy-op-evm`'s `OpBlockExecutor`/`OpBlockExecutorFactory`. Per-tx ArbOS gas/poster/tip
 //! math lives in `arb_revm::handler`; this layer drives [`ArbEvm`] per tx (routing through

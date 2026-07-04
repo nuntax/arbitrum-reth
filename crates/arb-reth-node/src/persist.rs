@@ -1,4 +1,4 @@
-//! D.2.2: durable "execute-once, persist" primitive for the Arbitrum node.
+//! Durable "execute-once, persist" primitive for the Arbitrum node.
 //!
 //! The persist function takes an already-executed block (header carries the correct `state_root`
 //! baked in by the caller) together with the post-state `BundleState` and writes everything to
@@ -23,8 +23,8 @@ use revm_database::BundleState;
 
 /// Persist an executed Arbitrum block to MDBX.
 ///
-/// **Contract**: `recovered_block.header().state_root` must already reflect the post-state root
-/// of `bundle_state`.  The function computes the root from the trie and asserts the two values
+/// Contract: `recovered_block.header().state_root` must already reflect the post-state root
+/// of `bundle_state`. The function computes the root from the trie and asserts the two values
 /// match; mismatches return an error.
 ///
 /// # Steps
@@ -33,7 +33,7 @@ use revm_database::BundleState;
 ///    the **parent** (current latest committed) state.
 /// 3. Assert `root == block.header().state_root`.
 /// 4. Build [`ExecutedBlock`] wrapping the output and pre-computed [`ComputedTrieData`].
-/// 5. Write to MDBX + static files via `provider_rw.save_blocks(…, SaveBlocksMode::Full)` then
+/// 5. Write to MDBX + static files via `provider_rw.save_blocks(.., SaveBlocksMode::Full)` then
 ///    `provider_rw.commit()`.
 pub fn persist_executed_block<N>(
     factory: &ProviderFactory<N>,
@@ -108,7 +108,7 @@ mod tests {
 
     use crate::ArbNode;
 
-    /// D.2.2: persist a trivial executed block, reopen the factory, and verify
+    /// Persist a trivial executed block, reopen the factory, and verify
     /// the block is durably stored and the post-state account is readable.
     #[test]
     fn persist_block_roundtrip() {

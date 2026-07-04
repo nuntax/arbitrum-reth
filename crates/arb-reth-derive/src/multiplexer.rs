@@ -55,8 +55,8 @@ pub fn extract_messages(
     // [min, max] bounds only at message-emit time (see `make_l2_message`). Seeding from
     // `min_*` instead double-counts the base: the first Advance segment carries the
     // absolute value, so `min + absolute` overshoots `max` and clamps to `max`, giving
-    // every message the wrong (ceiling) L1 block number — which corrupts the ArbOS
-    // Blockhashes state on the very first derived block.
+    // every message the wrong (ceiling) L1 block number, which corrupts the ArbOS
+    // Blockhashes state on the first derived block.
     let mut timestamp = 0u64;
     let mut block = 0u64;
     let mut delayed_read = before_delayed_count;
@@ -167,8 +167,8 @@ mod tests {
         assert_eq!(msgs[0].header.block_number, 100);
         assert_eq!(msgs[0].delayed_messages_read, 7);
         assert!(msgs[0].header.request_id.is_none());
-        // 0 + 150 = 150, in [100, 200]. The pre-fix code seeded from min (100) and would
-        // have produced 100 + 150 = 250 → clamped to the max (200) — the derivation bug.
+        // 0 + 150 = 150, in [100, 200]. Seeding from min (100) instead would
+        // produce 100 + 150 = 250, clamped to the max (200): the derivation bug.
         assert_eq!(msgs[1].header.block_number, 150);
     }
 

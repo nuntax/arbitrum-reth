@@ -1,4 +1,4 @@
-//! D.3: `ArbPooledTransaction` wraps `EthPooledTransaction<ArbTxEnvelope>`.
+//! `ArbPooledTransaction` wraps `EthPooledTransaction<ArbTxEnvelope>`.
 //!
 //! [`NoopTransactionPool`] rejects all txs, but `NodeBuilder` requires a [`PoolTransaction`]
 //! satisfying `EthPoolTransaction<Consensus = ArbTxEnvelope>`. Arbitrum has no separate

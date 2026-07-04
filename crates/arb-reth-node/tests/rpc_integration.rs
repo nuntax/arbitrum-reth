@@ -13,7 +13,7 @@
 
     use arb_reth_node::{ArbLauncher, ArbNode};
 
-    /// D.5: `eth_*` JSON-RPC is live after node launch. Boots `ArbLauncher` with RPC on an
+    /// `eth_*` JSON-RPC is live after node launch. Boots `ArbLauncher` with RPC on an
     /// ephemeral port, feeds two deposits, and verifies `eth_getBlockByNumber` and
     /// `eth_getBalance`.
     #[tokio::test(flavor = "multi_thread")]

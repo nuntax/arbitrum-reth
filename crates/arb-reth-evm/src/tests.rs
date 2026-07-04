@@ -1,4 +1,4 @@
-//! Stage B exit proof: one Arbitrum transaction executes through
+//! One Arbitrum transaction executes through
 //! `ArbEvmFactory::create_evm(...).transact_raw(tx)` and produces a `ResultAndState` consistent
 //! with `arb_revm` running the same tx directly (gas_used matches, balances update).
 

@@ -1,9 +1,9 @@
-//! Stage C exit proof: a block's worth of transactions executes through [`ArbBlockExecutor`]
-//! producing per-tx receipts whose `gas_used`, `status`, `logs`, and `gas_used_for_l1` match
+//! A block's worth of transactions executes through [`ArbBlockExecutor`] producing per-tx receipts
+//! whose `gas_used`, `status`, `logs`, and `gas_used_for_l1` match
 //! `arb_revm::executor::execute_message`, and whose committed account state matches.
 //!
-//! Oracle: `arb_revm::executor::execute_message`. Stage C path:
-//! `ArbBlockExecutorFactory` → `ArbBlockExecutor`.
+//! Oracle: `arb_revm::executor::execute_message`. Executor path:
+//! `ArbBlockExecutorFactory` -> `ArbBlockExecutor`.
 
 use super::*;
 use crate::ArbEvmFactory;
@@ -114,7 +114,7 @@ fn message() -> ArbMessageEnvelope {
 
 /// Poster-gas oracle: drives the same StartBlock prelude + user txs through a directly built
 /// `arb_revm` EVM (the `ArbBuilder` surface) and reads `chain().poster_gas` after each user tx.
-/// Confirms Stage C captures `poster_gas` faithfully.
+/// Confirms the executor captures `poster_gas` faithfully.
 fn oracle_poster_gas_per_tx() -> Vec<u64> {
     use arb_revm::api::default_ctx::ArbContext;
     use arb_revm::{ArbBuilder, ArbChainContext};
@@ -130,7 +130,7 @@ fn oracle_poster_gas_per_tx() -> Vec<u64> {
         .with_tx(ArbTransaction::<TxEnv>::default());
     let mut evm = ctx.build_arb();
 
-    // StartBlock prelude aligns per-tx state with Stage C / execute_message.
+    // StartBlock prelude aligns per-tx state with the executor path / execute_message.
     let bctx = block_ctx();
     let l2_block_number = PARENT_NUMBER + 1;
     let derived = arb_revm::executor::hooks::ArbStartBlockDerived {
@@ -191,7 +191,7 @@ fn evm_env() -> EvmEnv<ArbSpecId> {
     EvmEnv::new(cfg_env, block)
 }
 
-/// Stage C block-execution context derived from the same message.
+/// Block-execution context derived from the same message.
 fn block_ctx() -> ArbBlockExecutionCtx {
     ArbBlockExecutionCtx {
         parent_hash: B256::ZERO,
@@ -210,7 +210,7 @@ fn block_ctx() -> ArbBlockExecutionCtx {
 fn block_executor_matches_execute_message() {
     let (oracle_outcome, oracle_db) = oracle();
 
-    // Stage C: same txs through ArbBlockExecutor over reth's `State<DB>`.
+    // Same txs through ArbBlockExecutor over reth's `State<DB>`.
     let factory = ArbBlockExecutorFactory::new(ArbEvmFactory, CHAIN_ID);
     let mut state = State::builder()
         .with_database(funded_db())
@@ -304,7 +304,7 @@ fn block_executor_matches_execute_message() {
         "block gas_used must equal the sum of per-tx gas"
     );
 
-    // State parity: every account touched by the oracle has the same balance/nonce in Stage C.
+    // State parity: every account touched by the oracle has the same balance/nonce here.
     state.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
     let bundle = state.take_bundle();
     for who in [SENDER_A, SENDER_B, RECIPIENT, POSTER] {

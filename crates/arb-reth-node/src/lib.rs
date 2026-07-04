@@ -1,22 +1,20 @@
-//! arb-reth-node: the Arbitrum node skeleton (Stage D.2).
+//! arb-reth-node: the Arbitrum node skeleton.
 //!
 //! # Why this is not a reth sync `Stage`
 //!
-//! reth's staged pipeline is *download-then-execute*: `HeaderStage`/`BodyStage` download a
+//! reth's staged pipeline is download-then-execute: `HeaderStage`/`BodyStage` download a
 //! trustless header+body, `ExecutionStage` executes the stored body, and `MerkleStage` computes the
-//! state root and **validates it against the stored header's `state_root`**. That model exists to
-//! check a header you *downloaded* from a peer.
+//! state root and validates it against the stored header's `state_root`. That model exists to
+//! check a header you downloaded from a peer.
 //!
-//! An Arbitrum node has no such header. It is **execute-to-derive**: a sequencer message is the
-//! input, and the block (including its state root) is the *output* of executing that message.
+//! An Arbitrum node has no such header. It is execute-to-derive: a sequencer message is the
+//! input, and the block (including its state root) is the output of executing that message.
 //! We mint it. So we follow the path reth uses for locally-produced (payload/engine) blocks:
 //! produce, execute, compute the state root, seal the header, persist the executed block
 //! via the provider's block-writer (`save_blocks` / `ExecutedBlock`).
 //!
-//! # D.2.1: `NodeTypes` + `ProviderFactory` smoke test
-//!
-//! This increment wires `ArbNode : NodeTypes` so that a reth `ProviderFactory` can stand up
-//! over a temp-MDBX database. The four associated types are:
+//! `ArbNode : NodeTypes` lets a reth `ProviderFactory` stand up over an MDBX database. The four
+//! associated types are:
 //!
 //! - `Primitives = ArbPrimitives`: Arbitrum tx/receipt/block types from arb-alloy.
 //! - `ChainSpec  = reth_chainspec::ChainSpec`: reth's stock chain spec (satisfies
@@ -100,8 +98,7 @@ pub type ArbNetworkPrimitives =
 // except the executor (Arbitrum has no tx gossip, p2p, or fork-choice engine).
 // `ArbLauncher` reuses reth's `LaunchContext` for DB/provider/tasks but skips the sync
 // pipeline and consensus-engine orchestrator, spawning `ArbEngineDriver` to drive reth's
-// engine tree directly; AddOns = () (no engine-coupled RpcAddOns). See `launcher.rs` and
-// `docs/stage-d2-handoff.md` §12.
+// engine tree directly; AddOns = () (no engine-coupled RpcAddOns).
 
 use reth_node_builder::components::{
     ComponentsBuilder, NoopConsensusBuilder, NoopNetworkBuilder, NoopPayloadBuilder,

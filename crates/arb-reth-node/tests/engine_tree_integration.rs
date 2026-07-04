@@ -59,7 +59,7 @@ mod tests {
         Arc::new(arb_chain_spec(&init).expect("build ArbOS chain spec"))
     }
 
-    /// GATE (plain state): the tree over a v1/plain-state `init_genesis` base.
+    /// Gate (plain state): the tree over a v1/plain-state `init_genesis` base.
     #[tokio::test(flavor = "multi_thread")]
     async fn engine_tree_tier1_replay() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(testnode_spec());
@@ -67,10 +67,10 @@ mod tests {
         drive_replay(factory, 412346).await;
     }
 
-    /// GATE (hashed-only / storage v2): the MAINNET-shaped base — hashed-state tables are
+    /// Gate (hashed-only / storage v2): the mainnet-shaped base where hashed-state tables are
     /// canonical (no `PlainAccountState`), exactly like the imported Arb One snapshot. The
-    /// plain-state gate above does NOT exercise the hashed read path; this proves the engine
-    /// tree's overlay + deferred-trie task + `state_by_block_hash` all read the HASHED tables
+    /// plain-state gate above does not exercise the hashed read path; this proves the engine
+    /// tree's overlay + deferred-trie task + `state_by_block_hash` all read the hashed tables
     /// correctly under the tree. This is the de-risk for engine-tree adoption on mainnet.
     #[tokio::test(flavor = "multi_thread")]
     async fn engine_tree_tier1_replay_v2_hashed() {
@@ -97,7 +97,7 @@ mod tests {
     }
 
     /// Shared drive body: stand up reth's `EngineApiTreeHandler` over `factory` and produce the
-    /// testnode-replay blocks via `InsertExecutedBlock` + `ForkchoiceUpdated` (NO re-execution),
+    /// testnode-replay blocks via `InsertExecutedBlock` + `ForkchoiceUpdated` (no re-execution),
     /// asserting each canonical block's `state_root` and hash equal the testnode's captured values.
     async fn drive_replay(factory: TestFactory, chain_id: u64) {
         /// How many blocks to drive through the tree.
@@ -223,7 +223,7 @@ mod tests {
                 break;
             }
 
-            // 1. Produce the block against the TREE OVERLAY at the current tip (legacy path:
+            // 1. Produce the block against the tree overlay at the current tip (legacy path:
             //    two independent `state_by_block_hash(parent)` providers).
             let (exec_sp, trie_sp) = match (
                 provider.state_by_block_hash(tip.hash()),
