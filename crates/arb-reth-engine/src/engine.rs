@@ -183,31 +183,47 @@ pub fn produce<'a>(
 
     let mut first = builder.executor().start_block_tx();
     loop {
-        let tx = if let Some(t) = first.take() {
-            t
+        let (tx, is_internal) = if let Some(t) = first.take() {
+            (t, true)
         } else if let Some(t) = redeems.pop_front() {
-            t
+            (t, false)
         } else if let Some(t) = user_txs.pop_front() {
-            t
+            (t, false)
         } else {
             break;
         };
+        let tx_ty = tx.ty();
         let sender: Address = tx
             .sender()
-            .map_err(|e| eyre!("failed to determine sender for tx {}: {e}", tx.ty()))?;
+            .map_err(|e| eyre!("failed to determine sender for tx {tx_ty}: {e}"))?;
         let recovered = Recovered::new_unchecked(tx, sender);
         let mut tx_logs: Vec<Log> = Vec::new();
         let mut tx_success = false;
-        builder
-            .execute_transaction_with_result_closure(recovered, |res| {
-                tx_success = res.result.result.is_success();
-                tx_logs = res.result.result.logs().to_vec();
-            })
-            // In trusted replay every tx is known-valid, so an EVM validation failure here
-            // (NonceTooHigh / lack-of-funds) is definitionally a torn parent-state read: the
-            // overlay `state_by_block_hash(parent)` snapshot raced the engine tree's async
-            // persistence.
-            .wrap_err("execute_transaction failed")?;
+        if let Err(e) = builder.execute_transaction_with_result_closure(recovered, |res| {
+            tx_success = res.result.result.is_success();
+            tx_logs = res.result.result.logs().to_vec();
+        }) {
+            // Nitro `arbos/block_processor.go` (~l.503-549): a derived tx that is INVALID under the
+            // state transition — a validation failure like lack-of-funds / NonceTooHigh, NOT a
+            // revert — is reverted and dropped, and block production continues without it. This is
+            // real on mainnet: an unsigned/contract tx from the delayed inbox whose sender can't
+            // pay yields an internal-only block (first seen at Arb One 35213183). revm rejects such
+            // a tx before applying it, so nothing is added to the block; just skip and move on. Only
+            // the internal start-block tx must always succeed. A wrong-but-not-invalid execution
+            // divergence is still caught by the state-root parity check downstream.
+            if is_internal {
+                return Err(e).wrap_err("internal start-block tx failed");
+            }
+            tracing::warn!(
+                target: "arb-reth::engine",
+                block = parent_header.number + 1,
+                tx_type = tx_ty,
+                %sender,
+                error = %e,
+                "dropping invalid derived transaction (Nitro drop-and-continue)",
+            );
+            continue;
+        }
         if tx_success {
             // FIFO, drained before the next user tx, matching Nitro's cascading-redeem order.
             let retries =
@@ -332,7 +348,8 @@ impl<'a, N: ProviderNodeTypes<Primitives = ArbPrimitives>> StorageRootProvider
         slots: &[B256],
         hashed_storage: HashedStorage,
     ) -> ProviderResult<StorageMultiProof> {
-        self.inner.storage_multiproof(address, slots, hashed_storage)
+        self.inner
+            .storage_multiproof(address, slots, hashed_storage)
     }
 }
 
@@ -768,7 +785,9 @@ where
                 .provider
                 .database_provider_ro()
                 .wrap_err("database_provider_ro failed")?;
-            let persisted_tip = db_ro.best_block_number().wrap_err("best_block_number failed")?;
+            let persisted_tip = db_ro
+                .best_block_number()
+                .wrap_err("best_block_number failed")?;
             let parent_num = self.tip.number;
 
             // Ring blocks strictly above the persisted tip, newest to oldest (MemoryOverlay order).
@@ -815,7 +834,14 @@ where
             } else {
                 trie_sp
             };
-            let built = produce(&self.evm_config, self.chain_id, &self.tip, msg, exec_sp, trie_sp)?;
+            let built = produce(
+                &self.evm_config,
+                self.chain_id,
+                &self.tip,
+                msg,
+                exec_sp,
+                trie_sp,
+            )?;
             // Zero-risk probe: also compute the root in parallel and assert it equals the serial
             // one just produced (serial still drives the chain). No-op unless ARB_SHADOW_STATEROOT
             // is set.
@@ -830,7 +856,14 @@ where
                 .provider
                 .state_by_block_hash(self.tip.hash())
                 .wrap_err("state_by_block_hash (trie) failed")?;
-            produce(&self.evm_config, self.chain_id, &self.tip, msg, exec_sp, trie_sp)
+            produce(
+                &self.evm_config,
+                self.chain_id,
+                &self.tip,
+                msg,
+                exec_sp,
+                trie_sp,
+            )
         }
     }
 
