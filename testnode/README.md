@@ -65,8 +65,8 @@ at the next version and repeat. Each pass is independent and self-contained.
 - Genesis is derived from L1, so a genesis (block 0) mismatch means the Initialize-message parse
   did not reproduce the testnode's genesis, which is a real bug to chase, not a missing flag. An
   explicit `--initial-l1-base-fee` still exists as an override if ever needed.
-- The testnode uses well-known throwaway keys, so nothing here reads or needs the mainnet
-  `arb-env.sh` secrets. Keep it that way: this harness must never source mainnet credentials.
+- The testnode uses well-known throwaway keys, so the harness needs no secrets and does not read
+  the mainnet `arb-env.sh` credentials.
 - The compare step mirrors `arb-parity-monitor.sh`'s monotone-forward bisection: a divergence
   poisons every descendant block, so checking the newest block is enough and the first bad block
   is found by bisection.

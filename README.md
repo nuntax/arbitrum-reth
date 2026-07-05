@@ -2,6 +2,8 @@
 
 An Arbitrum One execution and derivation node built on [reth](https://github.com/paradigmxyz/reth), with a custom Arbitrum revm for the state transition. It derives the L2 chain from L1 (sequencer batches, the delayed inbox, and post-Dencun blobs), executes it with ArbOS semantics, and rebuilds Arbitrum One state from Nitro genesis, checking every block against canonical Nitro.
 
+> **This is an experimental research prototype, not production software.** It is a single-developer, work-in-progress reimplementation of an Arbitrum node. All it does today is replay Arbitrum One history from L1 and check each block against canonical Nitro; it has never run against the live sequencer feed, makes no correctness, stability, or API guarantees, is unaudited, and should not be relied on for anything real or used to secure funds. It has bugs, and parity divergences are still being found and fixed block by block. Expect it to break.
+
 ## Background
 
 The idea came out of latency-sensitive MEV work on Arbitrum. Nitro was too slow at updating state after receiving sequencer feed messages, so I built a heuristic executor on top of revm to run Arbitrum transactions faster. That executor was approximate: it traded correctness for speed and did not have full parity with Arbitrum. It was useful, but it was nowhere near a node.
@@ -36,7 +38,7 @@ Binaries live under `arb-reth-node/src/bin`: `arb-reth` (the node), `arb-rewind`
 
 ## Status
 
-The current goal is a proof-of-concept full sync of Arbitrum One from Nitro genesis (L2 block 22207817), replaying every block and checking the state root against canonical Nitro. It is not meant to run as an archive node; history is pruned as the parity check passes.
+Experimental, and early. The current goal is a proof-of-concept full sync of Arbitrum One from Nitro genesis (L2 block 22207817), replaying every block and checking the state root against canonical Nitro. It is not meant to run as an archive node; history is pruned as the parity check passes. It is not a finished node and is not close to one.
 
 At the time of writing, over two million blocks have replayed clean from genesis. Divergences from Nitro are found and fixed as the sync advances, using a parity tripwire that bisects to the exact block and a per-transaction trace comparison.
 
