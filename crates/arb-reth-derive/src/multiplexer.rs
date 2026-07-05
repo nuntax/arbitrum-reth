@@ -64,13 +64,20 @@ pub fn extract_messages(
 
     for seg in segments {
         match seg.kind {
+            // Nitro `inbox.go` does `timestamp += advancing` / `blockNumber += advancing` on Go
+            // `uint64`, which WRAPS on overflow. This is load-bearing, not a corner case: a batch
+            // encodes a *decrement* as an advance of `u64::MAX` (= -1 mod 2^64) — e.g. Arb One batch
+            // 20797 carries an ADVANCE_L1_BLOCK of 0xffffffffffffffff to step the L1 block back by 1.
+            // `saturating_add` would pin the accumulator at u64::MAX (then clamp to `max_l1_block`),
+            // freezing every later message at the ceiling and corrupting the derived L1 block number
+            // (observed: Arb One 35118067 got 15894390 instead of 15894359). Must be `wrapping_add`.
             segment_kind::ADVANCE_TIMESTAMP => {
                 let d = decode_u64(&seg.data).map_err(|_| MultiplexerError::AdvanceDelta("timestamp"))?;
-                timestamp = timestamp.saturating_add(d);
+                timestamp = timestamp.wrapping_add(d);
             }
             segment_kind::ADVANCE_L1_BLOCK => {
                 let d = decode_u64(&seg.data).map_err(|_| MultiplexerError::AdvanceDelta("l1block"))?;
-                block = block.saturating_add(d);
+                block = block.wrapping_add(d);
             }
             segment_kind::L2_MESSAGE => {
                 out.push(make_l2_message(header, seg.data.clone(), timestamp, block, delayed_read));
@@ -181,6 +188,21 @@ mod tests {
         ];
         let msgs = extract_messages(&h, &segs, 0, &NoDelayed).unwrap();
         assert_eq!(msgs[0].header.timestamp, 2_000);
+    }
+
+    #[test]
+    fn advance_l1_block_of_u64_max_wraps_as_decrement() {
+        // A batch encodes an L1-block decrement as an advance of u64::MAX (-1 mod 2^64), exactly as
+        // seen on Arb One batch 20797. Base 150 (in [100,200]) then +u64::MAX must wrap to 149;
+        // saturating_add would give u64::MAX and clamp to max (200) — the DIV#8 freeze.
+        let h = header();
+        let segs = vec![
+            advance(segment_kind::ADVANCE_L1_BLOCK, 150),
+            advance(segment_kind::ADVANCE_L1_BLOCK, u64::MAX),
+            Segment { kind: segment_kind::L2_MESSAGE, data: b"tx".to_vec() },
+        ];
+        let msgs = extract_messages(&h, &segs, 0, &NoDelayed).unwrap();
+        assert_eq!(msgs[0].header.block_number, 149);
     }
 
     #[test]
