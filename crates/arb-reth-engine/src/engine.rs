@@ -612,11 +612,12 @@ where
     /// asserts it (and its `trie_updates`) equal the serial result. The serial result still drives
     /// the chain; this is a zero-risk correctness and timing probe before flipping parallel on.
     shadow_stateroot: bool,
-    /// Parallel state-root mode (env `ARB_PARALLEL_STATEROOT=1`, ring-overlay only). When on, the
-    /// ring branch of `build_block` wraps the trie provider in [`ParallelRootProvider`] so
-    /// `BlockBuilder::finish` computes the root in parallel (the `shadow_compare` recipe) and
-    /// that root drives the produced block. Requires `state_trie_overlays` to be populated, so
-    /// `maintain_ring` feeds the manager when this or `shadow_stateroot` is on.
+    /// Parallel state-root mode (ring-overlay only). DEFAULT ON; opt out with
+    /// `ARB_PARALLEL_STATEROOT=0` for the deprecated serial path. When on, the ring branch of
+    /// `build_block` wraps the trie provider in [`ParallelRootProvider`] so `BlockBuilder::finish`
+    /// computes the root in parallel (the `shadow_compare` recipe) and that root drives the produced
+    /// block. Requires `state_trie_overlays` to be populated, so `maintain_ring` feeds the manager
+    /// when this or `shadow_stateroot` is on.
     parallel_stateroot: bool,
     /// reth's native "ring" for the parallel/overlay path: resolves the (trie + hashed) overlay for
     /// the unpersisted blocks between the persisted anchor and the parent. Kept in lockstep with
@@ -668,9 +669,26 @@ where
         let shadow_stateroot = std::env::var("ARB_SHADOW_STATEROOT")
             .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
             .unwrap_or(false);
+        // Parallel state-root computation is now the DEFAULT (ring-overlay path); it is bit-exact
+        // with the serial path (gated for a long time behind `ARB_SHADOW_STATEROOT` before driving)
+        // and materially faster. The serial path is DEPRECATED and slated for removal. Opt back into
+        // serial with `ARB_PARALLEL_STATEROOT=0` (also `false`/`off`/`no`).
         let parallel_stateroot = std::env::var("ARB_PARALLEL_STATEROOT")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
-            .unwrap_or(false);
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+
+        // The serial state root only actually runs when parallel is disabled OR the ring overlay is
+        // off (parallel is a ring-overlay-only path). Warn loudly while we phase serial out.
+        if !parallel_stateroot || !tuning.ring_overlay {
+            tracing::warn!(
+                target: "arb-reth::engine",
+                ring_overlay = tuning.ring_overlay,
+                parallel_stateroot,
+                "serial state-root computation is DEPRECATED and will be removed; use the ring \
+                 overlay (--ring-overlay) with parallel state root (the default) — the serial path \
+                 falls behind at scale and is only kept as a temporary escape hatch",
+            );
+        }
 
         // ---- persistence service (real MDBX writer, noop pruner) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
