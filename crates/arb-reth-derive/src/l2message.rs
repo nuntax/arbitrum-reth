@@ -2,6 +2,7 @@
 //! transaction encodings. Mirrors `nitro/arbos/parse_l2.go::parseL2Message`.
 
 use alloy_primitives::{keccak256, B256};
+use arb_revm::brotli;
 
 /// L2 message sub-kinds (`nitro/arbos/parse_l2.go`).
 pub mod l2_kind {

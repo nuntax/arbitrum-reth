@@ -14,8 +14,9 @@ authors.workspace = true
 arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false, features = ["std"] }
 alloy-primitives = "1"
 alloy-rlp = { workspace = true }
-# C brotli from Nitro; `cc_brotli` builds from source for decompression parity.
-brotli = { path = "../../../nitro/crates/brotli", features = ["cc_brotli"] }
+# brotli is re-exported from arb_revm (which vendors it) so both crates share one brotli
+# source and avoid a lockfile collision. BUSL-licensed; see the arb_revm NOTICE.
+arb-revm = { path = "../../../arb_revm/crates/arb-revm" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

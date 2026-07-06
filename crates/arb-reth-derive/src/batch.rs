@@ -8,6 +8,7 @@
 
 use alloy_primitives::B256;
 use alloy_rlp::Header;
+use arb_revm::brotli;
 
 /// Header-flag bytes (`nitro/daprovider/util.go`). The flag is the first byte of
 /// the post-timeBounds payload.

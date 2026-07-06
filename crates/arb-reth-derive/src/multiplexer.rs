@@ -8,6 +8,7 @@
 
 use alloy_primitives::U256;
 use alloy_rlp::Decodable;
+use arb_revm::brotli;
 
 use crate::batch::{segment_kind, BatchHeader, Segment};
 use crate::delayed::DelayedSource;
