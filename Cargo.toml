@@ -9,6 +9,7 @@ resolver = "2"
 authors = ["nun"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/nuntax/arb-reth"
 version = "0.1.0"
 
 [workspace.dependencies]

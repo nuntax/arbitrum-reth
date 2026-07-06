@@ -1,0 +1,21 @@
+NOTICE
+
+The source code in this repository is licensed under MIT OR Apache-2.0
+(see LICENSE-MIT and LICENSE-APACHE).
+
+Third-party components under other terms:
+
+  brotli
+    arb-reth transitively links (via the arb-revm dependency) the `brotli` crate
+    from Offchain Labs' Arbitrum Nitro (https://github.com/OffchainLabs/nitro),
+    used for byte-exact sequencer batch (de)compression so L1 poster-cost
+    pricing matches Arbitrum. It is licensed under the Business Source License
+    1.1 (BUSL-1.1), with a change date of 2030-12-31 and a change license of
+    Apache-2.0. That crate wraps the Brotli C library, which is separately
+    licensed under the MIT license (Copyright the Brotli Authors).
+
+    Because a compiled binary links this component, production use of a built
+    binary is subject to Nitro's BUSL Additional Use Grant, which permits
+    production use to interact with, query, and validate the state of Covered
+    Arbitrum Chains (including Arbitrum One). Full license text:
+    https://github.com/OffchainLabs/nitro/blob/master/LICENSE.md
