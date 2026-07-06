@@ -94,11 +94,17 @@ struct Args {
     #[arg(long = "persistence-backpressure", default_value_t = 16)]
     persistence_backpressure: u64,
 
-    /// EXPERIMENTAL: read parent state for block production from a driver-held ring of just-executed
-    /// blocks overlaid on the immune latest state provider, instead of `state_by_block_hash(parent)`.
-    /// Eliminates the torn-read hazard so deep buffers become parity-safe. A/B against the default.
-    #[arg(long = "ring-overlay", default_value_t = false)]
-    ring_overlay: bool,
+    /// Use the DEPRECATED legacy parent-state read path (`state_by_block_hash(parent)`) instead of
+    /// the ring overlay. The ring overlay is ON by default: it reads parent state from a driver-held
+    /// ring of just-executed blocks over the immune latest provider, eliminating the torn-read hazard
+    /// so deep buffers stay parity-safe. Only pass this to A/B or debug the legacy path.
+    #[arg(long = "no-ring-overlay", default_value_t = false)]
+    no_ring_overlay: bool,
+
+    /// DEPRECATED no-op: the ring overlay is now the default. Accepted for backward compatibility
+    /// (older invocations pass `--ring-overlay`); it has no effect. Use `--no-ring-overlay` to opt out.
+    #[arg(long = "ring-overlay", default_value_t = false, hide = true)]
+    ring_overlay_compat: bool,
 
     /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
     /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
@@ -390,6 +396,12 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
 
     let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
 
+    if args.ring_overlay_compat {
+        tracing::warn!(
+            "--ring-overlay is deprecated and now a no-op: the ring overlay is on by default \
+             (pass --no-ring-overlay to use the deprecated legacy path)"
+        );
+    }
     let launcher = ArbLauncher {
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
         chain_id: effective_chain_id,
@@ -397,7 +409,7 @@ async fn run(ctx: CliContext, args: Args) -> eyre::Result<()> {
             persistence_threshold: args.persistence_threshold,
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
-            ring_overlay: args.ring_overlay,
+            ring_overlay: !args.no_ring_overlay,
         },
         messages: feed_rx,
         rpc_addr,
