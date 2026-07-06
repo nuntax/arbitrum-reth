@@ -58,4 +58,7 @@ Running the node needs an L1 execution RPC (with historical `eth_getLogs`) and, 
 
 ## License
 
-See the workspace license.
+Licensed under either of MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0
+([LICENSE-APACHE](LICENSE-APACHE)) at your option. One transitive dependency,
+`brotli` (from Offchain Labs' Nitro, via `arb_revm`), is BUSL-1.1; see
+[NOTICE](NOTICE) for what that means for running a built binary.
