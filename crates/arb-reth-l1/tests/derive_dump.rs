@@ -1,7 +1,6 @@
 //! Diagnostic: dump the first N sequencer batches after the Nitro genesis, with their
 //! timeBounds (min/max L1 block + timestamp), segment-kind histogram, and the per-message
-//! L1 block / timestamp the multiplexer assigns. Root-causes the block-22207832
-//! NUMBER-opcode divergence (per-message L1 block over-increment vs canonical flat).
+//! L1 block / timestamp the multiplexer assigns. Diagnoses per-message L1 block over-increment vs canonical flat.
 //!
 //! Run: ARB_L1_RPC=<url> cargo test -p arb-reth-l1 --test derive_dump -- --ignored --nocapture
 

@@ -224,7 +224,7 @@ impl ArbEvmConfig {
             // re-exec path, which reads `header.difficulty()`=1). The `DIFFICULTY` opcode returns
             // `block.difficulty` on pre-merge specs (ArbOS<11 → London), so passing `U256::ZERO`
             // here made sync-produced blocks diverge from canonical the first time a tx reads
-            // DIFFICULTY (Arb One block 22217986 tx[1]: +2203 gas + state/log mismatch). Must be 1.
+            // DIFFICULTY. Must be 1.
             U256::from(1u64),
             Some(attributes.prev_randao),
         )

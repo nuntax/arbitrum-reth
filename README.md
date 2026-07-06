@@ -33,14 +33,14 @@ Binaries live under `arb-reth-node/src/bin`: `arb-reth` (the node), `arb-rewind`
 
 - Execution is minted, not re-executed. Produced blocks go into reth's engine tree via `InsertExecutedBlock`, so the tree owns canonicalization and persistence without a second execution pass.
 - Parent state is threaded forward through an in-memory ring overlay anchored on a pinned read transaction, rather than read back through the provider. Reading it back races the tree's asynchronous persistence and can tear; the overlay avoids that and makes deeper in-memory buffering safe.
-- State root computation is optionally parallel (`ARB_PARALLEL_STATEROOT`), over an overlay of the unpersisted chain.
+- State root computation runs in parallel by default, over an overlay of the unpersisted chain.
 
 
 ## Status
 
 Experimental, and early. The current goal is a proof-of-concept full sync of Arbitrum One from Nitro genesis (L2 block 22207817), replaying every block and checking the state root against canonical Nitro. It is not meant to run as an archive node; history is pruned as the parity check passes. It is not a finished node and is not close to one.
 
-At the time of writing, over two million blocks have replayed clean from genesis. Divergences from Nitro are found and fixed as the sync advances, using a parity tripwire that bisects to the exact block and a per-transaction trace comparison.
+Millions of blocks have replayed clean from genesis. Divergences from Nitro are found and fixed as the sync advances, using a parity tripwire that bisects to the exact block and a per-transaction trace comparison.
 
 Execution from the live sequencer feed has not run yet. The node is wired to consume feed messages, and the L1 derivation runtime pushes derived messages through that same path, but the sync is still far from the tip, so the real-time feed-following mode is unexercised so far. Everything to date is historical replay derived from L1.
 

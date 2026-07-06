@@ -84,7 +84,7 @@ reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
-# D.5: eth_* RPC layer (receipt converter + serve_rpc helper) — now in the arb-reth-rpc crate.
+# D.5: eth_* RPC layer (receipt converter + serve_rpc helper), now in the arb-reth-rpc crate.
 arb-reth-rpc = { path = "../arb-reth-rpc" }
 arb-alloy-network = { path = "../../../arb-alloy/crates/network" }
 arb-alloy-rpc-types = { path = "../../../arb-alloy/crates/rpc-types", features = ["reth-compat"] }

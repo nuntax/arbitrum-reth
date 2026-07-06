@@ -187,7 +187,7 @@ fn main() -> eyre::Result<()> {
 
     // Diagnostic: the v2 state revert (`remove_state_above`) restores `HashedAccounts` from the
     // account/storage changesets in `(new_tip, current_tip]`. If those read back empty, the revert
-    // is a silent no-op (blocks removed, state left at the old tip), the failure we hit. Log the
+    // is a silent no-op (blocks removed, state left at the old tip). Log the
     // counts so a mis-read is obvious.
     {
         use reth_provider::{ChangeSetReader, StaticFileProviderFactory, StorageChangeSetReader};

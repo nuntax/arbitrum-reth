@@ -3,9 +3,7 @@
 //!
 //! Batch 0 is the chain's only `SeparateBatchEvent` batch: its payload lives in a
 //! `SequencerBatchData` event (not the posting tx calldata), and on mainnet that payload
-//! is empty. Before the fix, `resolve_batches` errored `UnsupportedDataLocation(1)` and
-//! (had it resolved) `derive_range` would error `Batch(Truncated)` on the empty payload.
-//! After the fix, resolving must succeed with an empty payload and deriving must yield an
+//! is empty. Resolving must succeed with an empty payload and deriving must yield an
 //! empty sequencer message (zero L2 messages), matching Nitro `ParseSequencerMessage`.
 //!
 //! Requires `ARB_L1_RPC` (archive `getLogs`); run with `-- --ignored`.
@@ -29,8 +27,7 @@ async fn batch0_separate_event_derives_empty() {
     let seq = arb_reth_l1::SequencerInboxReader::mainnet(provider.clone());
     let delayed = arb_reth_l1::DelayedInboxReader::mainnet(provider);
 
-    // resolve_batches must handle dataLocation=1 by reading the SequencerBatchData event
-    // (previously errored UnsupportedDataLocation before the separate-event path landed).
+    // resolve_batches must handle dataLocation=1 by reading the SequencerBatchData event.
     let resolved =
         resolve_batches(&seq, None, BATCH0_BLOCK, BATCH0_BLOCK).await.expect("resolve batch 0");
     assert_eq!(resolved.len(), 1, "block 15411056 holds exactly batch 0");

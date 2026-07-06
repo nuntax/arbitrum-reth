@@ -156,8 +156,7 @@ pub fn produce<'a>(
     // them after the remaining user txs, which does not change execution/state/gas (the txs are
     // independent) but reorders the block, diverging `transactionsRoot`/`receiptsRoot` and thus the
     // block hash from Nitro. That wrong hash is invisible to a state-root parity check until a later
-    // L1-advancing block bakes the (wrong) parent hash into ArbOS state via `record_new_l1_block`
-    // (first observed as a state-root divergence at Arb One block 22476703; real cause at 22476646).
+    // L1-advancing block bakes the (wrong) parent hash into ArbOS state via `record_new_l1_block`.
     let mut user_txs: VecDeque<ArbTxEnvelope> = input.message.txs.into_iter().collect();
     let mut redeems: VecDeque<ArbTxEnvelope> = VecDeque::new();
     // Set the block's L2 base fee. ArbOS stores `L2PricingState.BaseFeeWei` = the fee for the next
@@ -167,9 +166,8 @@ pub fn produce<'a>(
     // Our block env was seeded with the parent header's basefee (`config.rs` `next_evm_env`), which
     // is the fee from two blocks back and is only correct while the fee sits at the `minBaseFee`
     // floor. Fixing it makes user txs pay the right L2 fee + L1 poster gas (posterCost / basefee),
-    // and the sealed header (assembler reads `block_env.basefee()`) carry it. First observed at Arb
-    // One 23204013, the first block the gas backlog pushed the fee above the floor: correct header
-    // basefee 100120000 (parent's stored fee) vs our stale 1e8 (parent header), poster gas +537.
+    // and the sealed header (assembler reads `block_env.basefee()`) carry it. Only matters once the
+    // gas backlog pushes the fee off the floor.
     let block_base_fee = ArbosState::open()
         .l2_pricing
         .base_fee_wei
@@ -204,10 +202,10 @@ pub fn produce<'a>(
             tx_logs = res.result.result.logs().to_vec();
         }) {
             // Nitro `arbos/block_processor.go` (~l.503-549): a derived tx that is INVALID under the
-            // state transition — a validation failure like lack-of-funds / NonceTooHigh, NOT a
-            // revert — is reverted and dropped, and block production continues without it. This is
+            // state transition, a validation failure like lack-of-funds / NonceTooHigh, NOT a
+            // revert, is reverted and dropped, and block production continues without it. This is
             // real on mainnet: an unsigned/contract tx from the delayed inbox whose sender can't
-            // pay yields an internal-only block (first seen at Arb One 35213183). revm rejects such
+            // pay yields an internal-only block. revm rejects such
             // a tx before applying it, so nothing is added to the block; just skip and move on. Only
             // the internal start-block tx must always succeed. A wrong-but-not-invalid execution
             // divergence is still caught by the state-root parity check downstream.
@@ -501,22 +499,14 @@ where
 /// `persistence_backpressure_threshold=16`) suit a live validator: persist promptly, hold almost
 /// nothing in memory.
 ///
-/// A deep in-memory buffer silently corrupts the chain here, so do not widen these. Running
-/// production far ahead of persistence (e.g. 128/128/1024) roughly doubled timing-run throughput,
-/// but a mainnet re-validation proved it wrong: `produce()` reads parent state via
-/// `state_by_block_hash(parent)`, which snapshots the tree's in-memory overlay and the DB
-/// non-atomically. Once the persisted DB tip runs ahead of the in-memory anchor (only possible
-/// with a deep buffer), that read races the tree's async persistence thread (commit +
-/// `remove_persisted_blocks` + `remove_before`) and intermittently returns a stale/empty account.
-/// Two symptoms: (a) the stale read trips validation, giving a `NonceTooHigh`/"lack of funds"
-/// crash; (b) worse, the stale read mis-executes without erroring, so a wrong-but-internally-
-/// consistent state root is baked in and the chain diverges from canonical (observed: roots matched
-/// to block 22212000 then mismatched by 22214000, ~170 blocks before any crash). A retry cannot fix
-/// (b): the corruption is permanent once produced. At the shallow default below, the anchor tracks
-/// the DB tip (`LatestStateProvider`, no gap), the racy path is never taken, and the sync produced
-/// 32,624 blocks with 10/10 roots + hashes == canonical. Recovering throughput requires a
-/// state-read path that is not raced by persistence (e.g. thread the just-executed parent post-state
-/// forward in the driver instead of reading it back through the provider), not a bigger buffer.
+/// A deep in-memory buffer is only safe with the ring overlay. The legacy path reads parent state
+/// via `state_by_block_hash(parent)`, which snapshots the tree's in-memory overlay and the DB
+/// non-atomically; once the persisted DB tip runs ahead of the in-memory anchor (only possible with
+/// a deep buffer), that read races async persistence and can return a stale account. That either
+/// trips validation (a `NonceTooHigh`/"lack of funds" crash) or, worse, mis-executes silently and
+/// bakes a wrong-but-consistent state root into the chain (unrecoverable once produced). The ring
+/// overlay reads from the driver-held ring over the immune `LatestStateProvider`, which is not
+/// raced, so deep buffers are safe with it.
 #[derive(Debug, Clone, Copy)]
 pub struct ArbEngineTuning {
     /// Persist once the canonical tip is this many blocks ahead of the last persisted block.
@@ -525,20 +515,18 @@ pub struct ArbEngineTuning {
     pub memory_block_buffer_target: u64,
     /// Hard backpressure: stall block production once this many blocks are unpersisted.
     pub persistence_backpressure_threshold: u64,
-    /// Experimental toggle (`--ring-overlay`): read parent state for `produce()` from a driver-held
-    /// ring of just-executed blocks overlaid on the immune `LatestStateProvider` (MDBX-only, single
-    /// pinned tx), instead of `provider.state_by_block_hash(parent)` (which races async persistence
-    /// at depth). When true, the torn-read hazard is eliminated by construction, so deep buffers
-    /// become safe. Default false = legacy path.
+    /// Read parent state for `produce()` from a driver-held ring of just-executed blocks overlaid
+    /// on the immune `LatestStateProvider` (MDBX-only, single pinned tx), instead of
+    /// `provider.state_by_block_hash(parent)` (which races async persistence at depth). Eliminates
+    /// the torn-read hazard by construction, so deep buffers are safe. On at the CLI by default
+    /// (`--no-ring-overlay` opts out); `reth_defaults()` leaves it `false`.
     pub ring_overlay: bool,
 }
 
 impl Default for ArbEngineTuning {
     fn default() -> Self {
-        // Shallow buffer = the only config proven parity-correct on mainnet (see the type doc):
-        // deep buffers make produce()'s state_by_block_hash(parent) overlay read go stale and
-        // crash with "lack of funds". Matches reth's stock defaults. Do not widen these without
-        // re-running the mainnet parity check (arb-check-progress.sh must show 10/10 == canonical).
+        // reth's stock shallow defaults (prompt persistence, minimal buffer). For bulk-sync
+        // throughput, enable the ring overlay and widen the buffer via the CLI.
         Self::reth_defaults()
     }
 }
@@ -670,7 +658,7 @@ where
             .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
             .unwrap_or(false);
         // Parallel state-root computation is now the DEFAULT (ring-overlay path); it is bit-exact
-        // with the serial path (gated for a long time behind `ARB_SHADOW_STATEROOT` before driving)
+        // with the serial path (shadow-validated bit-exact before driving)
         // and materially faster. The serial path is DEPRECATED and slated for removal. Opt back into
         // serial with `ARB_PARALLEL_STATEROOT=0` (also `false`/`off`/`no`).
         let parallel_stateroot = std::env::var("ARB_PARALLEL_STATEROOT")
@@ -685,7 +673,7 @@ where
                 ring_overlay = tuning.ring_overlay,
                 parallel_stateroot,
                 "serial state-root computation is DEPRECATED and will be removed; use the ring \
-                 overlay (--ring-overlay) with parallel state root (the default) — the serial path \
+                 overlay (--ring-overlay) with parallel state root (the default), the serial path \
                  falls behind at scale and is only kept as a temporary escape hatch",
             );
         }

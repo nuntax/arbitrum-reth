@@ -80,8 +80,6 @@ struct Args {
 
     /// Engine-tree persistence threshold: persist once the canonical tip is this many blocks
     /// ahead of the last persisted block (larger = bigger, less frequent commit batches).
-    /// Deep buffers are not parity-safe: the overlay read in produce() goes stale and
-    /// crashes with "lack of funds". Keep shallow until that read-path bug is fixed.
     #[arg(long, default_value_t = 2)]
     persistence_threshold: u64,
 

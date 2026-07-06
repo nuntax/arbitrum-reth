@@ -311,7 +311,7 @@ mod tests {
     /// Parse the real `SequencerBatchDelivered` log data from Arbitrum One blob batch
     /// seq 1277861 (L1 block 25398052, tx 0x20eae1f4…). This is the same batch used
     /// by `blob_batch_fixture.rs`; the fixture `*_meta.json` was captured from this
-    /// event. Verified 2026-06-26 via `eth_getTransactionReceipt`.
+    /// event.
     ///
     /// Non-indexed log data (224 bytes / 7 × 32 words):
     ///   word0 delayedAcc              36dcb569…
@@ -357,7 +357,7 @@ mod tests {
     }
 
     /// Parse the `SequencerBatchDelivered` log data for the calldata batch
-    /// (seq 497980, L1 block 19000015, dataLocation=0 TxInput). Verified 2026-06-26.
+    /// (seq 497980, L1 block 19000015, dataLocation=0 TxInput).
     #[test]
     fn event_parse_calldata_batch_497980() {
         let hex = concat!(

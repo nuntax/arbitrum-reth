@@ -314,7 +314,7 @@ mod testnode_genesis_parity {
     const TESTNODE_CHAIN_CONFIG: &[u8] =
         include_bytes!("../tests/fixtures/testnode_l2_chain_config.json");
 
-    /// Genesis parity for the 2026-06-27 capture instance used by the per-block replay-parity
+    /// Genesis parity for the capture instance used by the per-block replay-parity
     /// test (`driver::tests::replay_feed_matches_testnode_per_block`). That testnode init read a
     /// live L1 base fee of 167 wei (not 147), giving a different genesis than the live-testnode
     /// fixture below. This test locks the genesis inputs that the per-block fixtures depend on.
