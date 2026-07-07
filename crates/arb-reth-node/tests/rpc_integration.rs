@@ -5,7 +5,7 @@
     use std::net::{Ipv4Addr, SocketAddr};
 
     use alloy_primitives::{address, U256};
-    use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+    use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use jsonrpsee::core::client::ClientT as _;
     use reth_chainspec::MAINNET;
     use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};

@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use alloy_genesis::{ChainConfig, Genesis, GenesisAccount};
 use alloy_primitives::{Address, B256, U256};
 use arb_revm::arbos_init::{arb_genesis_accounts, ArbosInitConfig};
-use arb_sequencer_network::init_message::{ArbChainConfig, ParsedInitMessage};
+use arbitrum_alloy_sequencer::init_message::{ArbChainConfig, ParsedInitMessage};
 use reth_chainspec::ChainSpec;
 
 /// Build a [`ChainSpec`] from an [`ArbosInitConfig`].
@@ -262,7 +262,7 @@ mod tests {
     /// `arbos_init_from_parsed` with a full `ParsedInitMessage`.
     #[test]
     fn arbos_init_from_parsed_works() {
-        use arb_sequencer_network::init_message::{ArbitrumChainParams, ArbChainConfig, ParsedInitMessage};
+        use arbitrum_alloy_sequencer::init_message::{ArbitrumChainParams, ArbChainConfig, ParsedInitMessage};
 
         let chain_config = ArbChainConfig {
             chain_id: 412346,
@@ -289,7 +289,7 @@ mod tests {
     /// Missing chain_config in ParsedInitMessage returns an error.
     #[test]
     fn arbos_init_from_parsed_requires_chain_config() {
-        use arb_sequencer_network::init_message::ParsedInitMessage;
+        use arbitrum_alloy_sequencer::init_message::ParsedInitMessage;
 
         let p = ParsedInitMessage {
             chain_id: U256::from(1u64),

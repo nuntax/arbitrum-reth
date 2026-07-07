@@ -12,7 +12,7 @@ use alloy_eips::eip4844::{BlobTransactionValidationError, env_settings::KzgSetti
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, B256, TxHash, TxKind, U256};
 use alloy_rlp::Encodable;
-use arb_alloy_consensus::ArbTxEnvelope;
+use arbitrum_alloy_consensus::ArbTxEnvelope;
 use reth_evm::RecoveredTx;
 use reth_primitives_traits::{InMemorySize, Recovered};
 use reth_transaction_pool::{

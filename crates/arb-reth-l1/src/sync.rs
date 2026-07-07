@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use alloy_primitives::B256;
 use alloy_provider::Provider;
 use arb_reth_derive::delayed::{DelayedMap, DelayedMessage, NoDelayed};
-use arb_sequencer_network::sequencer::feed::{BatchDataStats, BroadcastFeedMessage};
+use arbitrum_alloy_sequencer::sequencer::feed::{BatchDataStats, BroadcastFeedMessage};
 
 use crate::assemble::KIND_BATCH_POSTING_REPORT;
 use crate::beacon::BeaconClient;

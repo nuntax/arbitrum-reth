@@ -31,10 +31,10 @@ use alloy_evm::{
     },
 };
 use alloy_primitives::{Address, B64, B256, Bytes, Log, U256, logs_bloom};
-use arb_alloy_consensus::header::ArbHeaderInfo;
-use arb_alloy_consensus::receipt::{ArbReceipt, ArbReceiptEnvelope};
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
-use arb_alloy_consensus::transactions::internal::ArbInternalTx;
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
+use arbitrum_alloy_consensus::receipt::{ArbReceipt, ArbReceiptEnvelope};
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::internal::ArbInternalTx;
 use arb_revm::api::default_ctx::ArbContext;
 use arb_revm::constants::{BATCH_POSTER_ADDRESS, HISTORY_STORAGE_ADDRESS};
 use arb_revm::executor::hooks::{
@@ -430,7 +430,7 @@ const _: fn() = || {
 
 /// Block assembler for Arbitrum. Mirrors `OpBlockAssembler`.
 ///
-/// Builds an [`ArbBlock`](arb_alloy_consensus::ArbBlock)-shaped `Block<ArbTxEnvelope>` from
+/// Builds an [`ArbBlock`](arbitrum_alloy_consensus::ArbBlock)-shaped `Block<ArbTxEnvelope>` from
 /// execution output: receipts root, logs bloom, gas used, and the post-execution state root.
 /// Encodes Arbitrum header metadata (`extra_data` / `mix_hash`) from the post-execution
 /// [`ArbBlockHeaderInfo`] stored in the shared ctx cell.

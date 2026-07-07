@@ -12,7 +12,7 @@ authors.workspace = true
 
 [dependencies]
 arb-reth-l1 = { path = "../arb-reth-l1" }
-arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "24cc14df0a312bf81312d144ad786e7de3b8268f", default-features = false, features = ["std"] }
+arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af", default-features = false, features = ["std"] }
 
 alloy-primitives = { version = "1", default-features = false }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }

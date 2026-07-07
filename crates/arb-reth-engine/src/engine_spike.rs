@@ -61,7 +61,7 @@ impl ConfigureEngineEvm<ArbExecutionData> for ArbEvmConfig {
         // this via `builder.execute_transaction`). Empty vec means the iterator never yields; the
         // tuple just gives the opaque return type a nameable concrete type. Never actually called.
         use alloy_consensus::transaction::Recovered;
-        use arb_alloy_consensus::ArbTxEnvelope;
+        use arbitrum_alloy_consensus::ArbTxEnvelope;
         let txs: alloc::vec::Vec<Recovered<ArbTxEnvelope>> = alloc::vec::Vec::new();
         let convert = |tx: Recovered<ArbTxEnvelope>| -> Result<Recovered<ArbTxEnvelope>, core::convert::Infallible> {
             Ok(tx)
@@ -78,7 +78,7 @@ impl ConfigureEngineEvm<ArbExecutionData> for ArbEvmConfig {
 // path and is never called on the InsertExecutedBlock path, so it returns an error.
 // -----------------------------------------------------------------------------------------------
 
-use arb_alloy_consensus::reth::ArbBlock;
+use arbitrum_alloy_consensus::reth::ArbBlock;
 use reth_engine_primitives::PayloadValidator;
 use reth_payload_primitives::NewPayloadError;
 use reth_primitives_traits::SealedBlock;

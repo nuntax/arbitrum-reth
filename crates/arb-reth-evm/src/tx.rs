@@ -10,7 +10,7 @@ use alloy_consensus::transaction::Transaction as AlloyTransaction;
 use alloy_eips::eip2718::{Encodable2718, Typed2718};
 use alloy_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, TransactionEnvMut};
 use alloy_primitives::{Address, Bytes, B256, U256};
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_revm::ArbTransaction;
 use arb_revm::transaction::RetryTxMeta;
 use core::ops::{Deref, DerefMut};

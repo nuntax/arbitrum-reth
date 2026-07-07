@@ -10,9 +10,9 @@
 //! One. Requires `ARB_L1_RPC`; run with `-- --ignored`.
 
 use alloy_primitives::B256;
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_reth_l1::sync::{derive_range, resolve_batches, DEFAULT_DELAYED_WINDOW};
-use arb_sequencer_network::reader::parse_message;
+use arbitrum_alloy_sequencer::reader::parse_message;
 
 const TARGET_BLOCK: u64 = 19_000_015;
 

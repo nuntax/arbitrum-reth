@@ -37,7 +37,7 @@ use arb_reth_l1::sync::{
     DEFAULT_DELAYED_WINDOW,
 };
 use arb_reth_l1::{BeaconClient, DelayedInboxReader, DeliveredBatch, SequencerInboxReader};
-use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::{eyre, Context as _};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;

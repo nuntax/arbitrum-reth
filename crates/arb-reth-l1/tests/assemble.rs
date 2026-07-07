@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use alloy_primitives::{b256, hex, B256};
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_reth_derive::batch::parse_sequencer_batch_delivered;
 use arb_reth_derive::delayed::NoDelayed;
 use arb_reth_derive::message::{DerivedMessage, L1IncomingMessageHeader};
-use arb_sequencer_network::reader::parse_message;
-use arb_sequencer_network::sequencer::feed::BatchDataStats;
+use arbitrum_alloy_sequencer::reader::parse_message;
+use arbitrum_alloy_sequencer::sequencer::feed::BatchDataStats;
 use arb_reth_l1::assemble::{derived_to_feed, KIND_BATCH_POSTING_REPORT};
 use arb_reth_l1::{assemble_feed_messages, extract_calldata_payload, BatchPayload, DeliveredBatch};
 

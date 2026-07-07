@@ -17,7 +17,7 @@ pub struct ArbExecutorBuilder;
 impl<N> ExecutorBuilder<N> for ArbExecutorBuilder
 where
     N: reth_node_builder::FullNodeTypes,
-    N::Types: reth_node_types::NodeTypes<Primitives = arb_alloy_consensus::reth::ArbPrimitives>,
+    N::Types: reth_node_types::NodeTypes<Primitives = arbitrum_alloy_consensus::reth::ArbPrimitives>,
 {
     type EVM = ArbEvmConfig;
 

@@ -9,7 +9,7 @@ use super::*;
 use crate::ArbEvmFactory;
 use alloy_consensus::transaction::Recovered;
 use alloy_evm::{EvmEnv, EvmFactory};
-use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use arb_revm::executor::{
     ArbExecCfg, ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader, execute_message,
 };

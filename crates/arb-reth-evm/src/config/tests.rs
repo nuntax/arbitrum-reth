@@ -11,8 +11,8 @@ use alloy_consensus::transaction::Recovered;
 use alloy_consensus::Header;
 use alloy_evm::block::{BlockExecutor, BlockExecutorFactory, TxResult};
 use alloy_evm::{Evm, EvmFactory};
-use arb_alloy_consensus::header::ArbHeaderInfo;
-use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use arb_revm::ArbSpecId;
 use revm::database::{CacheDB, EmptyDB, State};
 use revm::primitives::{Address, Bytes, TxKind, U256};
@@ -184,7 +184,7 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
 #[test]
 fn block_executes_through_reth_generic_executor() {
     use alloy_consensus::{BlockBody, TxReceipt};
-    use arb_alloy_consensus::reth::ArbBlock;
+    use arbitrum_alloy_consensus::reth::ArbBlock;
     use reth_evm::execute::Executor;
     use reth_evm::ConfigureEvm;
     use reth_primitives_traits::RecoveredBlock;

@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 
 use alloy_primitives::Log;
-use arb_alloy_consensus::{
+use arbitrum_alloy_consensus::{
     ArbReceiptEnvelope,
     reth::{ArbBlock, ArbPrimitives},
 };
@@ -104,7 +104,7 @@ mod tests {
     use revm_database::BundleState;
     use revm_state::AccountInfo;
 
-    use arb_alloy_consensus::reth::ArbBlock;
+    use arbitrum_alloy_consensus::reth::ArbBlock;
 
     use crate::ArbNode;
 

@@ -14,12 +14,12 @@ use std::{fmt::Debug, net::SocketAddr};
 use alloy_consensus::{Receipt, ReceiptWithBloom};
 use alloy_primitives::Log;
 use alloy_rpc_types_eth::Log as RpcLog;
-use arb_alloy_consensus::{
+use arbitrum_alloy_consensus::{
     ArbReceipt, ArbReceiptEnvelope, ArbTxEnvelope,
     reth::ArbPrimitives,
 };
-use arb_alloy_network::Arbitrum;
-use arb_alloy_rpc_types::ArbTransactionReceipt;
+use arbitrum_alloy_network::Arbitrum;
+use arbitrum_alloy_rpc_types::ArbTransactionReceipt;
 use arb_reth_evm::ArbEvmConfig;
 use eyre::WrapErr;
 use reth_chain_state::CanonStateSubscriptions;

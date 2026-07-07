@@ -13,8 +13,8 @@ use core::{future::Future, pin::Pin};
 use std::net::SocketAddr;
 
 use alloy_consensus::Header;
-use arb_alloy_consensus::reth::ArbPrimitives;
-use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+use arbitrum_alloy_consensus::reth::ArbPrimitives;
+use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::eyre;
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
@@ -43,7 +43,7 @@ use reth_transaction_pool::noop::NoopTransactionPool;
 use reth_trie_db::ChangesetCache;
 use tokio::sync::oneshot;
 
-use arb_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
+use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
 
 use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning};
 use arb_reth_rpc::serve_rpc;
@@ -122,7 +122,7 @@ where
     // P = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> (see engine.rs).
     BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>: DatabaseProviderFactory<DB = DB>
         + BlockReader<Block = ArbBlock, Header = Header>
-        + reth_storage_api::TransactionsProvider<Transaction = arb_alloy_consensus::ArbTxEnvelope>
+        + reth_storage_api::TransactionsProvider<Transaction = arbitrum_alloy_consensus::ArbTxEnvelope>
         + reth_storage_api::ReceiptProvider<Receipt = ArbReceiptEnvelope>
         + StateProviderFactory
         + StateReader<Receipt = ArbReceiptEnvelope>
@@ -335,7 +335,7 @@ impl ArbLauncher {
 mod tests {
     use super::*;
     use alloy_primitives::{address, U256};
-    use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+    use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use reth_chainspec::MAINNET;
     use reth_node_builder::{NodeBuilder, NodeConfig, LaunchNode};
     use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};

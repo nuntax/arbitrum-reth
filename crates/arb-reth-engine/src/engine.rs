@@ -17,15 +17,15 @@ use alloy_consensus::Header;
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
-use arb_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
-use arb_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
+use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
+use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
 use arb_revm::ArbosState;
 use arb_revm::executor::{
     ArbExecCfg, ArbParentHeader, digest_message, scheduled_retries_from_redeem_logs,
 };
-use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::{WrapErr as _, eyre};
 
 use reth_chain_state::{
@@ -94,7 +94,7 @@ pub fn produce<'a>(
     trie_state_provider: Box<dyn StateProvider + 'a>,
 ) -> eyre::Result<BuiltPayloadExecutedBlock<ArbPrimitives>> {
     let parent_header = parent.header();
-    let version = arb_alloy_consensus::header::ArbHeaderInfo::decode_header(parent_header)
+    let version = arbitrum_alloy_consensus::header::ArbHeaderInfo::decode_header(parent_header)
         .map(|i| i.arbos_format_version as u8)
         .unwrap_or(0);
 

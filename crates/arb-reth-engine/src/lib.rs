@@ -18,7 +18,7 @@ use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload as AlloyExecutionPa
 use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadAttributes, PayloadTypes};
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedBlock};
 
-use arb_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
+use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 
 pub mod engine;
 pub mod engine_spike;

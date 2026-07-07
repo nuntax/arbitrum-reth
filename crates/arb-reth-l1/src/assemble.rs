@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::B256;
 use arb_reth_derive::delayed::DelayedSource;
-use arb_sequencer_network::sequencer::feed::{BatchDataStats, BroadcastFeedMessage};
+use arbitrum_alloy_sequencer::sequencer::feed::{BatchDataStats, BroadcastFeedMessage};
 
 use arb_reth_derive::message::DerivedMessage;
 

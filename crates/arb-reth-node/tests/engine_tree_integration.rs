@@ -14,8 +14,8 @@ mod tests {
 
     use alloy_consensus::Header;
     use alloy_primitives::{address, B256, U256};
-    use arb_alloy_consensus::reth::ArbPrimitives;
-    use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+    use arbitrum_alloy_consensus::reth::ArbPrimitives;
+    use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 
     use reth_engine_primitives::{
         BeaconEngineMessage, NoopInvalidBlockHook, TreeConfig,

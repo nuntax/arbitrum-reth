@@ -67,7 +67,7 @@ use alloy_consensus::Header;
 use reth_node_types::NodeTypes;
 use reth_storage_api::EthStorage;
 
-use arb_alloy_consensus::{ArbTxEnvelope, reth::ArbPrimitives};
+use arbitrum_alloy_consensus::{ArbTxEnvelope, reth::ArbPrimitives};
 
 /// Arbitrum One mainnet chain id.
 pub const ARB_ONE_CHAIN_ID: u64 = 42161;

@@ -12,7 +12,7 @@
 //! reconstructing those from L1 is a separate step.
 
 use arb_reth_derive::message::DerivedMessage;
-use arb_sequencer_network::sequencer::feed::{
+use arbitrum_alloy_sequencer::sequencer::feed::{
     BatchDataStats, BroadcastFeedMessage, Header, L1IncomingMessage, MessageWithMetadata,
 };
 use base64::prelude::*;

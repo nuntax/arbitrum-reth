@@ -18,4 +18,4 @@ pub mod l2message;
 pub mod message;
 pub mod multiplexer;
 
-use arb_sequencer_network as _;
+use arbitrum_alloy_sequencer as _;

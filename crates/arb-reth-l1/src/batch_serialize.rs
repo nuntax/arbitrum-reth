@@ -16,7 +16,7 @@
 
 use alloy_primitives::{keccak256, B256};
 use arb_reth_derive::batch::flag;
-use arb_sequencer_network::sequencer::feed::BatchDataStats;
+use arbitrum_alloy_sequencer::sequencer::feed::BatchDataStats;
 
 use crate::reader::{BatchPayload, DeliveredBatch};
 

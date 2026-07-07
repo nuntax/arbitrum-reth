@@ -1,5 +1,5 @@
 //! The `DerivedMessage -> BroadcastFeedMessage` adapter must feed the validated
-//! decoder (`arb_sequencer_network::reader::parse_message`, the one `digest_message`
+//! decoder (`arbitrum_alloy_sequencer::reader::parse_message`, the one `digest_message`
 //! uses) exactly the transactions the canonical-verified derive path produces.
 //!
 //! Decodes the real calldata batch (seq 497980, all L2Message kind), runs each
@@ -10,11 +10,11 @@
 use std::fs;
 
 use alloy_primitives::{hex, B256};
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_reth_derive::batch::parse_sequencer_batch_delivered;
 use arb_reth_derive::delayed::NoDelayed;
 use arb_reth_derive::l2message::parse_l2_message;
-use arb_sequencer_network::reader::parse_message;
+use arbitrum_alloy_sequencer::reader::parse_message;
 use arb_reth_l1::{
     decode_batch_messages, derived_to_feed_message, extract_calldata_payload, BatchPayload,
     DeliveredBatch,

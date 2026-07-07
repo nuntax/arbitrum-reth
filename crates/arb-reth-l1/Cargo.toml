@@ -24,13 +24,13 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
 base64 = "0.22"
 # Feed message type, so derived messages can be fed to the validated digest+executor path.
-arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "24cc14df0a312bf81312d144ad786e7de3b8268f", default-features = false, features = ["std"] }
+arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
 # ArbTxEnvelope::tx_hash for the digest-path equivalence test.
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "24cc14df0a312bf81312d144ad786e7de3b8268f", default-features = false, features = ["reth", "std"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af", default-features = false, features = ["reth", "std"] }
 # cu_profile: transport-level RPC method counter (measures the per-method CU mix).
 alloy-rpc-client = { version = "2.1", default-features = false }
 alloy-json-rpc = { version = "2.1", default-features = false }

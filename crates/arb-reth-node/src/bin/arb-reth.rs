@@ -31,10 +31,10 @@ use arb_reth_node::{
     arb_chain_spec, arbos_init_from_chain_config_json, arbos_init_from_parsed, ArbNode,
     ARB_ONE_CHAIN_ID, L1ResumeLog,
 };
-use arb_sequencer_network::init_message::parse_init_message_from_body;
+use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
 use arb_reth_node::launcher::ArbLauncher;
 use reth_provider::BlockNumReader;
-use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use clap::Parser;
 use reth_chainspec::MAINNET;
 use reth_cli_runner::{CliContext, CliRunner};

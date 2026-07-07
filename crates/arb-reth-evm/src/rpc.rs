@@ -8,7 +8,7 @@
 use alloy_evm::{
     rpc::{EthTxEnvError, TryIntoTxEnv},
 };
-use arb_alloy_rpc_types::ArbTransactionRequest;
+use arbitrum_alloy_rpc_types::ArbTransactionRequest;
 use arb_revm::ArbTransaction;
 
 use crate::{ArbNextBlockEnvAttributes, ArbTx};
