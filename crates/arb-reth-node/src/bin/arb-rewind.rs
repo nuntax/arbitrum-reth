@@ -48,7 +48,7 @@ use reth_tracing::{RethTracer, Tracer};
 
 /// Stack-probe shim for x86_64 (same as the other binaries in this crate).
 #[cfg(target_arch = "x86_64")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rust_probestack() {}
 
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;

@@ -72,7 +72,7 @@ use reth_storage_api::HeaderProvider;
 
 /// Stack-probe shim for x86_64 (same as arb-reth.rs).
 #[cfg(target_arch = "x86_64")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rust_probestack() {}
 
 // Storage v2 keys trie nodes with `PackedKeyAdapter` (v1 used `LegacyKeyAdapter`). The state root
