@@ -1,0 +1,19 @@
+{
+  "sequenceNumber": 707,
+  "message": {
+    "message": {
+      "header": {
+        "kind": 12,
+        "sender": "0x502fae7d46d88f08fc2f8ed27fcb2ab183eb3e1f",
+        "blockNumber": 530,
+        "timestamp": 1775559442,
+        "requestId": "0x0000000000000000000000000000000000000000000000000000000000000016",
+        "baseFeeL1": 7
+      },
+      "l2Msg": "Px6ufUbYjwj8L47Sf8sqsYPrLQ4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABilnpchGAAA=="
+    },
+    "delayedMessagesRead": 23
+  },
+  "blockHash": "0x661d745a7b0b89974f1dc34f4d6fa43aa2974652108f4f652b56e8a852ece36c",
+  "signature": null
+}

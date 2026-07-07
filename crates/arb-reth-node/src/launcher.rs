@@ -349,7 +349,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn launcher_boots_and_produces_blocks() {
         let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../arb_revm/testdata/fixtures");
+            .join("tests/fixtures");
         let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
             .expect("read fixture");
         let feed_msg: BroadcastFeedMessage =
