@@ -47,6 +47,10 @@ use reth_tracing::tracing::info;
 use reth_tracing::{RethTracer, Tracer};
 
 /// Stack-probe shim for x86_64 (same as the other binaries in this crate).
+///
+/// # Safety
+///
+/// Defined for the linker only; never called from Rust.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rust_probestack() {}

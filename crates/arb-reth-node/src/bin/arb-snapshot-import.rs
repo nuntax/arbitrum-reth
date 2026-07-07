@@ -71,6 +71,10 @@ use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::HeaderProvider;
 
 /// Stack-probe shim for x86_64 (same as arb-reth.rs).
+///
+/// # Safety
+///
+/// Defined for the linker only; never called from Rust.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rust_probestack() {}

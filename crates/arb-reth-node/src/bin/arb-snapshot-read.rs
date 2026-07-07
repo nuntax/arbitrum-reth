@@ -34,6 +34,10 @@ use reth_db_api::{
 use arb_reth_node::hashed_db::{account_by_address, code_of, storage_at, KECCAK_EMPTY};
 
 /// Stack-probe shim for x86_64 (same as other binaries in this crate).
+///
+/// # Safety
+///
+/// Defined for the linker only; never called from Rust.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __rust_probestack() {}
