@@ -9,12 +9,12 @@ authors.workspace = true
 # extension points. See docs/arb-reth-roadmap.md.
 
 [dependencies]
-arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "d3b2517e4c8a9422004f5ebf6c746c669f5f0c6f" } # sibling workspace, pure revm/ArbOS
+arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "c93e7fc0330884064c73f11341c90e5ba62c530a" } # sibling workspace, pure revm/ArbOS
 revm = { workspace = true }
 
 # Arbitrum consensus primitives (ArbTxEnvelope, ArbReceiptEnvelope, ArbHeaderInfo). reth-trait
 # impls live inside arb-alloy behind the `reth` feature (orphan rule).
-arb-alloy-consensus = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", default-features = false, features = ["reth"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387", default-features = false, features = ["reth"] }
 
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 alloy-evm = { version = "0.37", default-features = false }
@@ -26,9 +26,9 @@ alloy-eips = { version = "2.0", default-features = false }
 alloy-primitives = { version = "1", default-features = false }
 
 # rpc feature: TryIntoTxEnv and BuildPendingEnv impls for Arbitrum RPC types.
-arb-alloy-rpc-types = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", optional = true }
+arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387", optional = true }
 alloy-rpc-types-eth = { version = "2.0", default-features = false, optional = true }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", optional = true }
 
 [features]
-rpc = ["arb-alloy-rpc-types", "alloy-rpc-types-eth", "alloy-evm/rpc", "reth-rpc-eth-api"]
+rpc = ["arbitrum-alloy-rpc-types", "alloy-rpc-types-eth", "alloy-evm/rpc", "reth-rpc-eth-api"]

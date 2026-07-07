@@ -11,12 +11,12 @@ authors.workspace = true
 
 [dependencies]
 # Arbitrum message types from arb-alloy; alloy version unifies with reth's workspace.
-arb-sequencer-network = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", default-features = false, features = ["std"] }
+arbitrum-sequencer-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387", default-features = false, features = ["std"] }
 alloy-primitives = "1"
 alloy-rlp = { workspace = true }
 # brotli is re-exported from arb_revm (which vendors it) so both crates share one brotli
 # source and avoid a lockfile collision. BUSL-licensed; see the arb_revm NOTICE.
-arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "d3b2517e4c8a9422004f5ebf6c746c669f5f0c6f" }
+arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "c93e7fc0330884064c73f11341c90e5ba62c530a" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
