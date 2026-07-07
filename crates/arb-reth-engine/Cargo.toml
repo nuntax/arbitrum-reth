@@ -12,10 +12,10 @@ authors.workspace = true
 # `ArbPayloadValidator` / `ConfigureEngineEvm` impls. Split out of `arb-reth-node`.
 
 [dependencies]
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387", default-features = false, features = ["reth"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "24cc14df0a312bf81312d144ad786e7de3b8268f", default-features = false, features = ["reth"] }
 arb-reth-evm = { path = "../arb-reth-evm" }
-arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "c93e7fc0330884064c73f11341c90e5ba62c530a" }
-arbitrum-sequencer-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387", default-features = false, features = ["std"] }
+arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "2ef7f48145488ad5d5699410b9e6fefb928bf205" }
+arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "24cc14df0a312bf81312d144ad786e7de3b8268f", default-features = false, features = ["std"] }
 
 alloy-consensus = { version = "2.0", default-features = false }
 alloy-eips = { version = "2.0", default-features = false }
