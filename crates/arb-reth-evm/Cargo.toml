@@ -9,7 +9,7 @@ authors.workspace = true
 # extension points. See docs/arb-reth-roadmap.md.
 
 [dependencies]
-arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "fdf482f756806a9dce121133cfcd5c1a58174787" } # sibling workspace, pure revm/ArbOS
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "95a9078789e0bdf37de2c1b686e5556b7f92af22" } # sibling workspace, pure revm/ArbOS
 revm = { workspace = true }
 
 # Arbitrum consensus primitives (ArbTxEnvelope, ArbReceiptEnvelope, ArbHeaderInfo). reth-trait
