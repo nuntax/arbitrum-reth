@@ -100,7 +100,7 @@ fn main() -> eyre::Result<()> {
         let accounts_path = dir.join(&index.accounts_path);
         let acct_iter = readers::accounts(&accounts_path)?.map(move |r| {
             n += 1;
-            if n % 200_000 == 0 {
+            if n.is_multiple_of(200_000) {
                 eprintln!("  …{n} accounts parsed");
             }
             r.expect("account parse error")

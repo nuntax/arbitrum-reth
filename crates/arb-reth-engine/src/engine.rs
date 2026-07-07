@@ -470,11 +470,10 @@ where
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         // committed to DB?
-        if let Ok(best) = provider.best_block_number() {
-            if best >= bn {
+        if let Ok(best) = provider.best_block_number()
+            && best >= bn {
                 return true;
             }
-        }
         // canonical in memory (not yet persisted)?
         let head = canonical.get_canonical_head();
         if head.header().number >= bn && head.hash() == expected_hash {
@@ -640,6 +639,7 @@ where
         + DBProvider,
 {
     /// Stand up the engine tree over `factory`/`provider` and wire the event-drain task.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         factory: ProviderFactory<N>,
         provider: BlockchainProvider<N>,
@@ -959,8 +959,8 @@ where
         self.ring.push_back(exec);
         // Prune everything at/below the persisted (on-disk) tip. Use the RO provider's tip, not
         // `BlockchainProvider::best_block_number` (that's the in-memory canonical tip).
-        if let Ok(db_ro) = self.provider.database_provider_ro() {
-            if let Ok(persisted) = db_ro.best_block_number() {
+        if let Ok(db_ro) = self.provider.database_provider_ro()
+            && let Ok(persisted) = db_ro.best_block_number() {
                 let mut pruned: Vec<B256> = Vec::new();
                 while self
                     .ring
@@ -975,7 +975,6 @@ where
                     self.state_trie_overlays.remove_blocks(pruned);
                 }
             }
-        }
     }
 
     /// Produce, insert, and canonicalize one block from a feed message.
@@ -1095,11 +1094,10 @@ where
         let target = self.tip.number;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if let Ok(best) = self.provider.best_block_number() {
-                if best >= target {
+            if let Ok(best) = self.provider.best_block_number()
+                && best >= target {
                     return;
                 }
-            }
             if std::time::Instant::now() >= deadline {
                 return;
             }

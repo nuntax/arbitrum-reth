@@ -12,9 +12,9 @@ authors.workspace = true
 # arb-reth-derive (Stage F).
 
 [dependencies]
-arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth"] }
+arb-alloy-consensus = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", default-features = false, features = ["reth"] }
 arb-reth-evm = { path = "../arb-reth-evm", features = ["rpc"] }
-arb-revm = { path = "../../../arb_revm/crates/arb-revm" }
+arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "d3b2517e4c8a9422004f5ebf6c746c669f5f0c6f" }
 
 alloy-primitives = { version = "1", default-features = false }
 alloy-consensus = { version = "2.0", default-features = false }
@@ -44,7 +44,7 @@ revm-database = "41.0.0"
 # D.2.3: driver (reth BlockBuilder + revm State<StateProviderDatabase>)
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
-arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network" }
+arb-sequencer-network = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b" }
 
 # Stage F.3c: L1-derivation catch-up runtime (SequencerInbox + delayed inbox -> feed).
 arb-reth-l1 = { path = "../arb-reth-l1" }
@@ -86,8 +86,8 @@ reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b0
 
 # D.5: eth_* RPC layer (receipt converter + serve_rpc helper), now in the arb-reth-rpc crate.
 arb-reth-rpc = { path = "../arb-reth-rpc" }
-arb-alloy-network = { path = "../../../arb-alloy/crates/network" }
-arb-alloy-rpc-types = { path = "../../../arb-alloy/crates/rpc-types", features = ["reth-compat"] }
+arb-alloy-network = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b" }
+arb-alloy-rpc-types = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", features = ["reth-compat"] }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
@@ -114,7 +114,7 @@ reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b0
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["test-utils"] }
 revm-state = "41.0.0"
 tempfile = "3"
-arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth", "k256"] }
+arb-alloy-consensus = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", default-features = false, features = ["reth", "k256"] }
 # Per-block replay-parity test: seed the real ArbOS genesis block into the test factory.
 reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 

@@ -257,7 +257,7 @@ async fn profile_cu_over_consecutive_windows() {
 
     let c = counts.lock().unwrap();
     let mut rows: Vec<(String, u64)> = c.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|(_, n)| core::cmp::Reverse(*n));
     let total_calls: u64 = rows.iter().map(|(_, n)| n).sum();
     let total_cu: u64 = rows.iter().map(|(m, n)| n * cu_weight(m)).sum();
 

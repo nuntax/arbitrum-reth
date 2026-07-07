@@ -234,7 +234,7 @@ mod tests {
         out.extend_from_slice(&U256::from(payload.len()).to_be_bytes::<32>());
         out.extend_from_slice(payload);
         let pad = (32 - payload.len() % 32) % 32;
-        out.extend(std::iter::repeat(0u8).take(pad));
+        out.extend(std::iter::repeat_n(0u8, pad));
         out
     }
 

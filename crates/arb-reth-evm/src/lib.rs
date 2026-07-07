@@ -1,3 +1,5 @@
+// revm's TxEnv/BlockEnv are #[non_exhaustive]; they are built by field assignment.
+#![allow(clippy::field_reassign_with_default)]
 //! `arb-reth-evm`: bridges `arb_revm` (Arbitrum/ArbOS execution on revm) into reth's EVM and
 //! block-execution extension points.
 //!

@@ -3,11 +3,12 @@ members = ["crates/*"]
 resolver = "2"
 
 # arbitrum-reth: Arbitrum/ArbOS execution wired into reth. Execution engine lives in the
-# sibling `arb_revm` workspace (no reth deps); this workspace path-depends on it.
+# separate `arb-revm` repo (no reth deps); this workspace git-depends on it and on arb-alloy.
 
 [workspace.package]
 authors = ["nun"]
 edition = "2024"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nuntax/arb-reth"
 version = "0.1.0"

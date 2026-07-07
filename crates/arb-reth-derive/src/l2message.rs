@@ -40,7 +40,7 @@ pub struct ParsedL2 {
 impl ParsedL2 {
     /// Transaction hashes of the signed txs (`keccak256` of the canonical encoding).
     pub fn tx_hashes(&self) -> Vec<B256> {
-        self.signed_txs.iter().map(|b| keccak256(b)).collect()
+        self.signed_txs.iter().map(keccak256).collect()
     }
 }
 

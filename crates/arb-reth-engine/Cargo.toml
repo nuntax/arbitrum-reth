@@ -12,10 +12,10 @@ authors.workspace = true
 # `ArbPayloadValidator` / `ConfigureEngineEvm` impls. Split out of `arb-reth-node`.
 
 [dependencies]
-arb-alloy-consensus = { path = "../../../arb-alloy/crates/consensus", default-features = false, features = ["reth"] }
+arb-alloy-consensus = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", default-features = false, features = ["reth"] }
 arb-reth-evm = { path = "../arb-reth-evm" }
-arb-revm = { path = "../../../arb_revm/crates/arb-revm" }
-arb-sequencer-network = { path = "../../../arb-alloy/crates/sequencer-network", default-features = false, features = ["std"] }
+arb-revm = { git = "https://github.com/nuntax/arb-revm", rev = "d3b2517e4c8a9422004f5ebf6c746c669f5f0c6f" }
+arb-sequencer-network = { git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", default-features = false, features = ["std"] }
 
 alloy-consensus = { version = "2.0", default-features = false }
 alloy-eips = { version = "2.0", default-features = false }

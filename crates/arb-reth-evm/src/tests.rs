@@ -68,7 +68,7 @@ fn oracle_result() -> (u64, U256, U256) {
         .with_tx(ArbTransaction::<TxEnv>::default());
     let mut evm = ctx.build_arb();
     let out = evm.transact(transfer_tx()).expect("oracle execution");
-    let gas_used = out.result.gas_used();
+    let gas_used = out.result.tx_gas_used();
     let sender = out.state.get(&SENDER).expect("sender in state").info.balance;
     let recipient = out
         .state
@@ -94,7 +94,7 @@ fn arb_evm_factory_transact_matches_arb_revm() {
     assert!(out.result.is_success(), "transfer must succeed: {:?}", out.result);
 
     assert_eq!(
-        out.result.gas_used(),
+        out.result.tx_gas_used(),
         oracle_gas,
         "bridge gas_used must match arb_revm oracle"
     );
@@ -202,8 +202,8 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
         "arbOSVersion() must return 55 + the seeded ArbOS version"
     );
     assert_eq!(
-        bridge.result.gas_used(),
-        oracle.result.gas_used(),
+        bridge.result.tx_gas_used(),
+        oracle.result.tx_gas_used(),
         "node-path gas_used must match the in-EVM oracle"
     );
 }

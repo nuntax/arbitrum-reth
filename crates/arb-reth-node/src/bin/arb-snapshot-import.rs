@@ -500,7 +500,7 @@ where
                 let account = Account { nonce, balance, bytecode_hash };
 
                 // Commit if threshold reached (before this account pushes us over).
-                if storage_units > 0 && storage_units >= COMMIT_THRESHOLD {
+                if storage_units >= COMMIT_THRESHOLD {
                     provider_rw.commit()?;
                     provider_rw = factory.database_provider_rw()?;
                     tracing::info!(
@@ -519,7 +519,7 @@ where
                 total_accounts += 1;
                 storage_units += 1;
 
-                if total_accounts % 100_000 == 0 {
+                if total_accounts.is_multiple_of(100_000) {
                     tracing::info!(total_accounts, total_slots, "writing accounts...");
                 }
             }
@@ -539,7 +539,7 @@ where
                 let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from(code_bytes));
 
                 // Commit if threshold reached.
-                if storage_units > 0 && storage_units >= COMMIT_THRESHOLD {
+                if storage_units >= COMMIT_THRESHOLD {
                     provider_rw.commit()?;
                     provider_rw = factory.database_provider_rw()?;
                     tracing::info!(
@@ -577,7 +577,7 @@ where
                 }
 
                 // Commit if threshold reached.
-                if storage_units > 0 && storage_units >= COMMIT_THRESHOLD {
+                if storage_units >= COMMIT_THRESHOLD {
                     provider_rw.commit()?;
                     provider_rw = factory.database_provider_rw()?;
                     tracing::info!(

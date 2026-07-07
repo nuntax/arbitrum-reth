@@ -300,6 +300,7 @@ pub async fn derive_from_resolved<P: Provider>(
 /// in by the caller so they persist across consecutive windows. This is the CU-efficient path:
 /// each L1 range's delayed logs are fetched once (forward-carried), and a `BatchPostingReport`
 /// naming an already-resolved batch is served from `report_cache` instead of being re-fetched.
+#[allow(clippy::too_many_arguments)]
 pub async fn derive_from_resolved_cached<P: Provider>(
     seq_reader: &SequencerInboxReader<P>,
     delayed_reader: &DelayedInboxReader<P>,

@@ -82,7 +82,7 @@ fn exec_cfg() -> ArbExecCfg {
     ArbExecCfg {
         chain_id: CHAIN_ID,
         spec_id: ArbSpecId::ARBOS_51,
-        block_gas_limit: PARENT_GAS_LIMIT as u64,
+        block_gas_limit: PARENT_GAS_LIMIT,
         disable_priority_fee_check: true,
         disable_balance_check: false,
     }

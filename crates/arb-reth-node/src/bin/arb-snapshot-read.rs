@@ -136,9 +136,9 @@ fn main() -> eyre::Result<()> {
         let mut cursor = tx.cursor_dup_read::<tables::HashedStorages>()?;
 
         // Walk all dup values for this account key.
-        let mut walker = cursor.walk_dup(Some(ak), None)?;
+        let walker = cursor.walk_dup(Some(ak), None)?;
         let mut count = 0usize;
-        while let Some(entry_result) = walker.next() {
+        for entry_result in walker {
             let (_key, entry) = entry_result?;
             if !entry.value.is_zero() {
                 println!("  storage hashed_slot {} value {}", entry.key, entry.value);

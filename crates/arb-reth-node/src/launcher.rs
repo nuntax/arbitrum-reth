@@ -285,7 +285,7 @@ impl ArbLauncher {
                         driver.advance(&msg).await?;
                         bench_work_us += __w.elapsed().as_micros();
                         bench_n += 1;
-                        if bench_n % 1000 == 0 {
+                        if bench_n.is_multiple_of(1000) {
                             let wall_ms = bench_wall.elapsed().as_millis().max(1);
                             tracing::info!(
                                 target: "arb-reth::bench",

@@ -127,6 +127,7 @@ impl ArbEvmConfig {
     }
 
     /// Builds an [`EvmEnv`] from the explicit block fields + ArbOS version.
+    #[allow(clippy::too_many_arguments)]
     fn build_evm_env(
         &self,
         spec: ArbSpecId,
@@ -311,9 +312,9 @@ impl ConfigureEvm for ArbEvmConfig {
         Ok(self.next_evm_env(parent, attributes))
     }
 
-    fn context_for_block<'a>(
+    fn context_for_block(
         &self,
-        block: &'a SealedBlock<ArbBlock>,
+        block: &SealedBlock<ArbBlock>,
     ) -> Result<ArbBlockExecutionCtx, Self::Error> {
         Ok(self.context_for_block(block.header()))
     }

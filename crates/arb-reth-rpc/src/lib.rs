@@ -54,6 +54,9 @@ use reth_tokio_util::EventSender;
 /// by the block executor, so no L1-fee hardfork math is needed here.
 #[derive(Debug, Clone)]
 pub struct ArbReceiptConverter<Provider> {
+    // reth's RPC builder constructs the converter with a provider, but Arbitrum stores
+    // gas_used_for_l1 on the receipt at execution time, so it is never read here.
+    #[allow(dead_code)]
     provider: Provider,
 }
 
