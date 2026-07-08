@@ -117,12 +117,20 @@ impl ArbEvmConfig {
     ///
     /// Priority-fee check is disabled (Arbitrum prices the tip via its own handler); EIP-7623 is
     /// disabled (Arbitrum prices calldata via the poster fee, not the floor); balance check is on.
+    ///
+    /// EIP-3541 (reject deploy code starting with 0xEF) is disabled at ArbOS >= 30 so Stylus
+    /// programs, whose code carries the `0xEF 0xF0 ...` prefix, can be stored as account bytecode
+    /// (Nitro `core/vm/evm.go`: allows the Stylus component prefix, `arbos/params` StylusVersion 30).
+    /// Below ArbOS 30 there is no Stylus and 0xEF code stays banned, matching Nitro. (Nitro rejects
+    /// non-Stylus 0xEF even at >= 30; that stricter case is not reproduced here, but such code does
+    /// not occur in practice, only the Stylus prefix is ever deployed.)
     fn cfg_env(&self, spec: ArbSpecId) -> CfgEnv<ArbSpecId> {
         let mut cfg = CfgEnv::new_with_spec(spec)
             .with_chain_id(self.chain_id)
             .with_disable_priority_fee_check(true);
         cfg.disable_balance_check = false;
         cfg.disable_eip7623 = true;
+        cfg.disable_eip3541 = spec.is_enabled_in(ArbSpecId::ARBOS_30);
         cfg
     }
 
