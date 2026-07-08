@@ -1,22 +1,31 @@
-//! Quick MDBX reader: dump block headers + tx hashes + receipt status.
-use std::path::Path;
+//! `arb-reth dump-blocks`: quick MDBX reader: dump block headers + tx hashes + receipt status.
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy_consensus::TxReceipt;
 use alloy_eips::BlockHashOrNumber;
-use arb_reth_node::ArbNode;
+use crate::ArbNode;
+use clap::Parser;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::providers::{ProviderFactoryBuilder, ReadOnlyConfig};
 use reth_provider::{HeaderProvider, ReceiptProvider, TransactionsProvider};
 
-fn main() -> eyre::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: dump-blocks <datadir> <block_number>...");
-        std::process::exit(1);
-    }
-    let datadir = Path::new(&args[1]);
+/// Dump block headers, tx hashes, and receipt status from a node datadir.
+#[derive(Debug, Parser)]
+#[command(name = "dump-blocks", about = "Dump block headers + tx hashes + receipt status")]
+pub struct DumpBlocksArgs {
+    /// Node datadir to read.
+    #[arg(value_name = "datadir")]
+    datadir: PathBuf,
+
+    /// Block numbers to dump.
+    #[arg(value_name = "block_number", required = true)]
+    block_numbers: Vec<u64>,
+}
+
+pub fn run(args: DumpBlocksArgs) -> eyre::Result<()> {
+    let datadir = args.datadir.as_path();
     let chain_spec: Arc<reth_chainspec::ChainSpec> = reth_chainspec::MAINNET.clone();
     let runtime = reth_tasks::Runtime::test();
 
@@ -27,8 +36,8 @@ fn main() -> eyre::Result<()> {
 
     let provider = factory.provider()?;
 
-    for bn in &args[2..] {
-        let bn: u64 = bn.parse()?;
+    for bn in &args.block_numbers {
+        let bn: u64 = *bn;
         let header = match provider.header_by_number(bn)? {
             Some(h) => h,
             None => { println!("{bn}: NOT FOUND"); continue; }
@@ -43,7 +52,7 @@ fn main() -> eyre::Result<()> {
         println!("  hash:       {hash:?}");
         println!("  state_root: {:?}", sealed.header().state_root);
         println!("  gas_used:   {}", sealed.header().gas_used);
-        
+
         if let Some(ref txs) = txs {
             let rec_count = receipts.as_ref().map(|r| r.len()).unwrap_or(0);
             println!("  tx_count:   {} (receipts: {})", txs.len(), rec_count);

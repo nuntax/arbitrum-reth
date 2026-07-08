@@ -1,11 +1,13 @@
-//! `arb-snapshot-import`: import a Nitro genesis-state stream into reth MDBX.
+//! `arb-reth snapshot import` / `arb-reth snapshot read`.
+//!
+//! ## `import`: import a Nitro genesis-state stream into reth MDBX.
 //!
 //! Reads a line-oriented state export produced by Nitro's state-dumper and writes
 //! the accounts/bytecodes/storage directly into reth's `HashedAccounts`,
 //! `HashedStorages`, and `Bytecodes` tables, then drives reth's state-root trie
 //! computation to verify parity.
 //!
-//! ## Stream format
+//! ### Stream format
 //!
 //! ```text
 //! A <accountHash:64hex> <nonce:dec> <balance:hex> <codeHash:64hex> <storageRoot:64hex>
@@ -18,16 +20,33 @@
 //! - All hashes are 64-hex pre-keccak'ed keys (already the hashed representation).
 //! - balance/value may be odd-length hex; parse with `U256::from_str_radix(tok, 16)`.
 //!
-//! ## Usage
+//! ### Usage
 //!
 //! ```text
-//! arb-snapshot-import \
+//! arb-reth snapshot import \
 //!   --state /tmp/arb1_genesis_state.stream \
 //!   --out   /tmp/arbreth-mdbx \
 //!   --expect 0x7f2bfc4481d02bfcfc606ebb949384ef78d03a0f30a2dc9cccd652eb80926ae1
 //! ```
-
-#![allow(missing_docs)]
+//!
+//! ## `read`: read hashed-state from a converted Arbitrum reth MDBX.
+//!
+//! Opens a read-only MDBX database (same layout as produced by `snapshot import`)
+//! and, given an Ethereum address, prints account information read directly from the
+//! hashed tables (`HashedAccounts`, `HashedStorages`, `Bytecodes`).
+//!
+//! ### Usage
+//!
+//! ```text
+//! arb-reth snapshot read --db /tmp/arbreth-verify --addr 0xf124579b4d0a56cf720d601283f45d6ce4198279
+//! arb-reth snapshot read --db /tmp/arbreth-verify --addr 0x0000000000000000000000000000000000000065
+//! arb-reth snapshot read --db /tmp/arbreth-verify \
+//!     --addr 0xe66092c38c2a56e63009946550407902934376da \
+//!     --slot 0x0000000000000000000000000000000000000000000000000000000000000000
+//! arb-reth snapshot read --db /tmp/arbreth-verify \
+//!     --addr 0xe66092c38c2a56e63009946550407902934376da \
+//!     --list-storage
+//! ```
 
 use std::{
     fs::File,
@@ -35,17 +54,17 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use reth_tracing::{RethTracer, Tracer};
 
-use alloy_primitives::{hex, B256, U256};
+use alloy_primitives::{hex, keccak256, Address, B256, U256};
 use clap::Parser;
 use alloy_genesis::{ChainConfig, Genesis};
 use reth_chainspec::{ChainSpec, MAINNET};
-use reth_db::{init_db, mdbx::DatabaseArguments, ClientVersion};
+use reth_db::{init_db, mdbx::DatabaseArguments, open_db_read_only, ClientVersion};
 use reth_db_api::{
-    cursor::DbCursorRW,
+    cursor::{DbCursorRW, DbDupCursorRO},
+    database::Database as RethDatabase,
     tables,
-    transaction::DbTxMut,
+    transaction::{DbTx, DbTxMut},
 };
 use reth_primitives_traits::{Account, Bytecode, SealedHeader};
 use reth_provider::{
@@ -70,14 +89,7 @@ use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::HeaderProvider;
 
-/// Stack-probe shim for x86_64 (same as arb-reth.rs).
-///
-/// # Safety
-///
-/// Defined for the linker only; never called from Rust.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __rust_probestack() {}
+use crate::hashed_db::{account_by_address, code_of, storage_at, KECCAK_EMPTY as HASHED_KECCAK_EMPTY};
 
 // Storage v2 keys trie nodes with `PackedKeyAdapter` (v1 used `LegacyKeyAdapter`). The state root
 // is adapter-independent (the MPT hash of key→value), so the genesis root still validates; only the
@@ -102,7 +114,7 @@ const TRIE_COMMIT_THRESHOLD: u64 = 25_000;
 const KECCAK_EMPTY: [u8; 32] =
     hex!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
 
-use arb_reth_node::ArbNode;
+use crate::ArbNode;
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 
 /// Import a Nitro genesis state stream into reth MDBX and verify the state root.
@@ -111,7 +123,7 @@ type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
     name = "arb-snapshot-import",
     about = "Import a Nitro genesis state stream into reth MDBX and verify the state root"
 )]
-struct Args {
+pub struct SnapshotImportArgs {
     /// Path to the Nitro genesis state stream file.
     #[arg(long, value_name = "FILE")]
     state: PathBuf,
@@ -132,13 +144,31 @@ struct Args {
     blocks: Option<PathBuf>,
 }
 
-fn main() -> eyre::Result<()> {
-    let _guard = RethTracer::new().init()?;
-    let args = Args::parse();
-    run(args)
+/// Read hashed state from a converted Arbitrum reth MDBX snapshot.
+#[derive(Debug, Parser)]
+#[command(
+    name = "arb-snapshot-read",
+    about = "Read hashed-state from a converted Arbitrum reth MDBX snapshot"
+)]
+pub struct SnapshotReadArgs {
+    /// Path to the datadir (the directory that contains a `db/` sub-directory).
+    #[arg(long, value_name = "DIR")]
+    db: PathBuf,
+
+    /// Ethereum address to look up (hex, with or without 0x prefix).
+    #[arg(long, value_name = "ADDR")]
+    addr: String,
+
+    /// Optional storage slot to query (32-byte hex, with or without 0x prefix).
+    #[arg(long, value_name = "SLOT")]
+    slot: Option<String>,
+
+    /// Enumerate all non-zero storage slots for this address and print their count.
+    #[arg(long)]
+    list_storage: bool,
 }
 
-fn run(args: Args) -> eyre::Result<()> {
+pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     let expect_str = args.expect.trim_start_matches("0x");
     let expected: B256 = B256::from_slice(&hex::decode(expect_str)?);
 
@@ -670,4 +700,92 @@ fn parse_b256(hex_str: &str) -> eyre::Result<B256> {
     }
     let bytes = hex::decode(s)?;
     Ok(B256::from_slice(&bytes))
+}
+
+pub fn read(args: SnapshotReadArgs) -> eyre::Result<()> {
+    // Parse the address.
+    let addr_str = args.addr.trim_start_matches("0x");
+    if addr_str.len() != 40 {
+        return Err(eyre::eyre!("--addr must be 40 hex chars (20 bytes), got {}", args.addr));
+    }
+    let addr_bytes = hex::decode(addr_str)?;
+    let address = Address::from_slice(&addr_bytes);
+
+    // Compute the keccak hash of the address (the hashed-state key).
+    let hashed_key = keccak256(address);
+
+    // Open the MDBX read-only.
+    // arb-snapshot-import stores MDBX in <out>/db.
+    let db_path = args.db.join("db");
+
+    // Pick the actual MDBX directory: prefer <dir>/db, fall back to <dir>.
+    let mdbx_path = if db_path.exists() { db_path } else { args.db.clone() };
+
+    let db = open_db_read_only(
+        mdbx_path.as_path(),
+        DatabaseArguments::new(ClientVersion::default()),
+    )?;
+
+    let tx = db.tx()?;
+
+    let maybe_account = account_by_address(&tx, address);
+
+    let (nonce, balance, code_hash) = match &maybe_account {
+        Some(acct) => {
+            let ch = acct.bytecode_hash.unwrap_or(HASHED_KECCAK_EMPTY);
+            (acct.nonce, acct.balance, ch)
+        }
+        None => (0u64, U256::ZERO, HASHED_KECCAK_EMPTY),
+    };
+
+    let code_len = if code_hash == HASHED_KECCAK_EMPTY {
+        0usize
+    } else {
+        match code_of(&tx, code_hash) {
+            Some(bytecode) => bytecode.0.len(),
+            None => 0,
+        }
+    };
+
+    println!(
+        "addr {} keccak {} nonce {} balance {} codeHash {} codeLen {}",
+        address, hashed_key, nonce, balance, code_hash, code_len,
+    );
+
+    if let Some(slot_str) = &args.slot {
+        let slot_hex = slot_str.trim_start_matches("0x");
+        // Pad to 64 hex chars if shorter.
+        let padded = format!("{:0>64}", slot_hex);
+        if padded.len() != 64 {
+            return Err(eyre::eyre!(
+                "--slot must be at most 32 bytes (64 hex chars), got {}",
+                slot_str
+            ));
+        }
+        let slot_bytes = hex::decode(&padded)?;
+        let slot = B256::from_slice(&slot_bytes);
+
+        let value = storage_at(&tx, address, slot);
+        println!("slot {} value {}", slot, value);
+    }
+
+    if args.list_storage {
+        let ak = keccak256(address);
+        let mut cursor = tx.cursor_dup_read::<tables::HashedStorages>()?;
+
+        // Walk all dup values for this account key.
+        let walker = cursor.walk_dup(Some(ak), None)?;
+        let mut count = 0usize;
+        for entry_result in walker {
+            let (_key, entry) = entry_result?;
+            if !entry.value.is_zero() {
+                println!("  storage hashed_slot {} value {}", entry.key, entry.value);
+                count += 1;
+            }
+        }
+        println!("storage non-zero slot count: {}", count);
+    }
+
+    tx.commit()?;
+    Ok(())
 }

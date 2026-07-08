@@ -27,6 +27,8 @@
 // Some modules (`persist`, `pooled`) reference `alloc::`; keep the crate available.
 extern crate alloc;
 
+pub mod commands;
+
 pub mod genesis;
 pub use genesis::{
     arb_chain_spec, arb_chain_spec_with_header, arbos_init_from_chain_config_json,

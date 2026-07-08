@@ -1,4 +1,4 @@
-//! `arb-rewind`: unwind the node's database to an earlier L2 block after a divergence.
+//! `arb-reth rewind`: unwind the node's database to an earlier L2 block after a divergence.
 //!
 //! A state-root mismatch is deterministic and monotone-forward: if block `N` is wrong, every
 //! descendant `N+1..tip` was built on the bad state and is wrong too. The parity monitor pins the
@@ -20,18 +20,16 @@
 //!
 //! ```text
 //! # keep block N-1 as the new tip (drop the first divergent block N and everything above)
-//! arb-rewind --datadir /tmp/arb1-sync --snapshot-head head-block.stream --diverged-at <N>
+//! arb-reth rewind --datadir /tmp/arb1-sync --snapshot-head head-block.stream --diverged-at <N>
 //!
 //! # equivalently, name the block to KEEP as the new tip
-//! arb-rewind --datadir /tmp/arb1-sync --snapshot-head head-block.stream --to <N-1>
+//! arb-reth rewind --datadir /tmp/arb1-sync --snapshot-head head-block.stream --to <N-1>
 //! ```
-
-#![allow(missing_docs)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arb_reth_node::{read_head_header, ArbNode, L1ResumeLog, ARB_ONE_CHAIN_ID};
+use crate::{read_head_header, ArbNode, L1ResumeLog, ARB_ONE_CHAIN_ID};
 use clap::Parser;
 use reth_chainspec::ChainSpec;
 use reth_db::{init_db, mdbx::DatabaseArguments, ClientVersion};
@@ -44,22 +42,12 @@ use reth_provider::{
 };
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
-use reth_tracing::{RethTracer, Tracer};
-
-/// Stack-probe shim for x86_64 (same as the other binaries in this crate).
-///
-/// # Safety
-///
-/// Defined for the linker only; never called from Rust.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __rust_probestack() {}
 
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 
 #[derive(Debug, Parser)]
 #[command(name = "arb-rewind", about = "Unwind the arb-reth database to an earlier L2 block")]
-struct Args {
+pub struct RewindArgs {
     /// Data directory of the node to rewind (the dir holding `db/`, `static_files/`, `rocksdb/`).
     #[arg(long, value_name = "PATH")]
     datadir: PathBuf,
@@ -86,10 +74,7 @@ struct Args {
     dry_run: bool,
 }
 
-fn main() -> eyre::Result<()> {
-    let _guard = RethTracer::new().init()?;
-    let args = Args::parse();
-
+pub fn run(args: RewindArgs) -> eyre::Result<()> {
     // New tip: `--to` names it directly; `--diverged-at N` keeps N-1. Clap guarantees exactly one.
     let new_tip = match (args.to, args.diverged_at) {
         (Some(to), _) => to,
@@ -103,7 +88,7 @@ fn main() -> eyre::Result<()> {
     // cannot rewind below (the imported genesis block).
     let (genesis_num, genesis_hash, genesis_header) = read_head_header(&args.snapshot_head)?;
     let chain_spec: Arc<ChainSpec> =
-        arb_reth_node::arb_chain_spec_with_header(args.chain_id, genesis_header, genesis_hash);
+        crate::arb_chain_spec_with_header(args.chain_id, genesis_header, genesis_hash);
 
     let db_path = args.datadir.join("db");
     let static_files_path = args.datadir.join("static_files");

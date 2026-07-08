@@ -22,6 +22,7 @@ alloy-eips = { version = "2.0", default-features = false }
 alloy-rpc-types-eth = { version = "2.0", default-features = false }
 alloy-rpc-types-engine = { version = "2.0", default-features = false, features = ["serde"] }
 alloy-genesis = { version = "2", default-features = false }
+alloy-trie = { version = "0.9", default-features = false }
 eyre = "0.6.12"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
@@ -49,6 +50,7 @@ arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", r
 # Stage F.3c: L1-derivation catch-up runtime (SequencerInbox + delayed inbox -> feed).
 arb-reth-l1 = { path = "../arb-reth-l1" }
 arb-reth-sync = { path = "../arb-reth-sync" }
+arb-reth-genesis = { path = "../arb-reth-genesis" }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
 
 # D.3b: NodeBuilder integration (Node<N> + noop components + custom LaunchNode)

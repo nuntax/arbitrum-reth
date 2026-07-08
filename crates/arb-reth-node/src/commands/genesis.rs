@@ -1,22 +1,35 @@
-//! Convert the Nitro classic-state export (the Arbitrum One Nitro-genesis snapshot)
+//! `arb-reth genesis verify` / `arb-reth genesis verify-export`.
+//!
+//! ## `verify`: convert the Nitro classic-state export (the Arbitrum One Nitro-genesis snapshot)
 //! into a reth-readable genesis and verify the resulting block-22207817 state root against the
 //! live chain.
 //!
 //! Usage:
-//!   arb-genesis-import <export-dir> [--arbos-only]
+//!   arb-reth genesis verify <export-dir> [--arbos-only]
 //!
 //! `<export-dir>` holds `index.json`, `accounts.json`, `addresstable.json`, `retryables.json`
 //! (the `state/0x152dd48/` directory from the snapshot tar). With `--arbos-only` the 1.29M classic
 //! accounts are skipped and only the ArbOS state account (0xa4b05…) storage-trie root is checked
 //! against the eth_getProof sub-oracle (a fast loop for the ArbOS init / address-table / retryable
 //! paths). Without it, the full genesis state root is computed and checked.
+//!
+//! ## `verify-export`: read the `reth-export --mode state` stream (A/C/S records) on stdin,
+//! recompute the hashed state-trie root, and assert it equals the expected stateRoot (the
+//! end-to-end proof that the geth-DB → reth conversion preserves state exactly). Also cross-checks
+//! each account's storage root (recomputed from its S records) against the storage root in its A
+//! record.
+//!
+//! Usage:  reth-export --mode state <dir> | arb-reth genesis verify-export <expectedStateRoot>
 
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{address, hex, Address, B256, U256};
+use alloy_trie::{TrieAccount, EMPTY_ROOT_HASH};
 use arb_revm::arbos_init::{build_mainnet_genesis_accounts, ArbosInitConfig};
 use arb_reth_genesis::{readers, verify};
+use clap::Parser;
 
 /// ArbOS state account (Nitro constant 0xa4b05ff…).
 const ARBOS_STATE: Address = address!("0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
@@ -45,13 +58,41 @@ fn arb_one_init() -> ArbosInitConfig {
     }
 }
 
-fn main() -> eyre::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let dir = PathBuf::from(
-        args.next()
-            .unwrap_or_else(|| "genesis-export/state/0x152dd48".to_string()),
-    );
-    let arbos_only = std::env::args().any(|a| a == "--arbos-only");
+/// Convert the Nitro classic-state export into a reth-readable genesis and verify the state root.
+#[derive(Debug, Parser)]
+#[command(
+    name = "arb-genesis-import",
+    about = "Verify the Arbitrum One Nitro-genesis state root from the classic-state export"
+)]
+pub struct GenesisVerifyArgs {
+    /// Export directory holding `index.json`, `accounts.json`, `addresstable.json`, `retryables.json`.
+    #[arg(value_name = "export-dir", default_value = "genesis-export/state/0x152dd48")]
+    export_dir: PathBuf,
+
+    /// Build/verify only the ArbOS state account storage root (skip the 1.29M classic accounts).
+    #[arg(long = "arbos-only")]
+    arbos_only: bool,
+
+    /// Dump exact built leaves for a comma-separated address list (differential debugging).
+    #[arg(long = "dump", value_name = "0xaddr,...")]
+    dump: Option<String>,
+}
+
+/// Read the `reth-export --mode state` stream on stdin and verify the hashed state-trie root.
+#[derive(Debug, Parser)]
+#[command(
+    name = "verify-export",
+    about = "Verify the hashed state-trie root of a reth-export --mode state stream (stdin)"
+)]
+pub struct GenesisVerifyExportArgs {
+    /// Expected state root (hex, with or without 0x prefix). Omit to only print the computed root.
+    #[arg(value_name = "expectedStateRoot")]
+    expected_root: Option<String>,
+}
+
+pub fn verify(args: GenesisVerifyArgs) -> eyre::Result<()> {
+    let dir = args.export_dir;
+    let arbos_only = args.arbos_only;
 
     let index = readers::read_index(&dir.join("index.json"))?;
     println!(
@@ -122,10 +163,7 @@ fn main() -> eyre::Result<()> {
     };
 
     // Optional: dump exact built leaves for `--dump 0xaddr,0xaddr,...` (differential debugging).
-    if let Some(list) = std::env::args()
-        .skip_while(|a| a != "--dump")
-        .nth(1)
-    {
+    if let Some(list) = args.dump {
         use alloy_primitives::keccak256;
         use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
         println!("--- built leaves ({} total accounts) ---", built.len());
@@ -180,5 +218,90 @@ fn main() -> eyre::Result<()> {
         eyre::bail!("genesis state root mismatch (expected {GENESIS_STATE_ROOT})");
     }
     println!("\n✅ Arbitrum One genesis state root MATCH (block 22207817)");
+    Ok(())
+}
+
+fn b256(tok: &str) -> B256 {
+    B256::from_slice(&hex::decode(tok).expect("hex b256"))
+}
+fn u256(tok: &str) -> U256 {
+    U256::from_str_radix(tok, 16).expect("hex u256")
+}
+
+pub fn verify_export(args: GenesisVerifyExportArgs) -> eyre::Result<()> {
+    let expected: Option<B256> = args.expected_root.map(|s| {
+        B256::from_slice(&hex::decode(s.trim_start_matches("0x")).expect("expected root hex"))
+    });
+
+    let stdin = std::io::stdin();
+    let mut accounts: Vec<(B256, TrieAccount)> = Vec::with_capacity(1_300_000);
+
+    // Current account's storage cross-check state.
+    let mut cur_addr_hash = B256::ZERO;
+    let mut cur_storage_root = EMPTY_ROOT_HASH;
+    let mut cur_slots: Vec<(B256, U256)> = Vec::new();
+    let mut storage_checked: u64 = 0;
+
+    let flush_storage = |addr: B256, expect: B256, slots: &mut Vec<(B256, U256)>, checked: &mut u64| {
+        if slots.is_empty() {
+            assert_eq!(expect, EMPTY_ROOT_HASH, "account {addr} has storageRoot but no S records");
+            return;
+        }
+        let got = verify::storage_root_hashed(slots.iter().copied());
+        assert_eq!(got, expect, "storage root mismatch for account {addr}");
+        *checked += 1;
+        slots.clear();
+    };
+
+    let mut n_acc = 0u64;
+    let mut n_code = 0u64;
+    let mut n_slot = 0u64;
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("A") => {
+                // Flush the previous account's storage before starting a new one.
+                flush_storage(cur_addr_hash, cur_storage_root, &mut cur_slots, &mut storage_checked);
+                let addr_hash = b256(it.next().expect("A hash"));
+                let nonce: u64 = it.next().expect("A nonce").parse()?;
+                let balance = u256(it.next().expect("A balance"));
+                let code_hash = b256(it.next().expect("A codeHash"));
+                let storage_root = b256(it.next().expect("A storageRoot"));
+                accounts.push((
+                    addr_hash,
+                    TrieAccount { nonce, balance, storage_root, code_hash },
+                ));
+                cur_addr_hash = addr_hash;
+                cur_storage_root = storage_root;
+                n_acc += 1;
+            }
+            Some("S") => {
+                let slot = b256(it.next().expect("S slot"));
+                let val = u256(it.next().expect("S value"));
+                cur_slots.push((slot, val));
+                n_slot += 1;
+            }
+            Some("C") => n_code += 1,
+            Some("H") | Some("B") | Some("R") | None => {}
+            Some(other) => eyre::bail!("unknown record type {other:?}"),
+        }
+    }
+    flush_storage(cur_addr_hash, cur_storage_root, &mut cur_slots, &mut storage_checked);
+
+    eprintln!(
+        "parsed {n_acc} accounts, {n_code} codes, {n_slot} slots; storage roots checked: {storage_checked}"
+    );
+
+    let root = verify::state_root_hashed(accounts);
+    let mut out = std::io::stdout();
+    writeln!(out, "state root: {root:#x}")?;
+    if let Some(exp) = expected {
+        if root == exp {
+            writeln!(out, "✅ MATCH {exp:#x}")?;
+        } else {
+            eyre::bail!("MISMATCH: got {root:#x}, expected {exp:#x}");
+        }
+    }
     Ok(())
 }

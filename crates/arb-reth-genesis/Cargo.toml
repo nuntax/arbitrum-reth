@@ -17,12 +17,4 @@ eyre = "0.6.12"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
 
-[[bin]]
-name = "arb-genesis-import"
-path = "src/bin/arb_genesis_import.rs"
-
-[[bin]]
-name = "verify-export"
-path = "src/bin/verify_export.rs"
-
 [dev-dependencies]
