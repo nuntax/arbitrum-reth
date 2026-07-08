@@ -32,7 +32,7 @@ use crate::{
 use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
 use crate::launcher::ArbLauncher;
 use reth_provider::BlockNumReader;
-use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
+use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use clap::Parser;
 use reth_chainspec::MAINNET;
 use reth_cli_runner::CliContext;
@@ -127,6 +127,29 @@ pub struct NodeArgs {
     #[arg(long = "replay-feed", value_name = "PATH")]
     replay_feed: Option<PathBuf>,
 
+    /// Live sequencer-feed relay to follow, e.g. `ws://127.0.0.1:9642` (a nitro-testnode) or
+    /// `wss://arb1.arbitrum.io/feed` (Arbitrum One). The node connects, streams each feed frame's
+    /// `BroadcastFeedMessage`s into the block driver in real time, and reconnects on drop. This is
+    /// the low-latency path: it follows the sequencer directly rather than waiting for L1 batches.
+    ///
+    /// The relay is a TIP source, not history: its backlog starts at a recent sequence, so this
+    /// cannot sync a chain from scratch. Reach the tip via `--l1-rpc` derivation (or a snapshot),
+    /// then let the feed ride it. The feed and derivation MAY run together: the driver reconciles by
+    /// message sequence (drop already-applied, buffer feed-ahead, drain as the gap fills), so
+    /// derivation fills the confirmed prefix while the feed rides the tip. The follower requests our
+    /// current tip's sequence on connect. Use `--no-l1-derive` to run the feed as the sole producer
+    /// (e.g. resuming an already-synced datadir). Not handled: a feed vs L1 content disagreement
+    /// (feed publishes a block L1 later contradicts) — L1 is authoritative and the reorg/resequence
+    /// that Nitro does is future work; on an honest sequencer the two never disagree.
+    #[arg(long = "feed-url", value_name = "URL")]
+    feed_url: Option<String>,
+
+    /// Skip the L1-derivation catch-up loop, making `--feed-url` the sole block source. Genesis is
+    /// still bootstrapped from `--l1-rpc` (chain id, spec, initial L1 base fee). Use this to follow a
+    /// chain purely through its sequencer feed: the driver applies each feed message as the next
+    /// block, so derivation must not also produce (both feed the one channel and would double-apply).
+    #[arg(long = "no-l1-derive")]
+    no_l1_derive: bool,
 
     /// L1 execution-layer RPC endpoint. When set, the node runs trustless L1-derivation
     /// catch-up: it reads SequencerInbox batches + the delayed inbox and feeds the
@@ -155,6 +178,14 @@ pub struct NodeArgs {
     /// RPC latency). Higher = faster catch-up until the L1 provider rate-limits. 1 = serial.
     #[arg(long = "l1-prefetch", default_value_t = 6)]
     l1_prefetch: u64,
+
+    /// Max `eth_getLogs` block span per request. Set to your provider's cap when it rejects wide
+    /// ranges (e.g. `--l1-getlogs-range 10` for Alchemy's free tier). Bounds every L1 log scan:
+    /// the batch window, the delayed-message scan, and the startup batch-0 lookup. Omit to keep the
+    /// defaults (1k batch / 10k delayed), which suit an unmetered archive endpoint. Smaller = many
+    /// more requests, so slower catch-up.
+    #[arg(long = "l1-getlogs-range", value_name = "BLOCKS")]
+    l1_getlogs_range: Option<u64>,
 
     /// Delayed cursor before the start block. Optional override: defaults to the snapshot tip
     /// header's nonce (the L2 tip's `delayedMessagesRead`), so it need not be supplied.
@@ -380,6 +411,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let launcher = ArbLauncher {
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
         chain_id: effective_chain_id,
+        genesis_block: rollup.l2_genesis_block,
         tuning: crate::ArbEngineTuning {
             persistence_threshold: args.persistence_threshold,
             memory_block_buffer_target: args.memory_buffer_target,
@@ -444,10 +476,96 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         });
     }
 
+    // Live sequencer-feed follower (--feed-url): a reconnecting websocket source that streams each
+    // feed frame's messages into the same channel the driver drains. Like --replay-feed but from the
+    // network and unbounded in time; the low-latency path that rides the sequencer tip directly.
+    if let Some(feed_url) = args.feed_url.clone() {
+        let tx = feed_tx.clone();
+        // Ask the relay to start at our tip's next message index (block - genesis + 1). The relay is
+        // a bounded tip backlog: if this predates what it holds it just streams its current backlog,
+        // and the driver's sequence guard dedups/buffers regardless, so this is an optimization.
+        let feed_genesis_block = rollup.l2_genesis_block;
+        let feed_start_seq = handle
+            .provider
+            .last_block_number()
+            .unwrap_or(feed_genesis_block)
+            .saturating_sub(feed_genesis_block)
+            + 1;
+        task_executor.spawn_task(async move {
+            use futures_util::StreamExt;
+            use tokio_tungstenite::tungstenite::Message;
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let mut next_seq = feed_start_seq;
+            loop {
+                // Resume from where we last were (advances as messages arrive) via the Arbitrum
+                // start-sequence header on the websocket upgrade.
+                let request = match feed_url.as_str().into_client_request() {
+                    Ok(mut req) => {
+                        if let Ok(val) = next_seq.to_string().parse() {
+                            req.headers_mut().insert("Arbitrum-Requested-Sequence-Number", val);
+                        }
+                        req
+                    }
+                    Err(e) => {
+                        reth_tracing::tracing::error!(target: "arb-reth", url = %feed_url, err = %e, "feed: invalid url; follower stopping");
+                        return;
+                    }
+                };
+                match tokio_tungstenite::connect_async(request).await {
+                    Ok((mut ws, _)) => {
+                        info!(target: "arb-reth", url = %feed_url, from_seq = next_seq, "feed: connected to sequencer feed");
+                        let mut pushed = 0usize;
+                        while let Some(frame) = ws.next().await {
+                            let text = match frame {
+                                Ok(Message::Text(t)) => t.as_str().to_owned(),
+                                Ok(Message::Binary(b)) => match core::str::from_utf8(b.as_ref()) {
+                                    Ok(s) => s.to_owned(),
+                                    Err(_) => continue,
+                                },
+                                Ok(Message::Close(_)) => break,
+                                // ping/pong/frame: nothing to decode.
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    reth_tracing::tracing::warn!(target: "arb-reth", err = %e, "feed: websocket error");
+                                    break;
+                                }
+                            };
+                            // Each frame is a feed `Root` { version, messages: [BroadcastFeedMessage] }.
+                            // Other frames (e.g. confirmed-sequence-number notices) carry no messages
+                            // and are skipped.
+                            match serde_json::from_str::<Root>(&text) {
+                                Ok(root) => {
+                                    for msg in root.messages.into_iter().flatten() {
+                                        next_seq = msg.sequence_number + 1;
+                                        if tx.send(msg).await.is_err() {
+                                            reth_tracing::tracing::warn!(target: "arb-reth", "feed channel closed; stopping feed follower");
+                                            return;
+                                        }
+                                        pushed += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    reth_tracing::tracing::debug!(target: "arb-reth", err = %e, "feed: skipping unparsed frame");
+                                }
+                            }
+                        }
+                        reth_tracing::tracing::warn!(target: "arb-reth", pushed, "feed: disconnected; reconnecting in 2s");
+                    }
+                    Err(e) => {
+                        reth_tracing::tracing::warn!(target: "arb-reth", url = %feed_url, err = %e, "feed: connect failed; retrying in 2s");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
+
     // Trustless L1-derivation catch-up. Runs as a feed producer on the
     // same channel the driver drains, so derived blocks execute through the validated
     // STF path. The held sender keeps the node alive even after a bounded run finishes.
-    if let Some(l1_rpc) = args.l1_rpc {
+    // Skipped under --no-l1-derive so --feed-url is the sole producer (genesis already bootstrapped
+    // from --l1-rpc above; the derivation loop and the feed must not both feed the channel).
+    if let Some(l1_rpc) = args.l1_rpc.filter(|_| !args.no_l1_derive) {
         // The current durable L2 tip (`last_block_number` = the persisted DB head, not the
         // in-memory canonical head). The driver already boots its production tip from this block
         // (via reth's `lookup_head`), so L1 derivation must resume so that its first NEW block is
@@ -519,7 +637,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             );
             let reader = SequencerInboxReader::new(provider, sequencer_inbox);
             let block = reader
-                .delivery_block_of_batch(0, inbox_deploy_block, 1_000)
+                .delivery_block_of_batch(
+                    0,
+                    inbox_deploy_block,
+                    args.l1_getlogs_range.map(|n| n.max(1)).unwrap_or(1_000),
+                )
                 .await
                 .map_err(|e| eyre::eyre!("resolve batch 0 delivery block: {e}"))?
                 .ok_or_else(|| eyre::eyre!("batch 0 not found near the SequencerInbox deploy block"))?;
@@ -536,6 +658,12 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         sync_cfg.l1_beacon = args.l1_beacon;
         sync_cfg.end_block = args.l1_end_block;
         sync_cfg.prefetch_windows = args.l1_prefetch;
+        // Cap every getLogs span to the provider's limit when set (free-tier friendly).
+        if let Some(n) = args.l1_getlogs_range {
+            let n = n.max(1);
+            sync_cfg.batch_window = n;
+            sync_cfg.delayed_window = n;
+        }
         sync_cfg.start_l2_block = start_l2_block;
         sync_cfg.db_tip_l2 = db_tip;
         sync_cfg.checkpoint_path = Some(checkpoint_path);

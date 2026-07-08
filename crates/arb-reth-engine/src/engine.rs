@@ -8,6 +8,7 @@
 //! [`produce`] and [`wait_for_head`] are the single source of truth for the block-production and
 //! head-observation logic; the `engine_spike` test imports them from here.
 
+use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -614,6 +615,17 @@ where
     provider_factory: ProviderFactory<N>,
     changeset_cache: ChangesetCache,
     runtime: Runtime,
+    /// Sequence-reconciliation cursor (arb-reth's `TransactionStreamer` analogue). `next_seq` is the
+    /// next message index to apply; a feed/derived message with `sequence_number` maps to L2 block
+    /// `sequence_number + genesis_block`. Messages below `next_seq` are already-applied duplicates
+    /// (dropped); the one equal to it is applied; ones above it are feed-ahead and buffered in
+    /// `pending` until derivation closes the gap. This lets `--l1-rpc` derivation and `--feed-url`
+    /// both feed the single driver channel without double-applying (Nitro's model, sans byte-compare
+    /// reorg: an honest sequencer's feed and L1 agree, so index dedup suffices).
+    next_seq: u64,
+    /// Feed-ahead reorder buffer: messages with `sequence_number > next_seq`, keyed by sequence.
+    /// Bounded by `MAX_PENDING` to cap memory if the feed runs far ahead of derivation.
+    pending: BTreeMap<u64, BroadcastFeedMessage>,
 }
 
 impl<N> ArbEngineDriver<N>
@@ -646,6 +658,7 @@ where
         evm_config: ArbEvmConfig,
         chain_id: u64,
         genesis_tip: SealedHeader<Header>,
+        genesis_block: u64,
         canonical: CanonicalInMemoryState<ArbPrimitives>,
         runtime: Runtime,
         tuning: ArbEngineTuning,
@@ -757,6 +770,10 @@ where
             }
         });
 
+        // Seed the dedup cursor from the resumed tip: the next message to apply is the one that
+        // produces block tip+1, i.e. message index tip.number - genesis_block + 1.
+        let next_seq = genesis_tip.number.saturating_sub(genesis_block) + 1;
+
         Ok(Self {
             provider,
             evm_config,
@@ -773,6 +790,8 @@ where
             provider_factory: driver_factory,
             changeset_cache: driver_changeset_cache,
             runtime: driver_runtime,
+            next_seq,
+            pending: BTreeMap::new(),
         })
     }
 
@@ -981,7 +1000,40 @@ where
     ///
     /// Waits only for fast in-memory canonicalization (the tree persists to MDBX asynchronously).
     /// Returns the hash of the newly-produced block, which becomes the new tip.
+    /// Reconcile and apply one incoming message (from either the feed or L1 derivation), Nitro
+    /// `TransactionStreamer` style. Drops it if already applied (`sequence_number < next_seq`),
+    /// applies it if it is the next expected message, or buffers it as feed-ahead otherwise; after
+    /// applying, drains any now-contiguous buffered messages. Returns the resulting head hash.
     pub async fn advance(&mut self, msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
+        const MAX_PENDING: usize = 50_000;
+        let seq = msg.sequence_number;
+        if seq < self.next_seq {
+            // Already applied by the other producer (feed/L1 overlap). Idempotent drop.
+            return Ok(self.tip.hash());
+        }
+        if seq > self.next_seq {
+            // Feed-ahead: hold until derivation fills the gap up to this sequence, then it drains.
+            if self.pending.len() < MAX_PENDING {
+                self.pending.insert(seq, msg.clone());
+            }
+            return Ok(self.tip.hash());
+        }
+        // seq == next_seq: this is the next block. Apply it, then drain the buffer forward.
+        let mut hash = self.apply_one(msg).await?;
+        self.next_seq += 1;
+        while let Some(buffered) = self.pending.remove(&self.next_seq) {
+            hash = self.apply_one(&buffered).await?;
+            self.next_seq += 1;
+        }
+        // Discard any stragglers now below the cursor (a feed dup that lost the race to L1).
+        self.pending.retain(|k, _| *k >= self.next_seq);
+        Ok(hash)
+    }
+
+    /// Apply exactly one in-order message: build the next block from `self.tip`, insert it into the
+    /// engine tree, canonicalize, and advance `self.tip`. [`Self::advance`]'s sequence guard ensures
+    /// this is only called for the message that produces `tip + 1`.
+    async fn apply_one(&mut self, msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
         use std::time::Instant;
         let __t0 = Instant::now();
 

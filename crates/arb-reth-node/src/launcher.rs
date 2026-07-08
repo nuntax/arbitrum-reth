@@ -87,6 +87,10 @@ pub struct ArbLauncher {
     pub ctx: LaunchContext,
     /// Arbitrum chain id (42161 = mainnet, 421614 = Sepolia).
     pub chain_id: u64,
+    /// L2 genesis block number (`GenesisBlockNum`): message index 0 is the init/genesis block, so a
+    /// feed message's sequence number maps to L2 block `seq + genesis_block`. Seeds the driver's
+    /// sequence-dedup cursor so feed and L1-derivation messages reconcile without double-applying.
+    pub genesis_block: u64,
     /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
     pub tuning: ArbEngineTuning,
     /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
@@ -174,7 +178,7 @@ impl ArbLauncher {
         NodeTypesWithDBAdapter<N, DB>: NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
         NodeTypesWithDBAdapter<N, DB>: reth_node_api::NodeTypesWithDB<DB = DB>,
     {
-        let Self { ctx, chain_id, tuning, messages, rpc_addr } = self;
+        let Self { ctx, chain_id, genesis_block, tuning, messages, rpc_addr } = self;
 
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
@@ -258,6 +262,7 @@ impl ArbLauncher {
             arb_evm_config.clone(),
             chain_id,
             genesis_tip,
+            genesis_block,
             canonical,
             task_executor.clone(),
             tuning,
@@ -357,9 +362,15 @@ mod tests {
 
         let task_executor = Runtime::test();
 
+        // The driver dedups by sequence number, so the two messages must be sequential (a fresh
+        // genesis DB has genesis_block 0, so the first digested message is index 1).
         let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
-        tx.send(feed_msg.clone()).await.unwrap();
-        tx.send(feed_msg.clone()).await.unwrap();
+        let mut m1 = feed_msg.clone();
+        m1.sequence_number = 1;
+        let mut m2 = feed_msg.clone();
+        m2.sequence_number = 2;
+        tx.send(m1).await.unwrap();
+        tx.send(m2).await.unwrap();
         drop(tx);
 
         let datadir = reth_db::test_utils::tempdir_path();
@@ -387,6 +398,7 @@ mod tests {
         let launcher = ArbLauncher {
             ctx: LaunchContext::new(task_executor.clone(), data_dir),
             chain_id: crate::ARB_ONE_CHAIN_ID,
+            genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             messages: rx,
             rpc_addr: None,

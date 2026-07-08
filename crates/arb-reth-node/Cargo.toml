@@ -80,6 +80,11 @@ tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
 
+# Live sequencer-feed follower (--feed-url): websocket source into the feed channel.
+# ws:// (testnode) needs "connect"; wss:// (mainnet relay) needs the rustls TLS root feature.
+tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
 # D.3b.4: bin/arb-reth (clap CLI, reth runtime/ctrl-c harness, tracing, node-core)
 clap = { version = "4", features = ["derive"] }
 reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }

@@ -30,6 +30,10 @@ ARB_RETH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 L1_RPC="${L1_RPC:-http://127.0.0.1:8545}"
 L2_RPC="${L2_RPC:-http://127.0.0.1:8547}"
+# Testnode Prysm beacon REST endpoint. The batch-poster posts blob batches to the local L1, so
+# derivation needs this to fetch sidecars; it is only consulted for blob batches (harmless on a
+# calldata-only chain). Set L1_BEACON= empty to force the calldata-only path.
+L1_BEACON="${L1_BEACON-http://127.0.0.1:3500}"
 # arb-reth's own RPC. 8545/8547 are taken by the testnode L1/L2, so default elsewhere.
 ARB_HTTP_PORT="${ARB_HTTP_PORT:-8560}"
 ARB_RPC="http://127.0.0.1:$ARB_HTTP_PORT"
@@ -104,10 +108,11 @@ cmd_run() {
   # marks this as a custom deployment, so the deploy-block and L2-genesis anchors default to 0
   # (a fresh chain) with no extra flags. --l1-start-block 0 walks the testnode L1 from genesis.
   log "starting arb-reth (RPC $ARB_RPC, datadir $DATADIR)"
-  "$ARB_RETH_BIN" \
+  "$ARB_RETH_BIN" node \
     --datadir "$DATADIR" \
     --http --http.port "$ARB_HTTP_PORT" \
     --l1-rpc "$L1_RPC" \
+    ${L1_BEACON:+--l1-beacon "$L1_BEACON"} \
     --l1-sequencer-inbox "$SEQUENCER_INBOX" \
     --l1-bridge "$BRIDGE" \
     --l1-start-block 0 \
