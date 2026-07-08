@@ -40,7 +40,9 @@ Binaries live under `arb-reth-node/src/bin`: `arb-reth` (the node), `arb-rewind`
 
 Experimental, and early. The current goal is a proof-of-concept full sync of Arbitrum One from Nitro genesis (L2 block 22207817), replaying every block and checking the state root against canonical Nitro. It is not meant to run as an archive node; history is pruned as the parity check passes. It is not a finished node and is not close to one.
 
-Millions of blocks have replayed clean from genesis. Divergences from Nitro are found and fixed as the sync advances, using a parity tripwire that bisects to the exact block and a per-transaction trace comparison.
+~20M blocks have replayed clean from genesis. Divergences from Nitro are found as the sync advances, and are now extremely rare.
+
+The repo includes a Nitro snapshot converter that turns a Nitro state snapshot into a reth database. Nitro keys state by hash (no preimages), so arb-reth serves execution through a hashed-state access layer rather than reth's plain-state tables. One issue, reth's RPC reads plain state, so state RPC (`eth_getBalance`, `eth_call`) is not functional yet, though block and header queries work.
 
 Execution from the live sequencer feed has not run yet. The node is wired to consume feed messages, and the L1 derivation runtime pushes derived messages through that same path, but the sync is still far from the tip, so the real-time feed-following mode is unexercised so far. Everything to date is historical replay derived from L1.
 
