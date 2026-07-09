@@ -1,0 +1,50 @@
+[package]
+name = "arb-reth-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Tier-1 engine-tree driver: `ArbEngineDriver` stands up reth's `EngineApiTreeHandler` and mints
+# execute-to-derive blocks via `InsertExecutedBlock` + `ForkchoiceUpdated` (no re-execution), with
+# the ring overlay + optional parallel state root. Also owns the payload-type stubs that only exist
+# to satisfy `NodeTypes::Payload` (`ArbPayloadTypes`/`ArbExecutionData`/...) and the minimal
+# `ArbPayloadValidator` / `ConfigureEngineEvm` impls. Split out of `arb-reth-node`.
+
+[dependencies]
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af", default-features = false, features = ["reth"] }
+arb-reth-evm = { path = "../arb-reth-evm" }
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "9fa2ddde2e9f4eca6778d45841a31e8d4cc12804" }
+arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af", default-features = false, features = ["std"] }
+
+alloy-consensus = { version = "2.0", default-features = false }
+alloy-eips = { version = "2.0", default-features = false }
+alloy-primitives = { version = "1", default-features = false }
+alloy-rpc-types-engine = { version = "2.0", default-features = false, features = ["serde"] }
+eyre = "0.6.12"
+serde = { version = "1", default-features = false, features = ["derive"] }
+tracing = "0.1"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+revm = { workspace = true }
+revm-database = "41.0.0"
+
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-engine-tree = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-exex-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-primitives-traits = { version = "0.5.0", default-features = false }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-prune = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-stages-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", features = ["db-api"] }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
