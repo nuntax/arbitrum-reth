@@ -666,6 +666,10 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         }
         sync_cfg.start_l2_block = start_l2_block;
         sync_cfg.db_tip_l2 = db_tip;
+        // Messages are numbered by message index (block - genesis_block) for the driver's
+        // sequence-reconciliation; without this a non-zero genesis (Arbitrum One) mis-numbers every
+        // derived block and the driver applies none.
+        sync_cfg.genesis_block = l2_genesis_block;
         sync_cfg.checkpoint_path = Some(checkpoint_path);
 
         // Read the durable L2 tip on demand so checkpoint writes only advance past blocks that are

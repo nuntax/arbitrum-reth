@@ -71,6 +71,11 @@ pub struct L1SyncConfig {
     /// so they are dropped rather than re-sent to the driver (which would produce them again). The
     /// first message sent is always block `db_tip_l2 + 1`.
     pub db_tip_l2: u64,
+    /// The L2 block number of Nitro genesis (Arbitrum One: 22207817; a fresh chain: 0). Feed/derived
+    /// messages are numbered by *message index* (`block - genesis_block`), which is what the driver's
+    /// sequence-reconciliation expects. Absolute block numbers only equal the index when this is 0
+    /// (the testnode), so it MUST be set for a chain whose genesis is not block 0.
+    pub genesis_block: u64,
     /// Where to persist the [`L1ResumeCheckpoint`] as sync advances (`None` disables checkpointing).
     pub checkpoint_path: Option<PathBuf>,
     /// L1 blocks per `derive_range` call (bounds `getLogs` range per request).
@@ -101,6 +106,7 @@ impl L1SyncConfig {
             start_delayed_count,
             start_l2_block: 0,
             db_tip_l2: 0,
+            genesis_block: 0,
             checkpoint_path: None,
             batch_window: 1_000,
             delayed_window: DEFAULT_DELAYED_WINDOW,
@@ -149,6 +155,7 @@ where
     // message produces; blocks `<= db_tip_l2` are already persisted and get dropped.
     let mut next_l2 = cfg.start_l2_block + 1;
     let db_tip_l2 = cfg.db_tip_l2;
+    let genesis_block = cfg.genesis_block;
     // Window boundaries awaiting durability before they can be appended to the resume log.
     // Ascending in both `l1_block` and `l2_block`; drained front-to-back as `persisted_tip` rises.
     let mut pending_ckpt: VecDeque<L1ResumeCheckpoint> = VecDeque::new();
@@ -229,9 +236,15 @@ where
             );
         }
 
-        // Number each derived message with its absolute L2 block, then either send it or, when it
-        // reproduces a block already on disk (a resume that started before the DB tip), drop it.
-        // The `next_l2` counter advances for dropped blocks too: they are real blocks in the chain.
+        // Number each derived message and either send it or, when it reproduces a block already on
+        // disk (a resume that started before the DB tip), drop it. `next_l2` counts ABSOLUTE L2
+        // blocks (advancing for dropped blocks too: they are real blocks in the chain) so it lines
+        // up with `db_tip_l2`. The `sequence_number` handed to the driver, however, must be the
+        // MESSAGE INDEX (`block - genesis_block`), which is what its sequence-reconciliation expects
+        // (`block = sequence_number + genesis_block`); absolute block numbers only match the index
+        // when genesis is block 0. Sending absolute numbers on a chain with a non-zero genesis (e.g.
+        // Arbitrum One at 22207817) makes every message land far above the driver's `next_seq`, so it
+        // buffers/drops them all and never applies any block.
         let mut skipped = 0u64;
         for mut msg in derived.messages {
             let bn = next_l2;
@@ -240,7 +253,7 @@ where
                 skipped += 1;
                 continue;
             }
-            msg.sequence_number = bn;
+            msg.sequence_number = bn - genesis_block;
             if feed_tx.send(msg).await.is_err() {
                 tracing::warn!(target: "arb-reth::l1-sync", "feed channel closed; stopping L1 sync");
                 return Ok(());
