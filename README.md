@@ -50,7 +50,7 @@ Progress on the sync is mostly gated by hardware and budget. A full replay wants
 
 ## Building and running
 
-This is a Rust workspace pinned to a specific reth revision, revm 41, and alloy 2.0. It also depends on the sibling `arb_revm` and `arb-alloy` repositories.
+This is a Rust workspace pinned to a specific reth revision, revm 41, and alloy 2.0. It also depends on the sibling `arbitrum-revm` and `arbitrum-alloy` repositories.
 ```
 cargo build --release
 ```
