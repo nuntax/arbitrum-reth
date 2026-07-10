@@ -20,17 +20,17 @@ use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
 use reth_node_api::{AddOnsContext, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter};
+use reth_node_builder::hooks::NodeHooks;
 use reth_node_builder::{
     AddOns, LaunchContext, LaunchNode, Node, NodeBuilderWithComponents, NodeComponents,
     NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter,
 };
-use reth_node_builder::hooks::NodeHooks;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
-    providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
     BalProvider, BlockNumReader, BlockReader, ChangeSetReader, DatabaseProviderFactory,
     HashedPostStateProvider, ProviderFactory, StateProviderFactory, StateReader,
     StorageChangeSetReader,
+    providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
 };
 use reth_rpc_builder::RpcServerHandle;
 use reth_storage_api::{
@@ -93,35 +93,40 @@ pub struct ArbLauncher {
     pub rpc_addr: Option<SocketAddr>,
 }
 
-impl<N, DB, T, CB>
-    LaunchNode<NodeBuilderWithComponents<T, CB, ()>>
-    for ArbLauncher
+impl<N, DB, T, CB> LaunchNode<NodeBuilderWithComponents<T, CB, ()>> for ArbLauncher
 where
     N: Node<RethFullAdapter<DB, N>>
         + NodeTypesForProvider
-        + NodeTypes<Primitives = ArbPrimitives, Payload = arb_reth_engine::ArbPayloadTypes, ChainSpec: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + reth_chainspec::Hardforks>,
+        + NodeTypes<
+            Primitives = ArbPrimitives,
+            Payload = arb_reth_engine::ArbPayloadTypes,
+            ChainSpec: reth_chainspec::EthChainSpec
+                           + reth_chainspec::EthereumHardforks
+                           + reth_chainspec::Hardforks,
+        >,
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
     T: FullNodeTypes<
-        Types = N,
-        Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>,
-        DB = DB,
-    >,
+            Types = N,
+            Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>,
+            DB = DB,
+        >,
     CB: NodeComponentsBuilder<T> + 'static,
-    <CB::Components as NodeComponents<T>>::Evm: ConfigureEvm<Primitives = ArbPrimitives>
-        + Into<arb_reth_evm::ArbEvmConfig>
-        + Clone,
+    <CB::Components as NodeComponents<T>>::Evm:
+        ConfigureEvm<Primitives = ArbPrimitives> + Into<arb_reth_evm::ArbEvmConfig> + Clone,
     CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
     NodeTypesWithDBAdapter<N, DB>: ProviderNodeTypes<Primitives = ArbPrimitives>,
     // Explicit equality bounds to help the compiler resolve the associated type projections
     // from NodeTypesWithDBAdapter<N, DB>.
-    NodeTypesWithDBAdapter<N, DB>: NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
+    NodeTypesWithDBAdapter<N, DB>:
+        NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
     NodeTypesWithDBAdapter<N, DB>: reth_node_api::NodeTypesWithDB<DB = DB>,
     // Engine-tree (Tier-1) bounds: mirror `EngineApiTreeHandler::spawn_new`'s P-bounds with
     // P = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> (see engine.rs).
     BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>: DatabaseProviderFactory<DB = DB>
         + BlockReader<Block = ArbBlock, Header = Header>
-        + reth_storage_api::TransactionsProvider<Transaction = arbitrum_alloy_consensus::ArbTxEnvelope>
-        + reth_storage_api::ReceiptProvider<Receipt = ArbReceiptEnvelope>
+        + reth_storage_api::TransactionsProvider<
+            Transaction = arbitrum_alloy_consensus::ArbTxEnvelope,
+        > + reth_storage_api::ReceiptProvider<Receipt = ArbReceiptEnvelope>
         + StateProviderFactory
         + StateReader<Receipt = ArbReceiptEnvelope>
         + HashedPostStateProvider
@@ -157,32 +162,53 @@ impl ArbLauncher {
     where
         N: Node<RethFullAdapter<DB, N>>
             + NodeTypesForProvider
-            + NodeTypes<Primitives = ArbPrimitives, Payload = arb_reth_engine::ArbPayloadTypes, ChainSpec: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + reth_chainspec::Hardforks>,
+            + NodeTypes<
+                Primitives = ArbPrimitives,
+                Payload = arb_reth_engine::ArbPayloadTypes,
+                ChainSpec: reth_chainspec::EthChainSpec
+                               + reth_chainspec::EthereumHardforks
+                               + reth_chainspec::Hardforks,
+            >,
         DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
         T: FullNodeTypes<
-            Types = N,
-            Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>,
-            DB = DB,
-        >,
+                Types = N,
+                Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>,
+                DB = DB,
+            >,
         CB: NodeComponentsBuilder<T> + 'static,
-        <CB::Components as NodeComponents<T>>::Evm: ConfigureEvm<Primitives = ArbPrimitives>
-            + Into<arb_reth_evm::ArbEvmConfig>
-            + Clone,
+        <CB::Components as NodeComponents<T>>::Evm:
+            ConfigureEvm<Primitives = ArbPrimitives> + Into<arb_reth_evm::ArbEvmConfig> + Clone,
         CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
         NodeTypesWithDBAdapter<N, DB>: ProviderNodeTypes<Primitives = ArbPrimitives>,
-        NodeTypesWithDBAdapter<N, DB>: NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
+        NodeTypesWithDBAdapter<N, DB>:
+            NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
         NodeTypesWithDBAdapter<N, DB>: reth_node_api::NodeTypesWithDB<DB = DB>,
     {
-        let Self { ctx, chain_id, genesis_block, tuning, messages, rpc_addr } = self;
+        let Self {
+            ctx,
+            chain_id,
+            genesis_block,
+            tuning,
+            messages,
+            rpc_addr,
+        } = self;
 
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             rocksdb_provider,
             components_builder,
-            add_ons: AddOns { hooks, exexs: _, add_ons: _ },
+            add_ons:
+                AddOns {
+                    hooks,
+                    exexs: _,
+                    add_ons: _,
+                },
             config,
         } = target;
-        let NodeHooks { on_component_initialized, .. } = hooks;
+        let NodeHooks {
+            on_component_initialized,
+            ..
+        } = hooks;
 
         // Drive RPC config from the explicit `rpc_addr`: canonical `RpcAddOns` reads addresses from
         // `NodeConfig.rpc`, not an arg. Enable http+ws with the full module fleet; this node is
@@ -228,8 +254,7 @@ impl ArbLauncher {
             };
             if current != Some(reth_db_api::models::StorageSettings::v2()) {
                 let provider_rw = factory.provider_rw()?;
-                provider_rw
-                    .write_storage_settings(reth_db_api::models::StorageSettings::v2())?;
+                provider_rw.write_storage_settings(reth_db_api::models::StorageSettings::v2())?;
                 provider_rw
                     .commit()
                     .map_err(|e| eyre!("persist storage settings v2: {e}"))?;
@@ -254,8 +279,7 @@ impl ArbLauncher {
 
         // Clone the in-memory state from the provider so the tree updates the same instance that
         // BlockchainProvider serves for RPC queries.
-        let canonical: CanonicalInMemoryState<ArbPrimitives> =
-            provider.canonical_in_memory_state();
+        let canonical: CanonicalInMemoryState<ArbPrimitives> = provider.canonical_in_memory_state();
 
         let genesis_tip: SealedHeader<Header> =
             HeaderProvider::sealed_header(&provider, head.number)?
@@ -263,7 +287,7 @@ impl ArbLauncher {
 
         // `arb_evm_config` (hoisted from the RPC block below): also drives the engine tree.
         let arb_evm_config: arb_reth_evm::ArbEvmConfig =
-            ctx.node_adapter().components.evm_config().clone().into();
+            ctx.node_adapter().components.evm_config().clone();
 
         // Stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
         // sequencer feed through it. Persistence to MDBX is async (tree background service).
@@ -282,49 +306,48 @@ impl ArbLauncher {
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
         let mut messages_rx = messages;
 
-        task_executor.spawn_critical_task(
-            "arb-engine-driver",
-            async move {
-                let res: eyre::Result<()> = async {
-                    // Bench accounting: separate time spent WAITING for the next derived feed
-                    // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
-                    // Emitted every 1000 blocks at target "arb-reth::bench"; harmless at info off.
-                    let mut bench_recv_us: u128 = 0;
-                    let mut bench_work_us: u128 = 0;
-                    let mut bench_n: u64 = 0;
-                    let mut bench_wall = std::time::Instant::now();
-                    loop {
-                        let __r = std::time::Instant::now();
-                        let Some(msg) = messages_rx.recv().await else { break };
-                        bench_recv_us += __r.elapsed().as_micros();
-                        let __w = std::time::Instant::now();
-                        driver.advance(&msg).await?;
-                        bench_work_us += __w.elapsed().as_micros();
-                        bench_n += 1;
-                        if bench_n.is_multiple_of(1000) {
-                            let wall_ms = bench_wall.elapsed().as_millis().max(1);
-                            tracing::info!(
-                                target: "arb-reth::bench",
-                                blocks = bench_n,
-                                blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
-                                recv_ms = (bench_recv_us / 1000) as u64,
-                                work_ms = (bench_work_us / 1000) as u64,
-                                recv_pct = (100 * bench_recv_us
-                                    / (bench_recv_us + bench_work_us).max(1)) as u64,
-                                "bench: 1000-block window",
-                            );
-                            bench_recv_us = 0;
-                            bench_work_us = 0;
-                            bench_wall = std::time::Instant::now();
-                        }
+        task_executor.spawn_critical_task("arb-engine-driver", async move {
+            let res: eyre::Result<()> = async {
+                // Bench accounting: separate time spent WAITING for the next derived feed
+                // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
+                // Emitted every 1000 blocks at target "arb-reth::bench"; harmless at info off.
+                let mut bench_recv_us: u128 = 0;
+                let mut bench_work_us: u128 = 0;
+                let mut bench_n: u64 = 0;
+                let mut bench_wall = std::time::Instant::now();
+                loop {
+                    let __r = std::time::Instant::now();
+                    let Some(msg) = messages_rx.recv().await else {
+                        break;
+                    };
+                    bench_recv_us += __r.elapsed().as_micros();
+                    let __w = std::time::Instant::now();
+                    driver.advance(&msg).await?;
+                    bench_work_us += __w.elapsed().as_micros();
+                    bench_n += 1;
+                    if bench_n.is_multiple_of(1000) {
+                        let wall_ms = bench_wall.elapsed().as_millis().max(1);
+                        tracing::info!(
+                            target: "arb-reth::bench",
+                            blocks = bench_n,
+                            blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
+                            recv_ms = (bench_recv_us / 1000) as u64,
+                            work_ms = (bench_work_us / 1000) as u64,
+                            recv_pct = (100 * bench_recv_us
+                                / (bench_recv_us + bench_work_us).max(1)) as u64,
+                            "bench: 1000-block window",
+                        );
+                        bench_recv_us = 0;
+                        bench_work_us = 0;
+                        bench_wall = std::time::Instant::now();
                     }
-                    driver.shutdown().await;
-                    Ok(())
                 }
-                .await;
-                let _ = exit_tx.send(res); // ignore error if receiver was dropped
-            },
-        );
+                driver.shutdown().await;
+                Ok(())
+            }
+            .await;
+            let _ = exit_tx.send(res); // ignore error if receiver was dropped
+        });
 
         // Serve RPC through reth's canonical `RpcAddOns::launch_add_ons` (full fleet + ws +
         // subscriptions via `NodeConfig.rpc`), not the bespoke server. This node is self-driven
@@ -350,17 +373,21 @@ impl ArbLauncher {
             None
         };
 
-        Ok(ArbNodeHandle { provider, exit_rx, rpc_handle })
+        Ok(ArbNodeHandle {
+            provider,
+            exit_rx,
+            rpc_handle,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, U256};
+    use alloy_primitives::{U256, address};
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use reth_chainspec::MAINNET;
-    use reth_node_builder::{NodeBuilder, NodeConfig, LaunchNode};
+    use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
     use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
     use reth_storage_api::AccountReader;
     use reth_tasks::Runtime;
@@ -371,8 +398,7 @@ mod tests {
     /// and persists blocks 1 & 2 with cumulative balance = 2 x 111_000_000_000_000_000.
     #[tokio::test(flavor = "multi_thread")]
     async fn launcher_boots_and_produces_blocks() {
-        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures");
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
             .expect("read fixture");
         let feed_msg: BroadcastFeedMessage =
@@ -395,23 +421,19 @@ mod tests {
         let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
 
         // Build the ChainPath (data_dir) that LaunchContext needs.
-        let maybe_path = reth_node_core::dirs::MaybePlatformPath::<
-            reth_node_core::dirs::DataDirPath,
-        >::from(datadir.clone());
-        let config = NodeConfig::test().with_chain(MAINNET.clone()).with_datadir_args(
-            reth_node_core::args::DatadirArgs {
+        let maybe_path =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir.clone(),
+            );
+        let config = NodeConfig::test()
+            .with_chain(MAINNET.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
                 datadir: maybe_path.clone(),
                 ..Default::default()
-            },
-        );
-        let data_dir = maybe_path.unwrap_or_chain_default(
-            MAINNET.chain(),
-            config.datadir.clone(),
-        );
+            });
+        let data_dir = maybe_path.unwrap_or_chain_default(MAINNET.chain(), config.datadir.clone());
 
-        let node_builder_with_components = NodeBuilder::new(config)
-            .with_database(db)
-            .node(ArbNode);
+        let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
         let launcher = ArbLauncher {
             ctx: LaunchContext::new(task_executor.clone(), data_dir),
@@ -428,7 +450,10 @@ mod tests {
             .expect("launch must succeed");
 
         let provider = handle.provider.clone();
-        handle.wait_for_node_exit().await.expect("driver task must succeed");
+        handle
+            .wait_for_node_exit()
+            .await
+            .expect("driver task must succeed");
 
         // The launcher opens the DB in storage v2; confirm the flag is persisted.
         {
@@ -442,9 +467,19 @@ mod tests {
             );
         }
 
-        assert_eq!(provider.best_block_number().unwrap(), 2, "best block must be 2");
-        assert!(provider.header_by_number(1).unwrap().is_some(), "block 1 must exist");
-        assert!(provider.header_by_number(2).unwrap().is_some(), "block 2 must exist");
+        assert_eq!(
+            provider.best_block_number().unwrap(),
+            2,
+            "best block must be 2"
+        );
+        assert!(
+            provider.header_by_number(1).unwrap().is_some(),
+            "block 1 must exist"
+        );
+        assert!(
+            provider.header_by_number(2).unwrap().is_some(),
+            "block 2 must exist"
+        );
 
         let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
         let single_deposit = U256::from(111_000_000_000_000_000u128);
