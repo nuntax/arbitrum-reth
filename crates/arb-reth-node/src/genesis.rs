@@ -396,6 +396,37 @@ pub fn orbit_chain_from_files(
     Ok((spec, init, info))
 }
 
+/// Build an Orbit chain from a `chaininfo.json` ALONE (no genesis.json). The chain config comes
+/// from the chaininfo entry's `chain-config`; the genesis has no user prealloc (ArbOS-init state
+/// only). This suits chains whose genesis is ArbOS-init-only (e.g. a testnet with "no custom
+/// genesis").
+///
+/// Note: the `serialized_chain_config` is re-serialized from the parsed chaininfo rather than taken
+/// from Nitro's own bytes, so the ArbOS genesis root is only guaranteed byte-exact for such
+/// ArbOS-init-only chains. A chain that ships a custom `genesis.json` (prealloc, or a specific
+/// serialization) must be booted with [`orbit_chain_from_files`]; a fresh chain with an L1 is best
+/// bootstrapped from its on-L1 Initialize message instead (the node's `--l1-rpc` path).
+pub fn orbit_chain_from_chain_info(
+    chain_info_json: &[u8],
+    base_fee_override: Option<U256>,
+) -> eyre::Result<(ChainSpec, ArbosInitConfig, ChainInfo)> {
+    let info = parse_chain_info(chain_info_json, None)?;
+    // Serialize the entry's `chain-config` sub-object to bytes for `serialized_chain_config`.
+    let value: serde_json::Value = serde_json::from_slice(chain_info_json)
+        .map_err(|e| eyre::eyre!("parse chaininfo JSON: {e}"))?;
+    let cfg = value
+        .get(0)
+        .and_then(|e| e.get("chain-config"))
+        .ok_or_else(|| eyre::eyre!("chaininfo entry has no chain-config"))?;
+    let cfg_bytes = serde_json::to_vec(cfg).map_err(|e| eyre::eyre!("serialize chain-config: {e}"))?;
+    let mut init = arbos_init_from_chain_config_json(&cfg_bytes)?;
+    if let Some(fee) = base_fee_override {
+        init.initial_l1_base_fee = fee;
+    }
+    let spec = arb_chain_spec(&init)?;
+    Ok((spec, init, info))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +461,19 @@ mod tests {
         let init = arbos_init_from_chain_config_json(&g.serialized_chain_config).unwrap();
         assert_eq!(init.chain_id, U256::from(4663u64));
         assert_eq!(init.initial_arbos_version, 51);
+    }
+
+    #[test]
+    fn orbit_chain_from_chain_info_alone_builds_spec() {
+        // chaininfo-only path (no genesis.json): used for a testnet with no custom genesis.
+        let (spec, init, info) =
+            orbit_chain_from_chain_info(ROBINHOOD_CHAIN_INFO, None).expect("build from chaininfo");
+        assert_eq!(init.chain_id, U256::from(4663u64));
+        assert_eq!(init.initial_arbos_version, 51);
+        assert_eq!(info.rollup.sequencer_inbox, address!("0xBd0D173EEb87D57A09521c24388a12789F33ba96"));
+        // No user prealloc here (ArbOS-init accounts only), unlike the genesis.json path.
+        assert!(!spec.genesis.alloc.contains_key(&address!("0x000000000022D473030F116dDEE9F6B43aC78BA3")));
+        assert_ne!(spec.genesis_header().state_root, B256::ZERO);
     }
 
     #[test]

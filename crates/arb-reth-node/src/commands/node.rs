@@ -326,21 +326,30 @@ async fn derive_genesis_from_l1(
 pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
 
-    // --chain-info + --genesis: boot an Orbit chain from its bundled files. Highest precedence;
-    // supplies BOTH the chain spec (config + prealloc) and the rollup deployment (L1 addresses).
+    // --chain-info boots an Orbit chain. Highest precedence; supplies BOTH the chain spec and the
+    // rollup deployment (L1 addresses). With --genesis the chain spec + prealloc come from the
+    // genesis file (byte-exact, for a chain that ships a custom genesis like Robinhood mainnet);
+    // without it the chain config comes from the chaininfo entry (ArbOS-init-only genesis, e.g. a
+    // testnet with "no custom genesis"). `--genesis` alone (no chaininfo) has no rollup addresses.
     let orbit = match (&args.chain_info, &args.genesis_json) {
-        (Some(ci), Some(g)) => {
+        (Some(ci), genesis_opt) => {
             let ci_json = fs::read(ci).map_err(|e| eyre::eyre!("read chain-info {ci:?}: {e}"))?;
-            let g_json = fs::read(g).map_err(|e| eyre::eyre!("read genesis {g:?}: {e}"))?;
-            let (spec, init, info) = crate::orbit_chain_from_files(&ci_json, &g_json)?;
+            let (spec, init, info) = match genesis_opt {
+                Some(g) => {
+                    let g_json = fs::read(g).map_err(|e| eyre::eyre!("read genesis {g:?}: {e}"))?;
+                    crate::orbit_chain_from_files(&ci_json, &g_json)?
+                }
+                None => crate::orbit_chain_from_chain_info(
+                    &ci_json,
+                    args.initial_l1_base_fee.map(alloy_primitives::U256::from),
+                )?,
+            };
             Some((std::sync::Arc::new(spec), init, info))
         }
-        (None, None) => None,
-        _ => {
-            return Err(eyre::eyre!(
-                "--chain-info and --genesis must be provided together (they bundle one Orbit chain)"
-            ))
+        (None, Some(_)) => {
+            return Err(eyre::eyre!("--genesis requires --chain-info (the rollup addresses live there)"))
         }
+        (None, None) => None,
     };
 
     // Resolve the rollup addresses + deploy/genesis anchors as one set up front, so a

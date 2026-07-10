@@ -32,9 +32,9 @@ pub mod commands;
 pub mod genesis;
 pub use genesis::{
     arb_chain_spec, arb_chain_spec_with_alloc, arb_chain_spec_with_header,
-    arbos_init_from_chain_config_json, arbos_init_from_parsed, orbit_chain_from_files,
-    parse_chain_info, parse_nitro_genesis, read_head_header, ChainInfo, NitroGenesisFile,
-    RollupInfo,
+    arbos_init_from_chain_config_json, arbos_init_from_parsed, orbit_chain_from_chain_info,
+    orbit_chain_from_files, parse_chain_info, parse_nitro_genesis, read_head_header, ChainInfo,
+    NitroGenesisFile, RollupInfo,
 };
 
 pub mod hashed_db;
