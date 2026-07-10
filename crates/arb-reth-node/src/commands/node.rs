@@ -110,6 +110,20 @@ pub struct NodeArgs {
     #[arg(long = "chain", value_name = "PATH")]
     chain_config: Option<PathBuf>,
 
+    /// Path to a Nitro `chaininfo.json` (array of chains: chain-id, parent-chain-id, chain-config,
+    /// and the rollup deployment addresses). With `--genesis`, boots an Orbit chain end to end: the
+    /// chain spec + prealloc come from the genesis file and the L1 rollup addresses (sequencer
+    /// inbox, bridge, deployed-at) come from here. Must be given together with `--genesis`.
+    #[arg(long = "chain-info", value_name = "PATH")]
+    chain_info: Option<PathBuf>,
+
+    /// Path to a Nitro `genesis.json` (geth-style `alloc` + `arbOSInit.initialL1BaseFee` +
+    /// `serializedChainConfig`). Supplies the Orbit chain's genesis state (prealloc contracts +
+    /// funded accounts) layered under the ArbOS init state. Must be given together with
+    /// `--chain-info`.
+    #[arg(long = "genesis", value_name = "PATH")]
+    genesis_json: Option<PathBuf>,
+
     /// Initial L1 base fee (wei) baked into the ArbOS genesis when booting from --chain.
     /// Defaults to Nitro's `DefaultInitialL1BaseFee` of 50 GWei. This value is part of the
     /// genesis state, so a chain created with a different initial base fee (a nitro-testnode
@@ -312,9 +326,35 @@ async fn derive_genesis_from_l1(
 pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
 
+    // --chain-info + --genesis: boot an Orbit chain from its bundled files. Highest precedence;
+    // supplies BOTH the chain spec (config + prealloc) and the rollup deployment (L1 addresses).
+    let orbit = match (&args.chain_info, &args.genesis_json) {
+        (Some(ci), Some(g)) => {
+            let ci_json = fs::read(ci).map_err(|e| eyre::eyre!("read chain-info {ci:?}: {e}"))?;
+            let g_json = fs::read(g).map_err(|e| eyre::eyre!("read genesis {g:?}: {e}"))?;
+            let (spec, init, info) = crate::orbit_chain_from_files(&ci_json, &g_json)?;
+            Some((std::sync::Arc::new(spec), init, info))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(eyre::eyre!(
+                "--chain-info and --genesis must be provided together (they bundle one Orbit chain)"
+            ))
+        }
+    };
+
     // Resolve the rollup addresses + deploy/genesis anchors as one set up front, so a
-    // half-specified custom deployment fails fast rather than mid-boot.
-    let rollup = resolve_rollup_deployment(&args)?;
+    // half-specified custom deployment fails fast rather than mid-boot. An Orbit boot takes them
+    // straight from the chaininfo file.
+    let rollup = match &orbit {
+        Some((_, init, info)) => RollupDeployment {
+            sequencer_inbox: info.rollup.sequencer_inbox,
+            bridge: info.rollup.bridge,
+            deployed_at: info.rollup.deployed_at,
+            l2_genesis_block: init.genesis_block_number,
+        },
+        None => resolve_rollup_deployment(&args)?,
+    };
 
     // --snapshot-head: boot on an imported snapshot DB by building the chain spec from its head
     // header (so reth's genesis-hash check accepts the DB). Takes precedence over --chain.
@@ -323,8 +363,21 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // `snapshot_delayed` carries the L2 tip's `delayedMessagesRead` (the header nonce) so the
     // L1-sync delayed cursor defaults to it without a manual flag.
     let mut snapshot_delayed: Option<u64> = None;
-    let (chain_spec, effective_chain_id) = match (&args.snapshot_head, &args.chain_config) {
-        (Some(head_path), _) => {
+    let (chain_spec, effective_chain_id) = match (&orbit, &args.snapshot_head, &args.chain_config) {
+        (Some((spec, init, info)), _, _) => {
+            info!(
+                target: "arb-reth",
+                chain_id = init.chain_id.to::<u64>(),
+                arbos_version = init.initial_arbos_version,
+                chain_name = %info.chain_name,
+                parent_chain_id = info.parent_chain_id,
+                sequencer_inbox = %info.rollup.sequencer_inbox,
+                deployed_at = info.rollup.deployed_at,
+                "booting Orbit chain from chaininfo + genesis files",
+            );
+            (spec.clone(), init.chain_id.to::<u64>())
+        }
+        (None, Some(head_path), _) => {
             let (num, hash, header) = crate::read_head_header(head_path)?;
             snapshot_delayed = Some(u64::from_be_bytes(header.nonce.0));
             info!(
@@ -335,7 +388,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             );
             (crate::arb_chain_spec_with_header(args.chain_id, header, hash), args.chain_id)
         }
-        (None, Some(path)) => {
+        (None, None, Some(path)) => {
             let json = fs::read(path)
                 .map_err(|e| eyre::eyre!("failed to read chain config file {:?}: {}", path, e))?;
             let mut init = arbos_init_from_chain_config_json(&json)?;
@@ -352,7 +405,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             let spec = std::sync::Arc::new(arb_chain_spec(&init)?);
             (spec, derived_chain_id)
         }
-        (None, None) => match &args.l1_rpc {
+        (None, None, None) => match &args.l1_rpc {
             // No genesis file given but an L1 is: bootstrap genesis from the chain's Initialize
             // message on that L1 (chain id + config + base fee all come from it). This is the
             // zero-config path for a fresh chain like a nitro-testnode.

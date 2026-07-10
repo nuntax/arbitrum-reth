@@ -22,10 +22,11 @@
 use std::collections::BTreeMap;
 
 use alloy_genesis::{ChainConfig, Genesis, GenesisAccount};
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use arb_revm::arbos_init::{arb_genesis_accounts, ArbosInitConfig};
 use arbitrum_alloy_sequencer::init_message::{ArbChainConfig, ParsedInitMessage};
 use reth_chainspec::ChainSpec;
+use serde::Deserialize;
 
 /// Build a [`ChainSpec`] from an [`ArbosInitConfig`].
 ///
@@ -33,23 +34,31 @@ use reth_chainspec::ChainSpec;
 /// re-executes the ArbOS init procedure against an empty state to enumerate every
 /// account written to block 0's state trie.
 pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
+    arb_chain_spec_with_alloc(init, BTreeMap::new())
+}
+
+/// Like [`arb_chain_spec`] but merges an additional genesis allocation (the user `alloc` from an
+/// Orbit chain's genesis.json) under the ArbOS-init accounts. Nitro applies the prealloc first and
+/// then runs ArbOS init, so on an address conflict the ArbOS-written account wins.
+pub fn arb_chain_spec_with_alloc(
+    init: &ArbosInitConfig,
+    extra_alloc: BTreeMap<Address, GenesisAccount>,
+) -> eyre::Result<ChainSpec> {
     let accounts = arb_genesis_accounts(init).map_err(|e| eyre::eyre!(e))?;
 
-    // Build the genesis alloc from the ArbOS-produced account list.
-    let alloc: BTreeMap<Address, GenesisAccount> = accounts
-        .into_iter()
-        .map(|a| {
-            let ga = GenesisAccount {
-                nonce: Some(a.nonce),
-                balance: a.balance,
-                code: (!a.code.is_empty()).then(|| a.code.clone()),
-                storage: (!a.storage.is_empty())
-                    .then(|| a.storage.iter().copied().collect::<BTreeMap<B256, B256>>()),
-                ..Default::default()
-            };
-            (a.address, ga)
-        })
-        .collect();
+    // User prealloc first; ArbOS-produced accounts override on conflict.
+    let mut alloc: BTreeMap<Address, GenesisAccount> = extra_alloc;
+    for a in accounts {
+        let ga = GenesisAccount {
+            nonce: Some(a.nonce),
+            balance: a.balance,
+            code: (!a.code.is_empty()).then(|| a.code.clone()),
+            storage: (!a.storage.is_empty())
+                .then(|| a.storage.iter().copied().collect::<BTreeMap<B256, B256>>()),
+            ..Default::default()
+        };
+        alloc.insert(a.address, ga);
+    }
 
     // Arbitrum's geth chain config is LONDON-format: forks activate through London only, with no
     // Shanghai/Cancun/Prague. Adding those forks would cause reth to add withdrawalsRoot/blob/
@@ -201,10 +210,242 @@ pub fn read_head_header(path: &std::path::Path) -> eyre::Result<(u64, B256, allo
     best.ok_or_else(|| eyre::eyre!("no H records in {path:?}"))
 }
 
+// ---------------------------------------------------------------------------
+// Orbit chain files: Nitro `chaininfo.json` + geth-style `genesis.json`.
+// ---------------------------------------------------------------------------
+
+/// One entry of a Nitro `chaininfo.json` (the file is a JSON array of these). Carries the chain
+/// config plus the L1 rollup-deployment addresses, exactly what Nitro's `chaininfo` package holds.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChainInfo {
+    /// L2 chain id.
+    #[serde(rename = "chain-id")]
+    pub chain_id: u64,
+    /// Parent (settlement) chain id: 1 = Ethereum mainnet for an L2 Orbit chain.
+    #[serde(rename = "parent-chain-id", default)]
+    pub parent_chain_id: u64,
+    /// Whether the parent chain is itself an Arbitrum chain (i.e. this is an L3).
+    #[serde(rename = "parent-chain-is-arbitrum", default)]
+    pub parent_chain_is_arbitrum: bool,
+    /// Human-readable chain name.
+    #[serde(rename = "chain-name", default)]
+    pub chain_name: String,
+    /// The Arbitrum chain config (`{"chainId":..,"arbitrum":{..}}`).
+    #[serde(rename = "chain-config")]
+    pub chain_config: ArbChainConfig,
+    /// L1 rollup-deployment contract addresses.
+    pub rollup: RollupInfo,
+}
+
+/// Rollup-deployment addresses from a `chaininfo.json` entry (the subset the node needs to derive
+/// from L1: the sequencer inbox, the bridge, and the deploy block that anchors batch 0).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RollupInfo {
+    #[serde(default)]
+    pub bridge: Address,
+    #[serde(default)]
+    pub inbox: Address,
+    #[serde(rename = "sequencer-inbox", default)]
+    pub sequencer_inbox: Address,
+    #[serde(default)]
+    pub rollup: Address,
+    /// L1 block the rollup contracts were deployed at (anchors reading batch 0 + the Initialize
+    /// message). Nitro's `RollupAddresses.DeployedAt`.
+    #[serde(rename = "deployed-at", default)]
+    pub deployed_at: u64,
+}
+
+/// Parse a Nitro `chaininfo.json` (an array of [`ChainInfo`]). Returns the entry whose `chain-id`
+/// matches `chain_id`, or the sole entry when `chain_id` is `None`.
+pub fn parse_chain_info(json: &[u8], chain_id: Option<u64>) -> eyre::Result<ChainInfo> {
+    let chains: Vec<ChainInfo> =
+        serde_json::from_slice(json).map_err(|e| eyre::eyre!("parse chaininfo JSON: {e}"))?;
+    match chain_id {
+        Some(id) => chains
+            .into_iter()
+            .find(|c| c.chain_id == id)
+            .ok_or_else(|| eyre::eyre!("chaininfo has no entry for chain-id {id}")),
+        None => {
+            let n = chains.len();
+            let mut it = chains.into_iter();
+            let first = it.next().ok_or_else(|| eyre::eyre!("chaininfo array is empty"))?;
+            if n > 1 {
+                return Err(eyre::eyre!(
+                    "chaininfo has {n} entries; specify --chain-id to pick one"
+                ));
+            }
+            Ok(first)
+        }
+    }
+}
+
+/// A parsed Nitro `genesis.json`: the user prealloc, the exact serialized chain config bytes
+/// (needed byte-for-byte for the ArbOS genesis root), and the initial L1 base fee.
+#[derive(Debug, Clone)]
+pub struct NitroGenesisFile {
+    /// Genesis prealloc accounts (contracts + funded accounts) to layer under the ArbOS state.
+    pub alloc: BTreeMap<Address, GenesisAccount>,
+    /// Raw bytes of the `serializedChainConfig` string (the canonical serialization; used both as
+    /// `ArbosInitConfig::serialized_chain_config` and to derive the structured config).
+    pub serialized_chain_config: Vec<u8>,
+    /// `arbOSInit.initialL1BaseFee`, if present.
+    pub initial_l1_base_fee: Option<U256>,
+}
+
+#[derive(Deserialize)]
+struct RawNitroGenesis {
+    #[serde(default)]
+    alloc: BTreeMap<Address, RawAllocAccount>,
+    #[serde(rename = "arbOSInit", default)]
+    arbos_init: Option<RawArbOsInit>,
+    #[serde(rename = "serializedChainConfig")]
+    serialized_chain_config: String,
+}
+
+#[derive(Deserialize)]
+struct RawArbOsInit {
+    #[serde(rename = "initialL1BaseFee", default)]
+    initial_l1_base_fee: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RawAllocAccount {
+    #[serde(default)]
+    balance: Option<serde_json::Value>,
+    #[serde(default)]
+    nonce: Option<serde_json::Value>,
+    #[serde(default)]
+    code: Option<Bytes>,
+    #[serde(default)]
+    storage: Option<BTreeMap<B256, B256>>,
+}
+
+/// Coerce a genesis JSON scalar (a bare number OR a hex/decimal string) into a `U256`. Nitro's
+/// genesis.json writes balances/fees as bare JSON numbers, not the quoted hex geth normally uses.
+fn json_to_u256(v: &serde_json::Value) -> eyre::Result<U256> {
+    match v {
+        serde_json::Value::Number(n) => U256::try_from(n.as_u128().ok_or_else(|| {
+            eyre::eyre!("numeric value {n} out of u128 range; encode large balances as a string")
+        })?)
+        .map_err(|e| eyre::eyre!("u256 from number: {e}")),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            match s.strip_prefix("0x") {
+                Some(hex) => U256::from_str_radix(hex, 16),
+                None => U256::from_str_radix(s, 10),
+            }
+            .map_err(|e| eyre::eyre!("u256 from string {s:?}: {e}"))
+        }
+        other => Err(eyre::eyre!("expected number or string for U256, got {other}")),
+    }
+}
+
+/// Parse a Nitro `genesis.json` into a [`NitroGenesisFile`].
+pub fn parse_nitro_genesis(json: &[u8]) -> eyre::Result<NitroGenesisFile> {
+    let raw: RawNitroGenesis =
+        serde_json::from_slice(json).map_err(|e| eyre::eyre!("parse genesis.json: {e}"))?;
+
+    let mut alloc = BTreeMap::new();
+    for (addr, a) in raw.alloc {
+        let balance = a.balance.as_ref().map(json_to_u256).transpose()?.unwrap_or_default();
+        let nonce = a
+            .nonce
+            .as_ref()
+            .map(|v| json_to_u256(v).map(|u| u.saturating_to::<u64>()))
+            .transpose()?;
+        alloc.insert(
+            addr,
+            GenesisAccount { nonce, balance, code: a.code, storage: a.storage, ..Default::default() },
+        );
+    }
+
+    let initial_l1_base_fee = raw
+        .arbos_init
+        .and_then(|i| i.initial_l1_base_fee)
+        .as_ref()
+        .map(json_to_u256)
+        .transpose()?;
+
+    Ok(NitroGenesisFile {
+        alloc,
+        serialized_chain_config: raw.serialized_chain_config.into_bytes(),
+        initial_l1_base_fee,
+    })
+}
+
+/// Build everything the node needs to boot an Orbit chain from its `chaininfo.json` +
+/// `genesis.json`: the [`ChainSpec`] (ArbOS state under the genesis prealloc), the
+/// [`ArbosInitConfig`], and the [`ChainInfo`] (rollup addresses for L1 derivation).
+///
+/// The structured ArbOS init is parsed from the genesis.json's `serializedChainConfig` so the
+/// bytes that go into the genesis root are exactly the chain's own; the initial L1 base fee is
+/// taken from `arbOSInit` when present (else Nitro's 50 GWei default). The `chaininfo` chain-config
+/// is only used to sanity-check the chain id and to carry the rollup deployment.
+pub fn orbit_chain_from_files(
+    chain_info_json: &[u8],
+    genesis_json: &[u8],
+) -> eyre::Result<(ChainSpec, ArbosInitConfig, ChainInfo)> {
+    let genesis = parse_nitro_genesis(genesis_json)?;
+    let mut init = arbos_init_from_chain_config_json(&genesis.serialized_chain_config)?;
+    if let Some(fee) = genesis.initial_l1_base_fee {
+        init.initial_l1_base_fee = fee;
+    }
+    let chain_id = init.chain_id.to::<u64>();
+    let info = parse_chain_info(chain_info_json, Some(chain_id))?;
+    let spec = arb_chain_spec_with_alloc(&init, genesis.alloc)?;
+    Ok((spec, init, info))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::address;
+
+    const ROBINHOOD_CHAIN_INFO: &[u8] = include_bytes!("../tests/fixtures/robinhood-chain-info.json");
+    const ROBINHOOD_GENESIS: &[u8] = include_bytes!("../tests/fixtures/robinhood-genesis.json");
+
+    #[test]
+    fn parse_robinhood_chain_info() {
+        let info = parse_chain_info(ROBINHOOD_CHAIN_INFO, Some(4663)).expect("parse chaininfo");
+        assert_eq!(info.chain_id, 4663);
+        assert_eq!(info.parent_chain_id, 1);
+        assert!(!info.parent_chain_is_arbitrum, "Robinhood is an L2 (parent = Ethereum)");
+        assert_eq!(info.chain_config.arbitrum.initial_arbos_version, 51);
+        assert_eq!(
+            info.rollup.sequencer_inbox,
+            address!("0xBd0D173EEb87D57A09521c24388a12789F33ba96")
+        );
+        assert_eq!(info.rollup.deployed_at, 24994238);
+        // picking a non-present chain id must fail rather than silently return the wrong chain
+        assert!(parse_chain_info(ROBINHOOD_CHAIN_INFO, Some(42161)).is_err());
+    }
+
+    #[test]
+    fn parse_robinhood_genesis() {
+        let g = parse_nitro_genesis(ROBINHOOD_GENESIS).expect("parse genesis.json");
+        assert_eq!(g.alloc.len(), 38, "all 38 prealloc accounts");
+        assert!(g.alloc.values().all(|a| a.code.is_some()), "every prealloc is a contract");
+        assert_eq!(g.initial_l1_base_fee, Some(U256::from(613218601u64)));
+        // serializedChainConfig is the canonical chain-config bytes; it must parse back.
+        let init = arbos_init_from_chain_config_json(&g.serialized_chain_config).unwrap();
+        assert_eq!(init.chain_id, U256::from(4663u64));
+        assert_eq!(init.initial_arbos_version, 51);
+    }
+
+    #[test]
+    fn orbit_chain_from_files_builds_spec() {
+        let (spec, init, info) =
+            orbit_chain_from_files(ROBINHOOD_CHAIN_INFO, ROBINHOOD_GENESIS).expect("build orbit spec");
+        assert_eq!(init.chain_id, U256::from(4663u64));
+        // real initial L1 base fee from arbOSInit wins over the 50 GWei default
+        assert_eq!(init.initial_l1_base_fee, U256::from(613218601u64));
+        assert_eq!(info.rollup.sequencer_inbox, address!("0xBd0D173EEb87D57A09521c24388a12789F33ba96"));
+        // genesis alloc (38) + ArbOS accounts are both present, and the genesis root computed.
+        let genesis = &spec.genesis;
+        assert!(genesis.alloc.len() > 38, "ArbOS accounts layered over the 38 prealloc");
+        assert!(genesis.alloc.contains_key(&address!("0x000000000022D473030F116dDEE9F6B43aC78BA3")));
+        assert_ne!(spec.genesis_header().state_root, B256::ZERO);
+    }
 
     /// ArbSys precompile address (0x0000...0064).
     const ARB_SYS: Address = address!("0x0000000000000000000000000000000000000064");
