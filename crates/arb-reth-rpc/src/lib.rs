@@ -1,52 +1,22 @@
 //! Arbitrum `eth_*` RPC layer.
 //!
-//! Provides:
-//! - [`ArbReceiptConverter`]: converts `ArbReceiptEnvelope<Log>` primitives to
-//!   [`ArbTransactionReceipt`] RPC responses, surfacing `gas_used_for_l1`.
-//! - [`serve_rpc`]: standalone helper that wires an [`EthApi`] with the Arb
-//!   converter into a jsonrpsee HTTP server and returns its handle.
-//!
-//! The helper does not use `RpcAddOns` and does not touch the engine, so it can be
-//! swapped for `RpcAddOns`-based wiring later.
+//! Provides [`ArbReceiptConverter`] / [`ArbRpcConverter`]: convert `ArbReceiptEnvelope<Log>`
+//! primitives to [`ArbTransactionReceipt`] RPC responses, surfacing `gas_used_for_l1`. Wired into
+//! reth's canonical `RpcAddOns` eth-api builder (see `arb-reth-node::addons`), not a bespoke server.
 
-use std::{fmt::Debug, net::SocketAddr};
+use std::fmt::Debug;
 
 use alloy_consensus::{Receipt, ReceiptWithBloom};
 use alloy_primitives::Log;
 use alloy_rpc_types_eth::Log as RpcLog;
-use arbitrum_alloy_consensus::{
-    ArbReceipt, ArbReceiptEnvelope, ArbTxEnvelope,
-    reth::ArbPrimitives,
-};
+use arbitrum_alloy_consensus::{ArbReceipt, ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_network::Arbitrum;
 use arbitrum_alloy_rpc_types::ArbTransactionReceipt;
 use arb_reth_evm::ArbEvmConfig;
-use eyre::WrapErr;
-use reth_chain_state::CanonStateSubscriptions;
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
-use reth_consensus::noop::NoopConsensus;
-use reth_engine_primitives::ConsensusEngineEvent;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::SealedBlock;
-use reth_rpc::EthApi;
-use reth_rpc::eth::EthApiBuilder;
-use reth_rpc_builder::{
-    RpcModuleBuilder, RpcServerConfig, RpcServerHandle,
-    TransportRpcModuleConfig,
-};
 use reth_rpc_convert::{RpcConverter, transaction::{ConvertReceiptInput, ReceiptConverter}};
-use reth_rpc_eth_api::{
-    FullEthApiServer,
-    node::RpcNodeCoreAdapter,
-};
 use reth_rpc_eth_types::{EthApiError, receipt::build_receipt};
-use reth_rpc_server_types::RethRpcModule;
-use reth_storage_api::{
-    BalProvider, BlockReaderIdExt, FullRpcProvider, PruneCheckpointReader,
-    StageCheckpointReader,
-};
-use reth_tasks::Runtime;
-use reth_tokio_util::EventSender;
 
 /// Converts `ArbReceiptEnvelope<Log>` primitives into [`ArbTransactionReceipt`] RPC responses.
 ///
@@ -218,112 +188,3 @@ pub type ArbRpcConverter<Provider> = RpcConverter<
     ArbEvmConfig,
     ArbReceiptConverter<Provider>,
 >;
-
-/// Starts a jsonrpsee HTTP server exposing `eth_*` methods for Arbitrum.
-///
-/// Independent of the engine and `RpcAddOns`. Returns a [`RpcServerHandle`] whose
-/// lifetime controls the server. Generic over `Pool` and `Network`; pass a noop pool
-/// with `Consensus = ArbTxEnvelope` for sequencer-only nodes.
-pub async fn serve_rpc<Provider, Pool, Network>(
-    provider: Provider,
-    pool: Pool,
-    network: Network,
-    evm_config: ArbEvmConfig,
-    addr: SocketAddr,
-    runtime: Runtime,
-) -> eyre::Result<RpcServerHandle>
-where
-    Provider: FullRpcProvider<
-            Block = <ArbPrimitives as NodePrimitives>::Block,
-            Receipt = <ArbPrimitives as NodePrimitives>::Receipt,
-            Header = <ArbPrimitives as NodePrimitives>::BlockHeader,
-            Transaction = <ArbPrimitives as NodePrimitives>::SignedTx,
-        > + BlockReaderIdExt<
-            Block = <ArbPrimitives as NodePrimitives>::Block,
-            Receipt = <ArbPrimitives as NodePrimitives>::Receipt,
-            Header = <ArbPrimitives as NodePrimitives>::BlockHeader,
-            Transaction = <ArbPrimitives as NodePrimitives>::SignedTx,
-        > + ChainSpecProvider<
-            ChainSpec: EthChainSpec<Header = <ArbPrimitives as NodePrimitives>::BlockHeader>
-                + EthereumHardforks
-                + Hardforks,
-        > + CanonStateSubscriptions<Primitives = ArbPrimitives>
-        + reth_chain_state::ForkChoiceSubscriptions<
-            Header = <ArbPrimitives as NodePrimitives>::BlockHeader,
-        > + reth_chain_state::PersistedBlockSubscriptions
-        + reth_storage_api::AccountReader
-        + reth_storage_api::ChangeSetReader
-        + StageCheckpointReader
-        + PruneCheckpointReader
-        + BalProvider
-        + Debug
-        + Clone
-        + Unpin
-        + 'static,
-    Pool: reth_transaction_pool::TransactionPool<
-            Transaction: reth_transaction_pool::PoolTransaction<
-                Consensus = <ArbPrimitives as NodePrimitives>::SignedTx,
-            >,
-        > + Debug
-        + Clone
-        + Unpin
-        + Send
-        + Sync
-        + 'static,
-    Network: reth_network_api::NetworkInfo
-        + reth_network_api::Peers
-        + Debug
-        + Clone
-        + Unpin
-        + 'static,
-    // RpcNodeCoreAdapter must satisfy RpcNodeCore so EthApiBuilder::new_with_components works.
-    RpcNodeCoreAdapter<Provider, Pool, Network, ArbEvmConfig>: reth_rpc_eth_api::RpcNodeCore<
-        Provider = Provider,
-        Pool = Pool,
-        Network = Network,
-        Evm = ArbEvmConfig,
-        Primitives = ArbPrimitives,
-    >,
-    // The built EthApi must satisfy FullEthApiServer.
-    EthApi<RpcNodeCoreAdapter<Provider, Pool, Network, ArbEvmConfig>, ArbRpcConverter<Provider>>:
-        FullEthApiServer<Provider = Provider, Pool = Pool>,
-{
-    let rpc_converter = RpcConverter::new(ArbReceiptConverter::new(provider.clone()));
-
-    let components = RpcNodeCoreAdapter::new(
-        provider.clone(),
-        pool.clone(),
-        network.clone(),
-        evm_config.clone(),
-    );
-
-    let eth_api = EthApiBuilder::new_with_components(components)
-        .with_rpc_converter(rpc_converter)
-        .task_spawner(runtime.clone())
-        .build();
-
-    // Required by RpcModuleBuilder::build; we never emit engine events.
-    let engine_events = EventSender::<ConsensusEngineEvent<ArbPrimitives>>::default();
-
-    let module_config =
-        TransportRpcModuleConfig::default().with_http([RethRpcModule::Eth]);
-
-    let modules = RpcModuleBuilder::<ArbPrimitives, _, _, _, _, _>::new(
-        provider,
-        pool,
-        network,
-        runtime,
-        evm_config,
-        NoopConsensus::default(),
-    )
-    .build(module_config, eth_api, engine_events);
-
-    let handle = RpcServerConfig::default()
-        .with_http(jsonrpsee::server::ServerConfigBuilder::default())
-        .with_http_address(addr)
-        .start(&modules)
-        .await
-        .wrap_err("failed to start Arbitrum RPC HTTP server")?;
-
-    Ok(handle)
-}

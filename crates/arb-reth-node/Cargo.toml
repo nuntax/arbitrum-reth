@@ -91,7 +91,7 @@ reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
-# D.5: eth_* RPC layer (receipt converter + serve_rpc helper), now in the arb-reth-rpc crate.
+# D.5: Arbitrum RPC converters (receipt/rpc converters), consumed by the canonical RpcAddOns wiring.
 arb-reth-rpc = { path = "../arb-reth-rpc" }
 arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af" }
 arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af", features = ["reth-compat"] }

@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Arbitrum `eth_*` RPC layer: the `ArbReceiptConverter` (surfaces `gas_used_for_l1`) and the
-# standalone `serve_rpc` helper. Intentionally isolated from `RpcAddOns` and the engine so it can
-# be swapped for `RpcAddOns`-based wiring later. Split out of `arb-reth-node`.
+# Arbitrum RPC converters: `ArbReceiptConverter` / `ArbRpcConverter` (surface `gas_used_for_l1`),
+# consumed by reth's canonical `RpcAddOns` eth-api builder in `arb-reth-node::addons`.
+# Split out of `arb-reth-node`.
 
 [dependencies]
 arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f1e74b02952b0716801d4c20ad2e893c7b3992af", default-features = false, features = ["reth"] }

@@ -6,8 +6,9 @@ license.workspace = true
 authors.workspace = true
 
 # Stage F: L1 inbox derivation. Decodes SequencerInbox batches (blob + calldata)
-# into the canonical MessageWithMetadata stream (the half arbitrum-reth lacks).
-# Pure offline decoder (no network I/O). See docs/stage-f-handoff.md.
+# into the canonical MessageWithMetadata stream: the trustless-sync half that lets the
+# node reach tip standalone from L1. Pure offline decoder (no network I/O).
+# See docs/stage-f-handoff.md.
 
 [dependencies]
 # Arbitrum message types from arb-alloy; alloy version unifies with reth's workspace.
