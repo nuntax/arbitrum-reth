@@ -43,6 +43,7 @@ fn arb_node_call(arb: ArbPrecompilesEnum, input: PrecompileInput<'_>) -> Precomp
         value,
         is_static,
         bytecode_address,
+        target_address,
         mut internals,
         reservoir,
         ..
@@ -53,6 +54,7 @@ fn arb_node_call(arb: ArbPrecompilesEnum, input: PrecompileInput<'_>) -> Precomp
         caller,
         value,
         bytecode_address,
+        acting_address: target_address,
         is_static,
     };
     // `PrecompileInput` carries no EVM call depth; default to top-level. Only `ArbSys.isTopLevelCall`
