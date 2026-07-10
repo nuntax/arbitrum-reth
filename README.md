@@ -2,7 +2,7 @@
 
 An Arbitrum One execution and derivation node built on [reth](https://github.com/paradigmxyz/reth), with a custom Arbitrum revm for the state transition. It derives the L2 chain from L1 (sequencer batches, the delayed inbox, and post-Dencun blobs), executes it with ArbOS semantics, and rebuilds Arbitrum One state from Nitro genesis, checking every block against canonical Nitro.
 
-> **This is an experimental research prototype, not production software.** It is a single-developer, work-in-progress reimplementation of an Arbitrum node. All it does today is replay Arbitrum One history from L1 and check each block against canonical Nitro; it has never run against the live sequencer feed, makes no correctness, stability, or API guarantees, is unaudited, and should not be relied on for anything real or used to secure funds. It has bugs, and parity divergences are still being found and fixed block by block. Expect it to break.
+> **This is an experimental research prototype, not production software.** It is a single-developer, work-in-progress reimplementation of an Arbitrum node. It replays Arbitrum One history from L1 and follows the live sequencer feed, checking each block against canonical Nitro. It makes no correctness, stability, or API guarantees, is unaudited, and should not be relied on for anything real or used to secure funds. It has bugs, and parity divergences are still being found and fixed block by block. Expect it to break.
 
 ## Background
 
@@ -24,10 +24,10 @@ Standalone is the point of it. Other Arbitrum execution clients are as the namin
 - `arb-reth-evm`: bridges `arb_revm` into reth's `ConfigureEvm`, so the executor runs inside reth's block-building path.
 - `arb-reth-engine`: the block producer. Mints execute-to-derive blocks through reth's engine tree, reads parent state through an in-memory overlay, and can compute the state root in parallel.
 - `arb-reth-node`: the node skeleton, launcher, and binaries. Wires Arbitrum primitives into reth's `NodeTypes`, stands up the database and provider, and drives the sync.
-- `arb-reth-rpc`: an `eth_*` RPC layer with Arbitrum receipt fields (for example `gasUsedForL1`).
+- `arb-reth-rpc`: Arbitrum RPC converters (receipt fields like `gasUsedForL1`), wired into reth's canonical `RpcAddOns`. The node serves the full module fleet (`eth`/`net`/`web3`/`txpool`/`trace`/`debug`, including `eth_getLogs`) over HTTP and WebSocket through reth's own RPC stack.
 - `arb-reth-genesis`: imports the Nitro genesis state and verifies it.
 
-Binaries live under `arb-reth-node/src/bin`: `arb-reth` (the node), `arb-rewind` (roll the database back to a block), `arb-snapshot-import` / `arb-snapshot-read`, and `dump-blocks`.
+The `arb-reth` binary exposes subcommands: `node` (run the node), `snapshot import` / `snapshot read`, `genesis verify`, `rewind` (roll the database back to a block), and `dump-blocks`.
 
 ## Performance
 
@@ -40,14 +40,13 @@ Binaries live under `arb-reth-node/src/bin`: `arb-reth` (the node), `arb-rewind`
 
 Experimental, and early. The current goal is a proof-of-concept full sync of Arbitrum One from Nitro genesis (L2 block 22207817), replaying every block and checking the state root against canonical Nitro. It is not meant to run as an archive node; history is pruned as the parity check passes. It is not a finished node and is not close to one.
 
-~20M blocks have replayed clean from genesis. Divergences from Nitro are found as the sync advances, and are now extremely rare.
+The full Nitro genesis state root reproduces canonical exactly, over all ~1.27M genesis accounts. From there, roughly 20M blocks have replayed with block-for-block parity; divergences from Nitro are found as the sync advances, and are now extremely rare.
 
-The repo includes a Nitro snapshot converter that turns a Nitro state snapshot into a reth database. Nitro keys state by hash (no preimages), so arb-reth serves execution through a hashed-state access layer rather than reth's plain-state tables. One issue, reth's RPC reads plain state, so state RPC (`eth_getBalance`, `eth_call`) is not functional yet, though block and header queries work.
+The repo includes a Nitro snapshot converter that turns a Nitro state snapshot into a reth database. Nitro keys state by hash (no preimages), so arb-reth runs on reth's hashed-state (storage v2) tables. reth forward-hashes the address on read, so point-query state RPC (`eth_getBalance`, `eth_getStorageAt`, `eth_getCode`, `eth_call`, traces, logs) works directly against a converted snapshot. The one gap is whole-state enumeration by address (for example `debug_dumpState`), which needs `keccak(address)` preimages that Nitro snapshots do not ship, the same limitation as a default Nitro node.
 
-Execution from the live sequencer feed has not run yet. The node is wired to consume feed messages, and the L1 derivation runtime pushes derived messages through that same path, but the sync is still far from the tip, so the real-time feed-following mode is unexercised so far. Everything to date is historical replay derived from L1.
+The node follows the live sequencer feed. A feed follower and the L1-derivation hand-off drive the same block-production path; validated against a local Nitro test node, the derived and feed-followed blocks match canonical bit-for-bit while riding the live tip in lockstep. On Arbitrum One the from-genesis sync is still far from the tip, so mainnet tip-following waits on either finishing the replay or bootstrapping from a snapshot.
 
-Progress on the sync is mostly gated by hardware and budget. A full replay wants fast NVMe and a lot of RAM to keep the working set hot, which means renting a beefy VPS, and with limited funds available that is the practical constraint on how fast this moves. 
-Right now I am working on mitigating that by discarding any historical state and running the sync on my laptop. This, however, is explicitly not how a normal node would operate.
+Progress on the sync is mostly gated by hardware and budget. A full replay wants fast NVMe and a lot of RAM to keep the working set hot, and with limited funds that is the practical constraint on how fast this moves. Work happens across a mix of a cheap VPS and my laptop, discarding historical state to keep the working set small. This is explicitly not how a normal node would operate.
 
 ## Building and running
 
