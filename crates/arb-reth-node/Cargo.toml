@@ -127,3 +127,8 @@ reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b0
 
 # engine_spike / engine: Tier-1 engine-tree deps live in [dependencies] now (used by engine.rs).
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+criterion = "0.5"
+
+[[bench]]
+name = "block_production"
+harness = false
