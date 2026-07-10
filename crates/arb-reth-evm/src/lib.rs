@@ -25,7 +25,7 @@ pub mod tx;
 pub use tx::ArbTx;
 
 pub mod precompiles;
-pub use precompiles::arb_precompiles_map;
+pub use precompiles::ArbPrecompilesMap;
 
 pub mod block;
 pub use block::{
@@ -60,7 +60,7 @@ use arb_revm::ArbSpecId;
 /// The `arb_revm` EVM type this owns: the ArbOS EVM over [`ArbContext<DB>`] with the Arbitrum
 /// precompile set.
 type ArbRethEvm<DB, I> =
-    arb_revm::ArbEvm<ArbContext<DB>, I, EthInstructions<EthInterpreter, ArbContext<DB>>, PrecompilesMap>;
+    arb_revm::ArbEvm<ArbContext<DB>, I, EthInstructions<EthInterpreter, ArbContext<DB>>, ArbPrecompilesMap>;
 
 /// EVM error surfaced by the Arbitrum bridge. Matches `arb_revm`'s `ArbError`:
 /// `EVMError<DBError, InvalidTransaction>`.
@@ -162,7 +162,7 @@ where
         (
             &self.inner.0.ctx.journaled_state.database,
             &self.inner.0.inspector,
-            &self.inner.0.precompiles,
+            self.inner.0.precompiles.precompiles(),
         )
     }
 
@@ -170,7 +170,7 @@ where
         (
             &mut self.inner.0.ctx.journaled_state.database,
             &mut self.inner.0.inspector,
-            &mut self.inner.0.precompiles,
+            self.inner.0.precompiles.precompiles_mut(),
         )
     }
 }
@@ -215,12 +215,13 @@ impl EvmFactory for ArbEvmFactory {
         evm_env: EvmEnv<ArbSpecId, BlockEnv>,
     ) -> Self::Evm<DB, NoOpInspector> {
         // `create_evm` must return `Evm<DB, NoOpInspector>`, so pass an explicit `NoOpInspector`
-        // rather than the `()` default of `build_arb`. Swap in the `PrecompilesMap` required by
-        // `ConfigureEvm` (ArbOS precompiles re-homed onto `DynPrecompile`s).
+        // rather than the `()` default of `build_arb`. Swap in the ArbOS precompile provider
+        // (dispatches ArbOS addresses with the full `ArbContext`; exposes a `PrecompilesMap` to
+        // satisfy `ConfigureEvm`).
         let spec = evm_env.cfg_env.spec;
         let inner = Self::build_ctx(db, evm_env)
             .build_arb_with_inspector(NoOpInspector {})
-            .with_precompiles(arb_precompiles_map(spec));
+            .with_precompiles(ArbPrecompilesMap::new(spec));
         ArbEvm::new(inner, false)
     }
 
@@ -233,7 +234,7 @@ impl EvmFactory for ArbEvmFactory {
         let spec = evm_env.cfg_env.spec;
         let inner = Self::build_ctx(db, evm_env)
             .build_arb_with_inspector(inspector)
-            .with_precompiles(arb_precompiles_map(spec));
+            .with_precompiles(ArbPrecompilesMap::new(spec));
         ArbEvm::new(inner, true)
     }
 }

@@ -122,12 +122,11 @@ fn arb_evm_factory_transact_matches_arb_revm() {
     assert_eq!(evm.chain_id(), CHAIN_ID);
 }
 
-/// End-to-end proof of the node-path precompile bridge: a tx that CALLs `ArbSys.arbOSVersion()`
-/// executes through `PrecompilesMap` → `DynPrecompile` → `run_dispatch`-over-`EvmInternals` and
-/// must match the in-EVM `arb_revm` oracle bit-for-bit in both output and gas. The `arbos_version`
-/// slot is seeded to a known non-default value, proving the `ArbInternals` adapter actually
-/// `sload`s the correct slot (not a coincidental zero) and that gas is preserved through the
-/// `InterpreterResult` → `PrecompileResult` conversion.
+/// End-to-end proof of the node-path precompile provider: a tx that CALLs `ArbSys.arbOSVersion()`
+/// executes through `ArbPrecompilesMap` → `run_dispatch` over the full `ArbContext` and must match
+/// the in-EVM `arb_revm` oracle bit-for-bit in both output and gas. The `arbos_version` slot is
+/// seeded to a known non-default value, proving the provider actually `sload`s the correct slot
+/// (not a coincidental zero) and that gas is preserved.
 #[test]
 fn arbos_precompile_through_precompiles_map_matches_oracle() {
     use arb_revm::ArbosState;
@@ -178,7 +177,7 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
     let mut oracle_evm = octx.build_arb();
     let oracle = oracle_evm.transact(call_tx()).expect("oracle precompile call");
 
-    // Bridge: ArbEvmFactory (node PrecompilesMap path).
+    // Bridge: ArbEvmFactory (node ArbPrecompilesMap provider path).
     let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
     let mut bridge_evm = ArbEvmFactory.create_evm(seed_db(), evm_env);
     let bridge = bridge_evm

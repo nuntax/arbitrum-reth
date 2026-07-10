@@ -21,8 +21,8 @@
 //!
 //! reth's [`ConfigureEvm`](reth_evm::ConfigureEvm) requires `EvmFactory<Precompiles = PrecompilesMap,
 //! Tx: TransactionEnvMut>`. Both hold: `ArbTx` impls `TransactionEnvMut` (see `tx.rs`), and
-//! `ArbEvmFactory::Precompiles` is `PrecompilesMap` (ArbOS precompiles re-homed onto alloy-evm's
-//! `DynPrecompile`/`EvmInternals` model via `crate::precompiles::arb_precompiles_map`). The
+//! `ArbEvmFactory::Precompiles` is `PrecompilesMap` (exposed by [`crate::precompiles::ArbPrecompilesMap`],
+//! the actual revm provider, which dispatches ArbOS addresses with the full `ArbContext`). The
 //! [`ConfigureEvm`] impl is at the bottom of this file; per-header logic lives in the inherent
 //! methods below, which the trait methods delegate to.
 
