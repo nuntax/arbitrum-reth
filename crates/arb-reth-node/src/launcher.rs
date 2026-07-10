@@ -19,8 +19,7 @@ use eyre::eyre;
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
-use reth_network_api::noop::NoopNetwork;
-use reth_node_api::{FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter};
+use reth_node_api::{AddOnsContext, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter};
 use reth_node_builder::{
     AddOns, LaunchContext, LaunchNode, Node, NodeBuilderWithComponents, NodeComponents,
     NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter,
@@ -39,18 +38,12 @@ use reth_storage_api::{
     StorageSettingsCache,
 };
 use reth_tasks::TaskExecutor;
-use reth_transaction_pool::noop::NoopTransactionPool;
 use reth_trie_db::ChangesetCache;
 use tokio::sync::oneshot;
 
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
 
 use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning};
-use arb_reth_rpc::serve_rpc;
-use crate::pooled::ArbPooledTransaction;
-
-type ArbNoopNetwork = NoopNetwork;
-type ArbNoopPool = NoopTransactionPool<ArbPooledTransaction>;
 
 /// Handle returned by `ArbLauncher` after the node has been launched.
 ///
@@ -106,7 +99,7 @@ impl<N, DB, T, CB>
 where
     N: Node<RethFullAdapter<DB, N>>
         + NodeTypesForProvider
-        + NodeTypes<Primitives = ArbPrimitives, ChainSpec: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + reth_chainspec::Hardforks>,
+        + NodeTypes<Primitives = ArbPrimitives, Payload = arb_reth_engine::ArbPayloadTypes, ChainSpec: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + reth_chainspec::Hardforks>,
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
     T: FullNodeTypes<
         Types = N,
@@ -117,6 +110,7 @@ where
     <CB::Components as NodeComponents<T>>::Evm: ConfigureEvm<Primitives = ArbPrimitives>
         + Into<arb_reth_evm::ArbEvmConfig>
         + Clone,
+    CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
     NodeTypesWithDBAdapter<N, DB>: ProviderNodeTypes<Primitives = ArbPrimitives>,
     // Explicit equality bounds to help the compiler resolve the associated type projections
     // from NodeTypesWithDBAdapter<N, DB>.
@@ -163,7 +157,7 @@ impl ArbLauncher {
     where
         N: Node<RethFullAdapter<DB, N>>
             + NodeTypesForProvider
-            + NodeTypes<Primitives = ArbPrimitives, ChainSpec: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + reth_chainspec::Hardforks>,
+            + NodeTypes<Primitives = ArbPrimitives, Payload = arb_reth_engine::ArbPayloadTypes, ChainSpec: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + reth_chainspec::Hardforks>,
         DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
         T: FullNodeTypes<
             Types = N,
@@ -174,6 +168,7 @@ impl ArbLauncher {
         <CB::Components as NodeComponents<T>>::Evm: ConfigureEvm<Primitives = ArbPrimitives>
             + Into<arb_reth_evm::ArbEvmConfig>
             + Clone,
+        CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
         NodeTypesWithDBAdapter<N, DB>: ProviderNodeTypes<Primitives = ArbPrimitives>,
         NodeTypesWithDBAdapter<N, DB>: NodeTypes<ChainSpec = <N as NodeTypes>::ChainSpec, Primitives = ArbPrimitives>,
         NodeTypesWithDBAdapter<N, DB>: reth_node_api::NodeTypesWithDB<DB = DB>,
@@ -188,6 +183,22 @@ impl ArbLauncher {
             config,
         } = target;
         let NodeHooks { on_component_initialized, .. } = hooks;
+
+        // Drive RPC config from the explicit `rpc_addr`: canonical `RpcAddOns` reads addresses from
+        // `NodeConfig.rpc`, not an arg. Enable http+ws with the full module fleet; this node is
+        // self-driven from L1 derivation, so the auth/engine server is disabled.
+        let mut config = config;
+        if let Some(addr) = rpc_addr {
+            config.rpc.http = true;
+            config.rpc.http_addr = addr.ip();
+            config.rpc.http_port = addr.port();
+            config.rpc.http_api = Some(reth_rpc_server_types::RpcModuleSelection::All);
+            config.rpc.ws = true;
+            config.rpc.ws_addr = addr.ip();
+            config.rpc.ws_port = addr.port();
+            config.rpc.ws_api = Some(reth_rpc_server_types::RpcModuleSelection::All);
+            config.rpc.disable_auth_server = true;
+        }
 
         let changeset_cache = ChangesetCache::new();
         let disabled_stages = N::disabled_stages();
@@ -315,19 +326,26 @@ impl ArbLauncher {
             },
         );
 
-        let rpc_handle = if let Some(addr) = rpc_addr {
-            let runtime = ctx.task_executor().clone();
-            let rpc_provider = provider.clone();
-            let handle = serve_rpc(
-                rpc_provider,
-                ArbNoopPool::new(),
-                ArbNoopNetwork::default().with_chain_id(chain_id),
-                arb_evm_config,
-                addr,
-                runtime,
-            )
-            .await?;
-            Some(handle)
+        // Serve RPC through reth's canonical `RpcAddOns::launch_add_ons` (full fleet + ws +
+        // subscriptions via `NodeConfig.rpc`), not the bespoke server. This node is self-driven
+        // from L1 derivation, so the beacon-engine handle is a stub (dangling receiver: engine_*
+        // calls would return `EngineUnavailable`), and the auth/engine server is disabled, so
+        // nothing ever reaches it.
+        let rpc_handle = if rpc_addr.is_some() {
+            let (engine_tx, _engine_rx) = tokio::sync::mpsc::unbounded_channel();
+            let beacon_engine_handle =
+                reth_engine_primitives::ConsensusEngineHandle::new(engine_tx);
+            let add_ons_ctx = AddOnsContext {
+                node: ctx.node_adapter().clone(),
+                config: ctx.node_config(),
+                beacon_engine_handle,
+                engine_events: reth_tokio_util::EventSender::default(),
+                jwt_secret: ctx.auth_jwt_secret()?,
+            };
+            let handle = crate::addons::arb_add_ons()
+                .launch_add_ons(add_ons_ctx)
+                .await?;
+            Some(handle.rpc_server_handles.rpc)
         } else {
             None
         };

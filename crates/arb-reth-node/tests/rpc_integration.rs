@@ -26,9 +26,15 @@
             serde_json::from_str(&json).expect("parse BroadcastFeedMessage");
 
         let task_executor = Runtime::test();
+        // The driver dedups by sequence number, so the two messages must be sequential (a fresh
+        // genesis DB has genesis_block 0, so the first digested message is index 1).
         let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
-        tx.send(feed_msg.clone()).await.unwrap();
-        tx.send(feed_msg.clone()).await.unwrap();
+        let mut m1 = feed_msg.clone();
+        m1.sequence_number = 1;
+        let mut m2 = feed_msg.clone();
+        m2.sequence_number = 2;
+        tx.send(m1).await.unwrap();
+        tx.send(m2).await.unwrap();
         drop(tx);
 
         let datadir = reth_db::test_utils::tempdir_path();
@@ -52,6 +58,7 @@
         let launcher = ArbLauncher {
             ctx: reth_node_builder::LaunchContext::new(task_executor.clone(), data_dir),
             chain_id: arb_reth_node::ARB_ONE_CHAIN_ID,
+            genesis_block: 0,
             tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
             messages: rx,
             rpc_addr: Some(rpc_addr),
@@ -104,6 +111,57 @@
         let balance = U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16)
             .expect("parse balance hex");
         assert!(balance > U256::ZERO, "deposit recipient must have non-zero balance");
+
+        // --- Full RPC module fleet (Path B): before this change only `eth` was registered, so
+        // net/web3/txpool/trace/debug returned method-not-found. Each call below fails if its
+        // module is absent, proving the fleet is live on our engine-free, hashed-state node.
+
+        // net module: chain id as a decimal string. Canonical `RpcAddOns` derives this from the
+        // booted chain spec (MAINNET in this fixture); in production the spec is the Arbitrum spec,
+        // so this reports 42161. Asserting against the fixture's id keeps the test spec-agnostic.
+        let net_version: String = client
+            .request("net_version", jsonrpsee::rpc_params![])
+            .await
+            .expect("net_version should respond (net module registered)");
+        assert_eq!(net_version, MAINNET.chain().id().to_string());
+
+        // web3 module: non-empty client version string.
+        let client_version: String = client
+            .request("web3_clientVersion", jsonrpsee::rpc_params![])
+            .await
+            .expect("web3_clientVersion should respond (web3 module registered)");
+        assert!(!client_version.is_empty(), "client version must be non-empty");
+
+        // txpool module: {pending, queued} (zero on our noop pool, but the module must serve).
+        let txpool_status: serde_json::Value = client
+            .request("txpool_status", jsonrpsee::rpc_params![])
+            .await
+            .expect("txpool_status should respond (txpool module registered)");
+        assert!(txpool_status.get("pending").is_some(), "txpool_status must have a pending field");
+
+        // eth filter path: getLogs over the produced range returns an array (empty is fine).
+        let logs: serde_json::Value = client
+            .request(
+                "eth_getLogs",
+                jsonrpsee::rpc_params![serde_json::json!({
+                    "fromBlock": "0x0",
+                    "toBlock": "latest"
+                })],
+            )
+            .await
+            .expect("eth_getLogs should respond");
+        assert!(logs.is_array(), "eth_getLogs must return an array");
+
+        // debug module: re-execute block 1 through arb_revm with the default struct tracer. This
+        // is the meaningful proof that debug/trace execution works on our hashed-state node.
+        let traces: serde_json::Value = client
+            .request(
+                "debug_traceBlockByNumber",
+                jsonrpsee::rpc_params!["0x1", serde_json::json!({})],
+            )
+            .await
+            .expect("debug_traceBlockByNumber should respond (debug module + arb_revm tracing)");
+        assert!(traces.is_array(), "debug_traceBlockByNumber must return an array of traces");
 
         drop(rpc_handle);
     }

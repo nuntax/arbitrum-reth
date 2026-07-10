@@ -52,11 +52,15 @@ pub use launcher::{ArbLauncher, ArbNodeHandle};
 pub mod executor;
 pub use executor::ArbExecutorBuilder;
 
+pub mod addons;
+pub use addons::{ArbEthApiBuilder, ArbPayloadValidatorBuilder};
+
 pub mod pooled;
 pub use pooled::ArbPooledTransaction;
 
-// The `eth_*` RPC layer now lives in the `arb-reth-rpc` crate; re-export for API stability.
-pub use arb_reth_rpc::{ArbReceiptConverter, serve_rpc};
+// The Arbitrum RPC converters live in the `arb-reth-rpc` crate; re-export for API stability.
+// RPC is now served through reth's canonical `RpcAddOns` (see `addons`), not a bespoke server.
+pub use arb_reth_rpc::{ArbReceiptConverter, ArbRpcConverter};
 
 // The engine-tree driver, the payload-type stubs, and the minimal engine validator now live in the
 // `arb-reth-engine` crate; re-export for API stability.

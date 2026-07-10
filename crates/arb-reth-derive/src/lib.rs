@@ -1,8 +1,8 @@
 //! `arb-reth-derive`: L1 inbox derivation.
 //!
 //! Decodes Arbitrum L1 `SequencerInbox` batches into the canonical
-//! [`MessageWithMetadata`] stream (the trustless-sync half that `arbitrum-reth`
-//! lacks). Covers the blob path (EIP-4844) and calldata.
+//! [`MessageWithMetadata`] stream: the trustless-sync half that lets the node reach
+//! tip standalone from L1. Covers the blob path (EIP-4844) and calldata.
 //!
 //! Pipeline:
 //! ```text
