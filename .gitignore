@@ -1,6 +1,3 @@
 /target
 Cargo.lock
 *.pyc
-
-# local run config (may contain L1 keys)
-scripts/run.env
