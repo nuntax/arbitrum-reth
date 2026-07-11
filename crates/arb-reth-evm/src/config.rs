@@ -131,6 +131,10 @@ impl ArbEvmConfig {
         cfg.disable_balance_check = false;
         cfg.disable_eip7623 = true;
         cfg.disable_eip3541 = spec.is_enabled_in(ArbSpecId::ARBOS_30);
+        // EIP-7825 caps a single tx at 2^24 gas from Osaka (ArbOS 50+). Nitro exempts Arbitrum from
+        // that cap (state_transition.go: `!IsArbitrum() && isOsaka && ...`), so disable it or the
+        // node would drop high-gas L2 txs (e.g. 60M-gas deploys) that Nitro executes.
+        cfg.tx_gas_limit_cap = Some(u64::MAX);
         cfg
     }
 

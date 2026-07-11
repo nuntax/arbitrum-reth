@@ -17,7 +17,7 @@ alloy-primitives = "1"
 alloy-rlp = { workspace = true }
 # brotli is re-exported from arb_revm (which vendors it) so both crates share one brotli
 # source and avoid a lockfile collision. BUSL-licensed; see the arb_revm NOTICE.
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "f42557f8135b80323a96bf2d4109769f989f1b7a" }
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "dc999ed381da305cabd0768b8c5a10adafce3353" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
