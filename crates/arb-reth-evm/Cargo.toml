@@ -9,7 +9,7 @@ authors.workspace = true
 # extension points. See docs/arb-reth-roadmap.md.
 
 [dependencies]
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "8cdad08e22cbfe6ccd03955bdf9cb2406091e14f", features = ["stylus"] } # pure revm/ArbOS; stylus feature is self-contained (vendors Nitro's wasmer)
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "f42557f8135b80323a96bf2d4109769f989f1b7a", features = ["stylus"] } # pure revm/ArbOS; stylus feature is self-contained (vendors Nitro's wasmer)
 revm = { workspace = true }
 
 # Arbitrum consensus primitives (ArbTxEnvelope, ArbReceiptEnvelope, ArbHeaderInfo). reth-trait
