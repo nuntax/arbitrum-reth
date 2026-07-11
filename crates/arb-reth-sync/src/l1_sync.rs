@@ -173,6 +173,28 @@ where
     type Inflight = (u64, u64, JoinHandle<Result<Vec<(DeliveredBatch, Vec<u8>)>, arb_reth_l1::L1Error>>);
     let mut inflight: VecDeque<Inflight> = VecDeque::new();
 
+    // A ready empty window: an L1 range known (via the batchCount gate below) to contain no batches,
+    // so it needs no `getLogs`/payload fetch. It flows through the same consume path as a real empty
+    // window (advances the cursor + checkpoints), collapsing barren stretches into one step.
+    let spawn_empty = || {
+        tokio::spawn(async {
+            Ok::<Vec<(DeliveredBatch, Vec<u8>)>, arb_reth_l1::L1Error>(Vec::new())
+        })
+    };
+
+    // Batch-count gate (Nitro `InboxReader.GetBatchCount`): batches the `SequencerInbox` has posted
+    // as of `spawn_cursor - 1`. A range that does not raise this count delivered no batches, hence no
+    // L2 blocks, so it is skipped without a `getLogs` scan. `head_batch_count` caches it at `safe_head`.
+    let mut seen_batch_count = if cfg.start_block == 0 {
+        0
+    } else {
+        seq_reader
+            .batch_count(cfg.start_block - 1)
+            .await
+            .map_err(|e| eyre!("batchCount(start_block-1): {e}"))?
+    };
+    let mut head_batch_count = 0u64;
+
     loop {
         if cfg.end_block.is_some_and(|end| consume_cursor > end) {
             break;
@@ -186,20 +208,68 @@ where
                 .await
                 .map_err(|e| eyre!("L1 get_block_number: {e}"))?;
             safe_head = head.saturating_sub(cfg.confirmations);
+            head_batch_count = seq_reader
+                .batch_count(safe_head)
+                .await
+                .map_err(|e| eyre!("batchCount(safe_head): {e}"))?;
         }
 
-        // Fill the prefetch pipeline: spawn concurrent `resolve_batches` for the next windows.
+        // Fill the prefetch pipeline. Instead of blindly scanning every fixed window with `getLogs`
+        // (crippling on a sparse chain like early Robinhood, where most windows hold no batches), gate
+        // each step on the cheap `batchCount()` view: scan for real only where the count rises, and
+        // collapse barren stretches into a single empty window (skipping straight to the next batch's
+        // block by binary search). Dense chains (Arb One) pay one extra view call per productive window.
+        let window = cfg.batch_window.max(1);
         while inflight.len() < prefetch && spawn_cursor <= safe_head {
             if cfg.end_block.is_some_and(|end| spawn_cursor > end) {
                 break;
             }
-            let mut to = (spawn_cursor + cfg.batch_window.max(1) - 1).min(safe_head);
-            if let Some(end) = cfg.end_block {
-                to = to.min(end);
+            let from = spawn_cursor;
+            // Upper bound for this step: the safe head, capped by any --l1-end-block.
+            let scan_hi = cfg.end_block.map_or(safe_head, |end| end.min(safe_head));
+            // Batch count at the first getLogs-sized window's end, and at the whole step's end.
+            let win_to = (from + window - 1).min(scan_hi);
+            let win_batch_count = if win_to == safe_head {
+                head_batch_count
+            } else {
+                seq_reader.batch_count(win_to).await.map_err(|e| eyre!("batchCount(win_to): {e}"))?
+            };
+
+            if win_batch_count > seen_batch_count {
+                // The window delivers batches: scan it for real (prefetch the getLogs + payload fetch).
+                let (s, b) = (seq_reader.clone(), beacon.clone());
+                let handle =
+                    tokio::spawn(async move { resolve_batches(&s, b.as_ref(), from, win_to).await });
+                inflight.push_back((from, win_to, handle));
+                seen_batch_count = win_batch_count;
+                spawn_cursor = win_to + 1;
+                continue;
             }
-            let (s, b, from) = (seq_reader.clone(), beacon.clone(), spawn_cursor);
-            let handle = tokio::spawn(async move { resolve_batches(&s, b.as_ref(), from, to).await });
-            inflight.push_back((from, to, handle));
+
+            // Window is barren. How far does the barren stretch reach?
+            let hi_batch_count = if scan_hi == safe_head {
+                head_batch_count
+            } else {
+                seq_reader.batch_count(scan_hi).await.map_err(|e| eyre!("batchCount(scan_hi): {e}"))?
+            };
+            let to = if hi_batch_count == seen_batch_count {
+                // No batches anywhere up to scan_hi: one empty window over the whole stretch.
+                scan_hi
+            } else {
+                // Batches exist beyond win_to: binary-search the next batch's block, skip up to it.
+                seq_reader
+                    .first_block_with_batch_count_above(win_to + 1, scan_hi, seen_batch_count)
+                    .await
+                    .map_err(|e| eyre!("first_block_with_batch_count_above: {e}"))?
+                    - 1
+            };
+            if to + 1 - from > window {
+                tracing::info!(
+                    target: "arb-reth::l1-sync", from, to, blocks = to + 1 - from,
+                    "skipped barren L1 range (no new batches)",
+                );
+            }
+            inflight.push_back((from, to, spawn_empty()));
             spawn_cursor = to + 1;
         }
 

@@ -69,6 +69,57 @@ impl<P: Provider> SequencerInboxReader<P> {
         self.address
     }
 
+    /// `batchCount()` view (selector `0x06f13056`): total batches the `SequencerInbox` has posted
+    /// as of `at_block`. A cheap `eth_call` used to skip barren L1 ranges without a `getLogs` scan
+    /// (mirrors Nitro `InboxReader`'s `sequencerInbox.GetBatchCount(atBlock)` gate): if the count has
+    /// not risen across a range, that range delivered no batches, so it produced no L2 blocks.
+    pub async fn batch_count(&self, at_block: u64) -> Result<u64, L1Error> {
+        use alloy_eips::BlockId;
+        use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+        const BATCH_COUNT_SELECTOR: [u8; 4] = [0x06, 0xf1, 0x30, 0x56];
+        let tx = TransactionRequest::default().to(self.address).input(TransactionInput::new(
+            alloy_primitives::Bytes::from_static(&BATCH_COUNT_SELECTOR),
+        ));
+        let out = self
+            .provider
+            .call(tx)
+            .block(BlockId::from(at_block))
+            .await
+            .map_err(|e| L1Error::Rpc(e.to_string()))?;
+        if out.len() < 32 {
+            // Empty return: the SequencerInbox has no code at this block (queried at/before its
+            // deploy block), so it has posted zero batches. A successful call to a deployed contract
+            // always returns a full 32-byte word.
+            return Ok(0);
+        }
+        // uint256; batch counts fit u64 (right-aligned big-endian).
+        Ok(u64::from_be_bytes(out[24..32].try_into().unwrap()))
+    }
+
+    /// Smallest L1 block in `[lo, hi]` whose `batchCount()` exceeds `have` — i.e. the delivery block
+    /// of the next batch after `have`. Binary search over the monotonic `batch_count` view, so it
+    /// pins the start of a batch cluster in `O(log(hi - lo))` cheap `eth_call`s instead of striding
+    /// `getLogs` windows across a barren gap. The caller must have established `batch_count(hi) >
+    /// have` (there really is a batch to find) and `batch_count(lo - 1) <= have`.
+    pub async fn first_block_with_batch_count_above(
+        &self,
+        lo: u64,
+        hi: u64,
+        have: u64,
+    ) -> Result<u64, L1Error> {
+        let mut lo = lo;
+        let mut hi = hi;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.batch_count(mid).await? > have {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Ok(lo)
+    }
+
     /// Fetch all `SequencerBatchDelivered` logs in the inclusive L1 block range.
     pub async fn batch_logs(&self, from_block: u64, to_block: u64) -> Result<Vec<Log>, L1Error> {
         let filter = Filter::new()
