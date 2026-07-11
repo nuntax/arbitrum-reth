@@ -47,6 +47,13 @@ pub struct DerivedRange {
 /// far larger than this).
 pub const DEFAULT_DELAYED_WINDOW: u64 = 10_000;
 
+/// Max batch resolutions to run concurrently within one window. Each blob batch is a chain of
+/// L1/beacon round-trips (posting-tx fetch, block fetch, ~768 KiB sidecar download), so resolving a
+/// window's batches serially made blob-chain sync latency-bound (a window stalled seconds while its
+/// blocks executed in milliseconds). Bounded so a dense window (Arb One posts many calldata batches
+/// per window) does not open an unbounded fan-out of RPC calls.
+const BATCH_RESOLVE_CONCURRENCY: usize = 8;
+
 /// Fetch and resolve every batch in the inclusive L1 block range, in ascending batch
 /// order, pairing each with its resolved payload bytes.
 ///
@@ -57,24 +64,37 @@ pub async fn resolve_batches<P: Provider>(
     from_block: u64,
     to_block: u64,
 ) -> Result<Vec<(DeliveredBatch, Vec<u8>)>, L1Error> {
+    use futures_util::stream::{StreamExt, TryStreamExt};
+
     let mut logs = seq_reader.batch_logs(from_block, to_block).await?;
     // getLogs is ordered already, but pin it: assemble relies on ascending batch order.
     logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
 
-    let mut out = Vec::with_capacity(logs.len());
-    for log in &logs {
-        let batch = seq_reader.resolve_batch(log).await?;
-        let payload = match &batch.payload {
-            BatchPayload::Calldata(p) => p.clone(),
-            BatchPayload::None => Vec::new(),
-            BatchPayload::Blob { versioned_hashes, block_number } => {
-                let beacon = beacon.ok_or(L1Error::Missing("beacon client for blob batch"))?;
-                seq_reader.resolve_blob_payload(*block_number, versioned_hashes, beacon).await?
-            }
-        };
-        out.push((batch, payload));
-    }
-    Ok(out)
+    // Resolve each batch's payload concurrently, preserving order (`buffered`). The dominant cost on
+    // a blob chain is the per-batch beacon/L1 round-trips; running a window's batches in parallel
+    // cuts its resolution latency from sum-of-batches to ~max-of-batches. (A named async fn, rather
+    // than an inline closure, keeps the per-future lifetimes elided cleanly for the spawned caller.)
+    let futs: Vec<_> = logs.iter().map(|log| resolve_one(seq_reader, beacon, log)).collect();
+    futures_util::stream::iter(futs).buffered(BATCH_RESOLVE_CONCURRENCY).try_collect().await
+}
+
+/// Resolve one batch log into `(batch, payload)`: decode the event, fetch the posting tx, and pull
+/// the payload from calldata, a separate event, or the beacon blob sidecars.
+async fn resolve_one<P: Provider>(
+    seq_reader: &SequencerInboxReader<P>,
+    beacon: Option<&BeaconClient>,
+    log: &alloy_rpc_types_eth::Log,
+) -> Result<(DeliveredBatch, Vec<u8>), L1Error> {
+    let batch = seq_reader.resolve_batch(log).await?;
+    let payload = match &batch.payload {
+        BatchPayload::Calldata(p) => p.clone(),
+        BatchPayload::None => Vec::new(),
+        BatchPayload::Blob { versioned_hashes, block_number } => {
+            let beacon = beacon.ok_or(L1Error::Missing("beacon client for blob batch"))?;
+            seq_reader.resolve_blob_payload(*block_number, versioned_hashes, beacon).await?
+        }
+    };
+    Ok((batch, payload))
 }
 
 /// Build a [`DelayedMap`] covering every delayed index in `[need_from, need_to)`.

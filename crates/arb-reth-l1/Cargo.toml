@@ -17,6 +17,9 @@ alloy-eips = { version = "2.0", default-features = false }
 alloy-sol-types = "1.6"
 alloy-provider = { version = "2.0", default-features = false }
 alloy-rpc-types-eth = { version = "2.0", default-features = false }
+# Concurrent (ordered, bounded) batch resolution within a window. Drives futures on the caller's
+# task (no spawn), so it needs no tokio runtime dep here.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 # Beacon REST client for blob sidecars (consensus layer; no JSON-RPC).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -103,8 +103,15 @@ impl<P: Provider> DelayedInboxReader<P> {
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<DelayedMessage>, L1Error> {
-        let metas = self.fetch_metas(from_block, to_block).await?;
-        let bodies = self.fetch_bodies(from_block, to_block).await?;
+        // The meta scan and the body scan are independent getLogs; run them concurrently so a
+        // delayed-consuming window's tail is one round-trip deep, not three (this scan sits on the
+        // sequential consume path, so its latency directly gates sync throughput on a chain with
+        // frequent delayed messages).
+        let (metas, bodies) = futures_util::future::try_join(
+            self.fetch_metas(from_block, to_block),
+            self.fetch_bodies(from_block, to_block),
+        )
+        .await?;
 
         let mut out = Vec::with_capacity(metas.len());
         for event in metas.into_values() {
@@ -154,28 +161,49 @@ impl<P: Provider> DelayedInboxReader<P> {
     ) -> Result<BTreeMap<(u64, Address), Vec<u8>>, L1Error> {
         let mut bodies = BTreeMap::new();
 
+        // The inline-body and from-origin-body log scans are independent: run them concurrently.
         let inline = Filter::new()
             .event_signature(InboxMessageDelivered::SIGNATURE_HASH)
             .from_block(from_block)
             .to_block(to_block);
-        for log in self.get_logs(inline).await? {
+        let from_origin_filter = Filter::new()
+            .event_signature(InboxMessageDeliveredFromOrigin::SIGNATURE_HASH)
+            .from_block(from_block)
+            .to_block(to_block);
+        let (inline_logs, from_origin_logs) =
+            futures_util::future::try_join(self.get_logs(inline), self.get_logs(from_origin_filter))
+                .await?;
+
+        for log in inline_logs {
             let index = topic_u64(&log, "InboxMessageDelivered messageNum")?;
             let data = parse_inbox_message_data(&log.inner.data.data)?;
             bodies.insert((index, log.inner.address), data);
         }
 
-        let from_origin_filter = Filter::new()
-            .event_signature(InboxMessageDeliveredFromOrigin::SIGNATURE_HASH)
-            .from_block(from_block)
-            .to_block(to_block);
-        for log in self.get_logs(from_origin_filter).await? {
-            let index = topic_u64(&log, "InboxMessageDeliveredFromOrigin messageNum")?;
-            let emitter = log.inner.address;
-            let data = self.fetch_from_origin_body(&log).await?;
-            bodies.insert((index, emitter), data);
-        }
+        // Each from-origin body is a separate tx fetch; resolve them concurrently (order-independent,
+        // keyed by index+emitter).
+        use futures_util::stream::{StreamExt, TryStreamExt};
+        // Collect the per-log futures eagerly (not a lazy map in the stream) so the resulting future
+        // stays `Send` for the spawned sync task.
+        let body_futs: Vec<_> =
+            from_origin_logs.iter().map(|log| self.from_origin_body_entry(log)).collect();
+        let fetched: Vec<((u64, Address), Vec<u8>)> =
+            futures_util::stream::iter(body_futs).buffer_unordered(8).try_collect().await?;
+        bodies.extend(fetched);
 
         Ok(bodies)
+    }
+
+    /// `((index, emitter), body)` for one `InboxMessageDeliveredFromOrigin` log — the tx-calldata
+    /// body fetch, packaged for concurrent resolution in [`Self::fetch_bodies`].
+    async fn from_origin_body_entry(
+        &self,
+        log: &Log,
+    ) -> Result<((u64, Address), Vec<u8>), L1Error> {
+        let index = topic_u64(log, "InboxMessageDeliveredFromOrigin messageNum")?;
+        let emitter = log.inner.address;
+        let data = self.fetch_from_origin_body(log).await?;
+        Ok(((index, emitter), data))
     }
 
     async fn fetch_from_origin_body(&self, log: &Log) -> Result<Vec<u8>, L1Error> {
