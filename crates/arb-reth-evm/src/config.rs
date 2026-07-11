@@ -149,7 +149,6 @@ impl ArbEvmConfig {
         gas_limit: u64,
         basefee: u64,
         difficulty: U256,
-        prevrandao: Option<B256>,
     ) -> EvmEnv<ArbSpecId, BlockEnv> {
         let mut block = BlockEnv::default();
         block.number = U256::from(number);
@@ -158,7 +157,11 @@ impl ArbEvmConfig {
         block.gas_limit = gas_limit;
         block.basefee = basefee;
         block.difficulty = difficulty;
-        block.prevrandao = prevrandao;
+        // Arbitrum: geth NewEVMBlockContext sets Context.Random = BigToHash(header.Difficulty) when
+        // Difficulty != 0 (Nitro always sets L2 difficulty to 1), so the post-Merge PREVRANDAO (0x44)
+        // opcode returns the difficulty, NOT the mixHash. The mixHash carries ArbOS metadata
+        // (send_count / l1_block_number / arbos_version) and must never be exposed via 0x44.
+        block.prevrandao = Some(B256::from(difficulty.to_be_bytes::<32>()));
         EvmEnv::new(self.cfg_env(spec), block)
     }
 }
@@ -214,7 +217,6 @@ impl ArbEvmConfig {
             header.gas_limit(),
             header.base_fee_per_gas().unwrap_or_default(),
             header.difficulty(),
-            header.mix_hash(),
         )
     }
 
@@ -233,13 +235,10 @@ impl ArbEvmConfig {
             attributes.timestamp,
             attributes.gas_limit,
             parent.base_fee_per_gas().unwrap_or_default(),
-            // Nitro always sets L2 block difficulty to 1 (see `ArbBlockAssembler` + the `evm_env`
-            // re-exec path, which reads `header.difficulty()`=1). The `DIFFICULTY` opcode returns
-            // `block.difficulty` on pre-merge specs (ArbOS<11 → London), so passing `U256::ZERO`
-            // here made sync-produced blocks diverge from canonical the first time a tx reads
-            // DIFFICULTY. Must be 1.
+            // Nitro always sets L2 block difficulty to 1. build_evm_env derives block.prevrandao
+            // from this (geth Context.Random = BigToHash(difficulty)), so the DIFFICULTY/PREVRANDAO
+            // (0x44) opcode returns 1 on every spec, pre- and post-Merge.
             U256::from(1u64),
-            Some(attributes.prev_randao),
         )
     }
 
