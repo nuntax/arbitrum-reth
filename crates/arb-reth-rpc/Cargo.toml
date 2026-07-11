@@ -10,9 +10,9 @@ authors.workspace = true
 # Split out of `arb-reth-node`.
 
 [dependencies]
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "2d4f5b845a5b68f300d42f62795350ccc8471cd3", default-features = false, features = ["reth"] }
-arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "2d4f5b845a5b68f300d42f62795350ccc8471cd3" }
-arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "2d4f5b845a5b68f300d42f62795350ccc8471cd3", features = ["reth-compat"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "5e9ec82a6b7dcf8d06d24f75d6c2bb588dd7354a", default-features = false, features = ["reth"] }
+arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "5e9ec82a6b7dcf8d06d24f75d6c2bb588dd7354a" }
+arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "5e9ec82a6b7dcf8d06d24f75d6c2bb588dd7354a", features = ["reth-compat"] }
 arb-reth-evm = { path = "../arb-reth-evm", features = ["rpc"] }
 
 alloy-consensus = { version = "2.0", default-features = false }

@@ -89,6 +89,12 @@ fn main() -> eyre::Result<()> {
     // Idiomatic reth tracing; guard is held for the process lifetime.
     let _guard = RethTracer::new().init()?;
 
+    // rustls 0.23 carries both the aws-lc-rs and ring backends in our dep tree, so it can't pick a
+    // process-default CryptoProvider on its own; the first wss:// feed connect (connect_async builds
+    // a rustls ClientConfig) would otherwise panic with "no process-level CryptoProvider available".
+    // Install the aws-lc-rs provider once here. Err just means one is already installed, so ignore.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
 
     match cli.command {
