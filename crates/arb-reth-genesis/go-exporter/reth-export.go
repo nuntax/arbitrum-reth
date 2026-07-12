@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
 )
@@ -118,21 +119,32 @@ func main() {
 		//   A <accountHash> <nonce> <balanceHex> <codeHashHex> <storageRootHex>
 		//   C <codeHashHex> <codeHex>            (once per distinct non-empty code)
 		//   S <slotHash> <slotValueHex>          (belongs to the most recent A)
+		//
+		// Walk the account/storage TRIES directly (OpenTrie/OpenStorageTrie), not geth's flat
+		// snapshot layer. A pruned snapshot ships the head-state trie nodes but not the flat
+		// snapshot, so the snapshot-backed AccountIterator returns "account iterator: not
+		// supported". The trie walk works on any hash-scheme DB that retains the head state. The
+		// iterator keys are already the keccak-hashed account/slot keys, so no preimages are
+		// needed (and the produced state root is verified by `arb-reth snapshot import --expect`).
 		w := bufio.NewWriterSize(os.Stdout, 1<<20)
 		defer w.Flush()
 		seenCode := make(map[common.Hash]bool)
-		accIt, err := tdb.AccountIterator(header.Root, common.Hash{})
+		accTrie, err := sdb.OpenTrie(header.Root)
 		if err != nil {
-			fatal("account iterator", err)
+			fatal("open account trie", err)
 		}
-		defer accIt.Release()
+		accNodeIt, err := accTrie.NodeIterator(nil)
+		if err != nil {
+			fatal("account node iterator", err)
+		}
+		accIt := trie.NewIterator(accNodeIt)
 		var nAcc, nStor uint64
 		for accIt.Next() {
-			h := accIt.Hash()
-			acc, err := types.FullAccount(accIt.Account())
-			if err != nil {
+			var acc types.StateAccount
+			if err := rlp.DecodeBytes(accIt.Value, &acc); err != nil {
 				fatal("decode account", err)
 			}
+			h := common.BytesToHash(accIt.Key)
 			codeHash := common.BytesToHash(acc.CodeHash)
 			bal := "0"
 			if b := acc.Balance.Bytes(); len(b) > 0 {
@@ -145,29 +157,36 @@ func main() {
 				fmt.Fprintf(w, "C %x %x\n", codeHash, rawdb.ReadCode(db, codeHash))
 			}
 			if acc.Root != types.EmptyRootHash {
-				stIt, err := tdb.StorageIterator(header.Root, h, common.Hash{})
+				// `addr` only derives the storage-trie owner for the PATH scheme; on a hash-scheme
+				// DB the nodes are keyed purely by hash, so the zero address is correct here (we
+				// have no preimage to recover the real address, and don't need one).
+				storageTr, err := sdb.OpenStorageTrie(header.Root, common.Address{}, acc.Root, accTrie)
 				if err != nil {
-					fatal("storage iterator", err)
+					fatal("open storage trie", err)
 				}
+				stNodeIt, err := storageTr.NodeIterator(nil)
+				if err != nil {
+					fatal("storage node iterator", err)
+				}
+				stIt := trie.NewIterator(stNodeIt)
 				for stIt.Next() {
 					// Storage trie leaves are RLP(value); decode to the raw big-endian value bytes.
 					var val []byte
-					if err := rlp.DecodeBytes(stIt.Slot(), &val); err != nil {
+					if err := rlp.DecodeBytes(stIt.Value, &val); err != nil {
 						fatal("rlp-decode storage value", err)
 					}
-					fmt.Fprintf(w, "S %x %x\n", stIt.Hash(), val)
+					fmt.Fprintf(w, "S %x %x\n", common.BytesToHash(stIt.Key), val)
 					nStor++
 				}
-				if err := stIt.Error(); err != nil {
+				if err := stIt.Err; err != nil {
 					fatal("storage iter", err)
 				}
-				stIt.Release()
 			}
 			if *max != 0 && nAcc >= *max {
 				break
 			}
 		}
-		if err := accIt.Error(); err != nil {
+		if err := accIt.Err; err != nil {
 			fatal("account iter", err)
 		}
 		fmt.Fprintf(os.Stderr, "exported %d accounts, %d storage slots\n", nAcc, nStor)
