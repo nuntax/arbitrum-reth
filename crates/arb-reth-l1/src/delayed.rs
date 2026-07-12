@@ -186,7 +186,7 @@ impl<P: Provider> DelayedInboxReader<P> {
         // Collect the per-log futures eagerly (not a lazy map in the stream) so the resulting future
         // stays `Send` for the spawned sync task.
         let body_futs: Vec<_> =
-            from_origin_logs.iter().map(|log| self.from_origin_body_entry(log)).collect();
+            from_origin_logs.iter().map(|log| self.origin_body_entry(log)).collect();
         let fetched: Vec<((u64, Address), Vec<u8>)> =
             futures_util::stream::iter(body_futs).buffer_unordered(8).try_collect().await?;
         bodies.extend(fetched);
@@ -196,7 +196,7 @@ impl<P: Provider> DelayedInboxReader<P> {
 
     /// `((index, emitter), body)` for one `InboxMessageDeliveredFromOrigin` log — the tx-calldata
     /// body fetch, packaged for concurrent resolution in [`Self::fetch_bodies`].
-    async fn from_origin_body_entry(
+    async fn origin_body_entry(
         &self,
         log: &Log,
     ) -> Result<((u64, Address), Vec<u8>), L1Error> {

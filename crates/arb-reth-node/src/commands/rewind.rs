@@ -53,9 +53,20 @@ pub struct RewindArgs {
     datadir: PathBuf,
 
     /// Snapshot head stream (`reth-export --mode blocks`), used to build the chain spec so the DB
-    /// opens: the same file passed to `arb-reth --snapshot-head`.
+    /// opens: the same file passed to `arb-reth --snapshot-head`. For a snapshot-seeded datadir
+    /// (Arbitrum One). Alternative to the orbit `--chain-info`/`--genesis` pair.
     #[arg(long = "snapshot-head", value_name = "PATH")]
-    snapshot_head: PathBuf,
+    snapshot_head: Option<PathBuf>,
+
+    /// Orbit boot: Nitro `chaininfo.json`. Paired with `--genesis`, builds the chain spec for a
+    /// datadir booted from genesis files (not a snapshot), e.g. Robinhood. Alternative to
+    /// `--snapshot-head`; the genesis floor is that chain's genesis block (0 for a fresh chain).
+    #[arg(long = "chain-info", value_name = "PATH", requires = "genesis_json")]
+    chain_info: Option<PathBuf>,
+
+    /// Orbit boot: Nitro `genesis.json` (paired with `--chain-info`).
+    #[arg(long = "genesis", value_name = "PATH")]
+    genesis_json: Option<PathBuf>,
 
     /// New chain tip to keep (this block survives; everything above it is removed).
     #[arg(long = "to", value_name = "BLOCK", conflicts_with = "diverged_at", required_unless_present = "diverged_at")]
@@ -84,11 +95,31 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
         (None, None) => unreachable!("clap requires --to or --diverged-at"),
     };
 
-    // Genesis header (from the snapshot stream) both anchors the chain spec and gives the floor we
-    // cannot rewind below (the imported genesis block).
-    let (genesis_num, genesis_hash, genesis_header) = read_head_header(&args.snapshot_head)?;
-    let chain_spec: Arc<ChainSpec> =
-        crate::arb_chain_spec_with_header(args.chain_id, genesis_header, genesis_hash);
+    // Build the chain spec and the genesis floor (the block we cannot rewind below). Two boot modes:
+    // a snapshot-seeded datadir (Arbitrum One) reads its genesis header from the head stream; an
+    // orbit datadir (booted from chaininfo + genesis files, e.g. Robinhood) builds the spec from
+    // those files and sits at its genesis block. `snapshot_seeded` gates the changeset-layout
+    // migration below (only the snapshot import mis-seeds those segments).
+    let (genesis_num, chain_spec, snapshot_seeded): (u64, Arc<ChainSpec>, bool) =
+        match (&args.snapshot_head, &args.chain_info, &args.genesis_json) {
+            (Some(head), _, _) => {
+                let (genesis_num, genesis_hash, genesis_header) = read_head_header(head)?;
+                let spec = crate::arb_chain_spec_with_header(args.chain_id, genesis_header, genesis_hash);
+                (genesis_num, spec, true)
+            }
+            (None, Some(ci), Some(g)) => {
+                let ci_json = std::fs::read(ci).map_err(|e| eyre::eyre!("read chain-info {ci:?}: {e}"))?;
+                let g_json = std::fs::read(g).map_err(|e| eyre::eyre!("read genesis {g:?}: {e}"))?;
+                let (spec, init, _info) = crate::orbit_chain_from_files(&ci_json, &g_json)?;
+                (init.genesis_block_number, Arc::new(spec), false)
+            }
+            (None, _, _) => {
+                return Err(eyre::eyre!(
+                    "provide either --snapshot-head (snapshot-seeded datadir, e.g. Arbitrum One) or \
+                     --chain-info together with --genesis (orbit datadir, e.g. Robinhood)"
+                ))
+            }
+        };
 
     let db_path = args.datadir.join("db");
     let static_files_path = args.datadir.join("static_files");
@@ -107,7 +138,11 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
     // first block that actually has a changeset) and rename the files to match, after which stock
     // reth's unwind and reads are correct with no reth patch. Idempotent + guarded. See
     // `arb-snapshot-import.rs`, which mirrors reth's `init_genesis` for fresh imports.
-    migrate_changeset_layout(&static_files_path, genesis_num)?;
+    // Only snapshot-seeded datadirs carry the mis-seeded layout; an orbit datadir booted fresh from
+    // genesis files writes stock-aligned changeset segments, so skip the migration there.
+    if snapshot_seeded {
+        migrate_changeset_layout(&static_files_path, genesis_num)?;
+    }
 
     let db = init_db(&db_path, DatabaseArguments::new(ClientVersion::default()))?;
     let static_file_provider = StaticFileProvider::read_write(static_files_path)?;

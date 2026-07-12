@@ -67,14 +67,16 @@ fn transfer_train(n: u64) -> Vec<ArbTxEnvelope> {
 
 fn evm_env() -> alloy_evm::EvmEnv<ArbSpecId> {
     let next_timestamp = L1_TIMESTAMP.max(PARENT_TIMESTAMP);
-    let mut block = BlockEnv::default();
-    block.number = U256::from(PARENT_NUMBER + 1);
-    block.beneficiary = POSTER;
-    block.timestamp = U256::from(next_timestamp);
-    block.gas_limit = BLOCK_GAS_LIMIT;
-    block.basefee = BASEFEE;
-    block.difficulty = U256::ZERO;
-    block.prevrandao = Some(B256::ZERO);
+    let block = BlockEnv {
+        number: U256::from(PARENT_NUMBER + 1),
+        beneficiary: POSTER,
+        timestamp: U256::from(next_timestamp),
+        gas_limit: BLOCK_GAS_LIMIT,
+        basefee: BASEFEE,
+        difficulty: U256::ZERO,
+        prevrandao: Some(B256::ZERO),
+        ..Default::default()
+    };
 
     let mut cfg_env = CfgEnv::new_with_spec(ArbSpecId::ARBOS_51)
         .with_chain_id(CHAIN_ID)
