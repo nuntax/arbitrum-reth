@@ -108,6 +108,21 @@ pub fn extract_messages(
             _ => {}
         }
     }
+
+    // Force-inclusion: after the explicit segments are exhausted, Nitro's multiplexer injects
+    // "virtual" DelayedMessages segments and keeps emitting delayed messages until the read cursor
+    // reaches the batch's `afterDelayedMessages` (see arbstate/inbox.go). Without this, a batch that
+    // bumps `afterDelayedMessages` past what its explicit segments consume silently drops the
+    // remaining delayed messages (each of which is its own L2 block), diverging the chain. Drain the
+    // tail here so `assemble.rs`'s `before = after` cursor advance is actually satisfied.
+    while delayed_read < header.after_delayed_messages {
+        let dm = delayed
+            .message(delayed_read)
+            .ok_or(MultiplexerError::DelayedMissing(delayed_read))?;
+        delayed_read += 1;
+        out.push(dm.to_derived(delayed_read));
+    }
+
     Ok(out)
 }
 
