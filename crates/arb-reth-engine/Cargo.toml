@@ -14,7 +14,7 @@ authors.workspace = true
 [dependencies]
 arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "5e9ec82a6b7dcf8d06d24f75d6c2bb588dd7354a", default-features = false, features = ["reth"] }
 arb-reth-evm = { path = "../arb-reth-evm" }
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "1b3070a2e13063256a55bff8cfaf0e9b1ea83bbc" }
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "c28f9dc7385ae656d4694c8d40d8375cec8bc531" }
 arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "5e9ec82a6b7dcf8d06d24f75d6c2bb588dd7354a", default-features = false, features = ["std"] }
 
 alloy-consensus = { version = "2.0", default-features = false }
