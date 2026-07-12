@@ -40,25 +40,6 @@ pub fn arb_chain_spec(init: &ArbosInitConfig) -> eyre::Result<ChainSpec> {
 /// Like [`arb_chain_spec`] but merges an additional genesis allocation (the user `alloc` from an
 /// Orbit chain's genesis.json) under the ArbOS-init accounts. Nitro applies the prealloc first and
 /// then runs ArbOS init, so on an address conflict the ArbOS-written account wins.
-/// Extract `arbitrum.MaxCodeSize` from a Nitro serialized chain-config JSON blob. Returns 0 when
-/// absent (the caller treats 0 as "use the default"), mirroring Nitro's `MaxCodeSize()==0` sentinel.
-fn max_code_size_from_serialized_config(serialized_chain_config: &[u8]) -> u64 {
-    #[derive(Deserialize)]
-    struct Wrapper {
-        arbitrum: Option<ArbParams>,
-    }
-    #[derive(Deserialize)]
-    struct ArbParams {
-        #[serde(rename = "MaxCodeSize", default)]
-        max_code_size: u64,
-    }
-    serde_json::from_slice::<Wrapper>(serialized_chain_config)
-        .ok()
-        .and_then(|w| w.arbitrum)
-        .map(|a| a.max_code_size)
-        .unwrap_or(0)
-}
-
 pub fn arb_chain_spec_with_alloc(
     init: &ArbosInitConfig,
     extra_alloc: BTreeMap<Address, GenesisAccount>,
@@ -84,7 +65,9 @@ pub fn arb_chain_spec_with_alloc(
     // requests fields to the genesis header, diverging from Nitro's London-format header. Post-London
     // EVM features are gated on the ArbOS version (decoded from the header mixHash by `ArbEvmConfig`),
     // not on chain-spec forks. Mirrors the testnode's `l2_chain_config.json`.
-    let mut config = ChainConfig {
+    // MaxCodeSize (and other per-chain params) are recovered by the executor from ArbOS state
+    // subspace 7 at startup, exactly as Nitro does, so nothing chain-specific is stashed here.
+    let config = ChainConfig {
         chain_id: init.chain_id.to::<u64>(),
         homestead_block: Some(0),
         dao_fork_support: false,
@@ -100,17 +83,6 @@ pub fn arb_chain_spec_with_alloc(
         london_block: Some(0),
         ..Default::default()
     };
-
-    // Stash the chain's MaxCodeSize (Nitro raises it above EIP-170's 24576, e.g. Robinhood 98304) in
-    // the genesis config's extra fields so `ArbExecutorBuilder` can wire it into the EVM's
-    // limit_contract_code_size. Absent/0 means the chain uses the default.
-    let max_code_size = max_code_size_from_serialized_config(&init.serialized_chain_config);
-    if max_code_size != 0 {
-        config
-            .extra_fields
-            .insert_value("arbMaxCodeSize".to_string(), max_code_size)
-            .map_err(|e| eyre::eyre!("stash arbMaxCodeSize: {e}"))?;
-    }
 
     // Genesis header reproduces Nitro `arbosState.MakeGenesisBlock` exactly (validated against
     // nitro-testnode genesis `0xb88471...`). Nitro constants:
