@@ -16,6 +16,10 @@ arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", r
 
 alloy-primitives = { version = "1", default-features = false }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
+# RPC client + transport retry layer: retries transient L1 RPC failures (5xx/429/timeouts) with
+# backoff so a provider hiccup doesn't kill the derivation task.
+alloy-rpc-client = { version = "2.1", default-features = false, features = ["reqwest"] }
+alloy-transport = { version = "2.1", default-features = false }
 eyre = "0.6.12"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }

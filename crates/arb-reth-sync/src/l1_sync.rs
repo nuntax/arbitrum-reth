@@ -132,8 +132,15 @@ pub async fn run_l1_sync<F>(
 where
     F: Fn() -> u64 + Send,
 {
-    let provider = ProviderBuilder::new()
-        .connect_http(cfg.l1_rpc.parse().wrap_err("invalid --l1-rpc URL")?);
+    // Wrap the HTTP transport in a retry layer so a transient L1 RPC failure (429 rate limit, 5xx,
+    // connect/timeout) is retried with backoff instead of propagating and killing the derivation
+    // task. The default RateLimitRetryPolicy is reactive (passthrough on success), so it does not
+    // throttle the happy path. Beacon blob fetches have their own retry (see BeaconClient).
+    let url = cfg.l1_rpc.parse().wrap_err("invalid --l1-rpc URL")?;
+    let client = alloy_rpc_client::ClientBuilder::default()
+        .layer(alloy_transport::layers::RetryBackoffLayer::new(10, 500, 660))
+        .http(url);
+    let provider = ProviderBuilder::new().connect_client(client);
     let seq_reader = SequencerInboxReader::new(provider.clone(), cfg.sequencer_inbox);
     let delayed_reader = DelayedInboxReader::new(provider.clone(), cfg.bridge);
     let beacon = cfg.l1_beacon.as_ref().map(|u| BeaconClient::new(u.clone()));

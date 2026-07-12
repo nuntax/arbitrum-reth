@@ -56,14 +56,48 @@ impl BeaconClient {
     }
 
     /// Fetch all blob sidecars for a slot.
+    ///
+    /// Transient failures (network/timeout errors, HTTP 429, and 5xx) are retried with exponential
+    /// backoff so a brief provider hiccup does not kill an hours-long derivation. Alchemy's beacon
+    /// blob endpoint in particular returns sporadic 503s under load. Permanent failures (e.g. 404)
+    /// and body-decode errors return immediately.
     pub async fn blob_sidecars(&self, slot: u64) -> Result<Vec<BlobSidecar>, L1Error> {
         let url = format!("{}/eth/v1/beacon/blob_sidecars/{slot}", self.base);
-        let resp = self.http.get(&url).send().await.map_err(|e| L1Error::Rpc(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(L1Error::Rpc(format!("beacon blob_sidecars/{slot} -> {}", resp.status())));
+        const MAX_ATTEMPTS: u32 = 12;
+        let mut backoff = std::time::Duration::from_millis(500);
+        for attempt in 1..=MAX_ATTEMPTS {
+            let last: L1Error = match self.http.get(&url).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let parsed: SidecarsResponse =
+                            resp.json().await.map_err(|e| L1Error::Rpc(e.to_string()))?;
+                        return parsed.data.into_iter().map(BlobSidecar::try_from).collect();
+                    }
+                    // 429 (rate limit) and 5xx (server) are transient; other statuses are permanent.
+                    let transient = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error();
+                    let err = L1Error::Rpc(format!("beacon blob_sidecars/{slot} -> {status}"));
+                    if !transient {
+                        return Err(err);
+                    }
+                    err
+                }
+                // Network/timeout errors are transient.
+                Err(e) => L1Error::Rpc(e.to_string()),
+            };
+            if attempt == MAX_ATTEMPTS {
+                return Err(last);
+            }
+            tracing::warn!(
+                target: "arb-reth::l1-beacon",
+                slot, attempt, backoff_ms = backoff.as_millis() as u64, err = %last,
+                "transient beacon error, retrying blob sidecars",
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
         }
-        let parsed: SidecarsResponse = resp.json().await.map_err(|e| L1Error::Rpc(e.to_string()))?;
-        parsed.data.into_iter().map(BlobSidecar::try_from).collect()
+        unreachable!("loop returns on the final attempt")
     }
 
     /// Fetch the blobs for `versioned_hashes` (in order) at `slot` and decode them

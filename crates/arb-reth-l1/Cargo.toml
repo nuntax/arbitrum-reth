@@ -23,6 +23,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 
 # Beacon REST client for blob sidecars (consensus layer; no JSON-RPC).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `time` only (async backoff sleep for transient-RPC retries); the runtime is the caller's.
+tokio = { version = "1", default-features = false, features = ["time"] }
+tracing = "0.1"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
 base64 = "0.22"

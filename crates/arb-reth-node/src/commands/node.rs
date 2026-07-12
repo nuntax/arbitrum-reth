@@ -742,7 +742,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         let tx = feed_tx.clone();
         task_executor.spawn_task(async move {
             if let Err(e) = crate::run_l1_sync(sync_cfg, tx, persisted_tip).await {
-                reth_tracing::tracing::error!(target: "arb-reth", err = %e, "L1 sync failed");
+                // `?e` (Debug) prints the full eyre cause chain, not just the top context, so a
+                // derivation failure shows the real underlying error (batch/message decode, etc.).
+                reth_tracing::tracing::error!(target: "arb-reth", err = ?e, "L1 sync failed");
             }
         });
         info!(target: "arb-reth", start_block, start_delayed, start_l2_block, db_tip, "L1-derivation catch-up started");
