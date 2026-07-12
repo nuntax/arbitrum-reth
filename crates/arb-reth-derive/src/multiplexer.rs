@@ -157,13 +157,16 @@ mod tests {
     use crate::delayed::{DelayedMap, DelayedMessage, NoDelayed};
     use alloy_primitives::{Address, B256};
 
-    fn header() -> BatchHeader {
+    // `after_delayed_messages` must match each test's delayed setup: extract_messages force-includes
+    // delayed messages up to this count (Nitro parity), so a test that supplies none must set it to
+    // its starting cursor or the force-include reads past `NoDelayed` and errors.
+    fn header(after_delayed_messages: u64) -> BatchHeader {
         BatchHeader {
             min_timestamp: 1_000,
             max_timestamp: 2_000,
             min_l1_block: 100,
             max_l1_block: 200,
-            after_delayed_messages: 8,
+            after_delayed_messages,
         }
     }
 
@@ -173,7 +176,7 @@ mod tests {
 
     #[test]
     fn emits_l2_messages_with_running_timestamp_and_poster() {
-        let h = header();
+        let h = header(7); // start cursor 7, no delayed supplied
         // Running timestamp/block accumulate from 0 (Nitro semantics); the first Advance
         // carries the absolute value. tx-a is emitted before the L1-block advance, so its
         // block is still 0 and clamps up to min (100); tx-b sees the absolute 150 (in range).
@@ -197,7 +200,7 @@ mod tests {
 
     #[test]
     fn timestamp_clamped_to_max() {
-        let h = header();
+        let h = header(0);
         let segs = vec![
             advance(segment_kind::ADVANCE_TIMESTAMP, 10_000),
             Segment { kind: segment_kind::L2_MESSAGE, data: b"x".to_vec() },
@@ -211,7 +214,7 @@ mod tests {
         // A batch encodes an L1-block decrement as an advance of u64::MAX (-1 mod 2^64).
         // Base 150 (in [100,200]) then +u64::MAX must wrap to 149;
         // saturating_add would give u64::MAX and clamp to max (200).
-        let h = header();
+        let h = header(0);
         let segs = vec![
             advance(segment_kind::ADVANCE_L1_BLOCK, 150),
             advance(segment_kind::ADVANCE_L1_BLOCK, u64::MAX),
@@ -223,7 +226,7 @@ mod tests {
 
     #[test]
     fn l2_message_brotli_is_decompressed() {
-        let h = header();
+        let h = header(0);
         let inner = b"decompressed-l2-message".to_vec();
         let compressed =
             brotli::compress(&inner, 11, brotli::DEFAULT_WINDOW_SIZE, brotli::Dictionary::Empty).unwrap();
@@ -234,7 +237,7 @@ mod tests {
 
     #[test]
     fn delayed_segment_pulls_from_source_and_advances_cursor() {
-        let h = header();
+        let h = header(8);
         let dm = DelayedMessage {
             kind: 12,
             sender: Address::repeat_byte(0xcd),
@@ -264,7 +267,7 @@ mod tests {
 
     #[test]
     fn delayed_segment_missing_source_errors() {
-        let h = header();
+        let h = header(1);
         let segs = vec![Segment { kind: segment_kind::DELAYED_MESSAGES, data: vec![] }];
         assert_eq!(
             extract_messages(&h, &segs, 0, &NoDelayed),
