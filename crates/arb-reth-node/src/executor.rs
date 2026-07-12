@@ -22,6 +22,17 @@ where
     type EVM = ArbEvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<N>) -> eyre::Result<Self::EVM> {
-        Ok(ArbEvmConfig::new(ctx.chain_spec().chain().id()))
+        let spec = ctx.chain_spec();
+        // The chain's MaxCodeSize (Nitro `ChainConfig.MaxCodeSize()`) is stashed in the genesis
+        // config's extra fields by `arb_chain_spec_with_alloc`; absent (e.g. the snapshot path) it
+        // falls back to the EIP-170 default inside `ArbEvmConfig`.
+        let max_code_size = spec
+            .genesis()
+            .config
+            .extra_fields
+            .get_deserialized::<usize>("arbMaxCodeSize")
+            .and_then(Result::ok)
+            .unwrap_or(0);
+        Ok(ArbEvmConfig::new(spec.chain().id()).with_max_code_size(max_code_size))
     }
 }

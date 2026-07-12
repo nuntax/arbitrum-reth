@@ -91,7 +91,14 @@ pub struct ArbEvmConfig {
     block_assembler: ArbBlockAssembler,
     /// Chain id used when no header is available (and asserted against headers).
     chain_id: u64,
+    /// Maximum deployed contract code size (Nitro `ChainConfig.MaxCodeSize()`). Arbitrum chains may
+    /// raise this above Ethereum's EIP-170 24576 (e.g. Robinhood uses 98304); the EIP-3860 initcode
+    /// limit follows as 2x. Defaults to [`DEFAULT_MAX_CODE_SIZE`] when the chain does not set it.
+    max_code_size: usize,
 }
+
+/// Nitro `params.DefaultMaxCodeSize` (== Ethereum EIP-170). Used when a chain does not raise it.
+pub const DEFAULT_MAX_CODE_SIZE: usize = 24576;
 
 impl ArbEvmConfig {
     /// Creates a new [`ArbEvmConfig`] for the given chain id (e.g. [`ARB_ONE_CHAIN_ID`]).
@@ -100,7 +107,18 @@ impl ArbEvmConfig {
             executor_factory: ArbBlockExecutorFactory::new(ArbEvmFactory, chain_id),
             block_assembler: ArbBlockAssembler,
             chain_id,
+            max_code_size: DEFAULT_MAX_CODE_SIZE,
         }
+    }
+
+    /// Sets the maximum deployed contract code size (Nitro `ChainConfig.MaxCodeSize()`), read from
+    /// the chain's config. A value of 0 keeps the default.
+    #[must_use]
+    pub fn with_max_code_size(mut self, max_code_size: usize) -> Self {
+        if max_code_size != 0 {
+            self.max_code_size = max_code_size;
+        }
+        self
     }
 
     /// Creates a new [`ArbEvmConfig`] for Arbitrum One mainnet (chain id `42161`).
@@ -135,6 +153,10 @@ impl ArbEvmConfig {
         // that cap (state_transition.go: `!IsArbitrum() && isOsaka && ...`), so disable it or the
         // node would drop high-gas L2 txs (e.g. 60M-gas deploys) that Nitro executes.
         cfg.tx_gas_limit_cap = Some(u64::MAX);
+        // Arbitrum chains raise the deployed-code limit above EIP-170's 24576 (Nitro
+        // `ChainConfig.MaxCodeSize()`); without this the node rejects legal large deploys with
+        // CreateContractSizeLimit. revm derives the EIP-3860 initcode cap as 2x this.
+        cfg.limit_contract_code_size = Some(self.max_code_size);
         cfg
     }
 
