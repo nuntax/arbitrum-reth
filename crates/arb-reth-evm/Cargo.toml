@@ -9,12 +9,12 @@ authors.workspace = true
 # extension points. See docs/arb-reth-roadmap.md.
 
 [dependencies]
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "aafbcf0bc5e667f6afa9fcf40972f7a7d6b982c8", features = ["stylus"] } # pure revm/ArbOS; stylus feature is self-contained (vendors Nitro's wasmer)
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "dd05d8abf79c7d5436ab6bf7bd6d979bee0bba5e", features = ["stylus"] } # pure revm/ArbOS; stylus feature is self-contained (vendors Nitro's wasmer)
 revm = { workspace = true }
 
 # Arbitrum consensus primitives (ArbTxEnvelope, ArbReceiptEnvelope, ArbHeaderInfo). reth-trait
 # impls live inside arb-alloy behind the `reth` feature (orphan rule).
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "5e9ec82a6b7dcf8d06d24f75d6c2bb588dd7354a", default-features = false, features = ["reth"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21", default-features = false, features = ["reth"] }
 
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 alloy-evm = { version = "0.37", default-features = false }
@@ -26,7 +26,7 @@ alloy-eips = { version = "2.0", default-features = false }
 alloy-primitives = { version = "1", default-features = false }
 
 # rpc feature: TryIntoTxEnv and BuildPendingEnv impls for Arbitrum RPC types.
-arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "5e9ec82a6b7dcf8d06d24f75d6c2bb588dd7354a", optional = true }
+arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21", optional = true }
 alloy-rpc-types-eth = { version = "2.0", default-features = false, optional = true }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265", optional = true }
 
