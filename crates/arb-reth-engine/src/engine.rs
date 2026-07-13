@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use alloy_consensus::Header;
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Typed2718;
+use alloy_primitives::map::{HashMap, HashSet};
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
@@ -456,6 +457,212 @@ where
     }
 }
 
+/// Flattened value-read overlay over the ring, for the EXECUTION provider only.
+///
+/// reth's `MemoryOverlayStateProviderRef` walks every in-memory block per uncached account/storage
+/// read (`memory_overlay.rs` `basic_account`/`storage`: `for block in self.in_memory.iter()`). With
+/// our deep ring (`--backpressure` up to 512; measured median depth ~130 during catch-up) that is an
+/// O(ring) walk on the COMMON cold read that misses the whole ring and falls to the DB. This wrapper
+/// flattens the ring's touched accounts/storage into two maps once (newest-wins), turning each read
+/// into O(1) + a DB fallthrough. Trie/proof/bytecode methods delegate to `inner` (the real overlay)
+/// unchanged. `historical` and `inner` are anchored on the SAME pinned RO tx, so it inherits the
+/// ring's torn-read immunity. Newest-wins matches reth exactly: a present key (even a deleted account
+/// or a slot set to zero) short-circuits the DB just as `execution_output.account()/.storage()` do.
+/// Ring-flattened account infos (newest-wins), keyed by address.
+type CoalescedAccounts = HashMap<Address, Option<Account>>;
+/// Ring-flattened storage values (newest-wins), keyed by (address, slot).
+type CoalescedStorage = HashMap<(Address, StorageKey), StorageValue>;
+
+struct CoalescedExecProvider<'a> {
+    /// DB anchor for value fallthrough (a `LatestStateProviderRef` over the pinned RO tx).
+    historical: Box<dyn StateProvider + 'a>,
+    /// Full `MemoryOverlayStateProviderRef`: delegate trie/proof/bytecode; shadow oracle.
+    inner: Box<dyn StateProvider + 'a>,
+    /// Touched accounts across the ring (newest-wins). Present key => short-circuit DB.
+    accounts: CoalescedAccounts,
+    /// Touched storage slots across the ring (newest-wins). Present key => short-circuit DB.
+    storage: CoalescedStorage,
+    /// Addresses whose storage is fully known in the ring (created/destroyed => `is_storage_known`).
+    /// A storage MISS on such an address reads `0` and does NOT fall through to the DB, matching
+    /// reth's `BundleAccount::storage_slot` (bundle_account.rs:61-70: unknown slot + storage-known =>
+    /// `Some(ZERO)`). Without this, a slot cleared by an account recreation would read the stale DB
+    /// value.
+    known: HashSet<Address>,
+    /// `ARB_COALESCE_SHADOW=1`: cross-check every value read against `inner` (reth's walk).
+    shadow: bool,
+}
+
+impl CoalescedExecProvider<'_> {
+    /// Flatten a NEWEST-FIRST ring into (accounts, storage, storage-known) maps.
+    ///
+    /// Accounts: `or_insert` keeps the newest info per address (reth's `basic_account` returns the
+    /// newest block that touched the account). Storage mirrors reth's per-slot walk exactly: the
+    /// value is the newest block that RESOLVES the slot, where a block resolves it if the slot is
+    /// explicit there OR that block is storage-known (recreation => unset slots read 0). `frozen`
+    /// stops accumulating a storage-known address's OLDER blocks, since a recreation supersedes them.
+    fn flatten(
+        ring_newest_first: &[ExecutedBlock<ArbPrimitives>],
+    ) -> (CoalescedAccounts, CoalescedStorage, HashSet<Address>) {
+        let mut accounts: CoalescedAccounts = HashMap::default();
+        let mut storage: CoalescedStorage = HashMap::default();
+        let mut known: HashSet<Address> = HashSet::default();
+        // Storage for these addresses is resolved by a newer block (a recreation reset); ignore
+        // their older blocks so a stale explicit slot below the reset can't win.
+        let mut frozen: HashSet<Address> = HashSet::default();
+        for exec in ring_newest_first.iter() {
+            let bundle = &exec.execution_output.state;
+            for (addr, acct) in bundle.state.iter() {
+                accounts
+                    .entry(*addr)
+                    .or_insert_with(|| acct.info.as_ref().map(Into::into));
+                if frozen.contains(addr) {
+                    continue;
+                }
+                for (slot, sslot) in acct.storage.iter() {
+                    storage
+                        .entry((*addr, (*slot).into()))
+                        .or_insert(sslot.present_value);
+                }
+                if acct.status.is_storage_known() {
+                    known.insert(*addr);
+                    frozen.insert(*addr);
+                }
+            }
+        }
+        (accounts, storage, known)
+    }
+}
+
+impl BlockHashReader for CoalescedExecProvider<'_> {
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        self.inner.block_hash(number)
+    }
+    fn canonical_hashes_range(
+        &self,
+        start: BlockNumber,
+        end: BlockNumber,
+    ) -> ProviderResult<Vec<B256>> {
+        self.inner.canonical_hashes_range(start, end)
+    }
+}
+
+impl AccountReader for CoalescedExecProvider<'_> {
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        let v = match self.accounts.get(address) {
+            Some(a) => *a,
+            None => self.historical.basic_account(address)?,
+        };
+        if self.shadow {
+            let want = self.inner.basic_account(address)?;
+            assert_eq!(v, want, "coalesce basic_account mismatch addr={address}");
+        }
+        Ok(v)
+    }
+}
+
+impl BytecodeReader for CoalescedExecProvider<'_> {
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        self.inner.bytecode_by_hash(code_hash)
+    }
+}
+
+impl StorageRootProvider for CoalescedExecProvider<'_> {
+    fn storage_root(&self, address: Address, hashed_storage: HashedStorage) -> ProviderResult<B256> {
+        self.inner.storage_root(address, hashed_storage)
+    }
+    fn storage_proof(
+        &self,
+        address: Address,
+        slot: B256,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageProof> {
+        self.inner.storage_proof(address, slot, hashed_storage)
+    }
+    fn storage_multiproof(
+        &self,
+        address: Address,
+        slots: &[B256],
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        self.inner.storage_multiproof(address, slots, hashed_storage)
+    }
+}
+
+impl StateProofProvider for CoalescedExecProvider<'_> {
+    fn proof(
+        &self,
+        input: TrieInput,
+        address: Address,
+        slots: &[B256],
+    ) -> ProviderResult<AccountProof> {
+        self.inner.proof(input, address, slots)
+    }
+    fn multiproof(
+        &self,
+        input: TrieInput,
+        targets: MultiProofTargets,
+    ) -> ProviderResult<MultiProof> {
+        self.inner.multiproof(input, targets)
+    }
+    fn witness(
+        &self,
+        input: TrieInput,
+        target: HashedPostState,
+        mode: ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
+        self.inner.witness(input, target, mode)
+    }
+}
+
+impl HashedPostStateProvider for CoalescedExecProvider<'_> {
+    fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
+        self.inner.hashed_post_state(bundle_state)
+    }
+}
+
+impl StateRootProvider for CoalescedExecProvider<'_> {
+    fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
+        self.inner.state_root(hashed_state)
+    }
+    fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
+        self.inner.state_root_from_nodes(input)
+    }
+    fn state_root_with_updates(
+        &self,
+        hashed_state: HashedPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_with_updates(hashed_state)
+    }
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: TrieInput,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_from_nodes_with_updates(input)
+    }
+}
+
+impl StateProvider for CoalescedExecProvider<'_> {
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        let v = match self.storage.get(&(account, storage_key)) {
+            Some(val) => Some(*val),
+            None if self.known.contains(&account) => Some(StorageValue::ZERO),
+            None => self.historical.storage(account, storage_key)?,
+        };
+        if self.shadow {
+            let want = self.inner.storage(account, storage_key)?;
+            assert_eq!(
+                v, want,
+                "coalesce storage mismatch addr={account} key={storage_key}"
+            );
+        }
+        Ok(v)
+    }
+}
+
 /// Poll the tree's view (events + `best_block_number` + in-memory head) until block `bn` with
 /// hash `expected_hash` is canonical, or a bounded timeout elapses.
 pub async fn wait_for_head<P>(
@@ -607,6 +814,12 @@ where
     /// block. Requires `state_trie_overlays` to be populated, so `maintain_ring` feeds the manager
     /// when this or `shadow_stateroot` is on.
     parallel_stateroot: bool,
+    /// `ARB_COALESCE_OVERLAY=1` (ring-overlay only): flatten the ring into value maps for the EXEC
+    /// provider so each account/storage read is O(1) instead of an O(ring-depth) walk through
+    /// reth's `MemoryOverlayStateProviderRef`. See [`CoalescedExecProvider`].
+    coalesce_overlay: bool,
+    /// `ARB_COALESCE_SHADOW=1`: when coalescing, assert each value read equals reth's overlay walk.
+    coalesce_shadow: bool,
     /// reth's native "ring" for the parallel/overlay path: resolves the (trie + hashed) overlay for
     /// the unpersisted blocks between the persisted anchor and the parent. Kept in lockstep with
     /// `ring` (insert on produce, remove on persist). Only populated when `shadow_stateroot` is on.
@@ -677,6 +890,13 @@ where
         let parallel_stateroot = std::env::var("ARB_PARALLEL_STATEROOT")
             .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
             .unwrap_or(true);
+        // Coalesced exec overlay (opt-in): flatten the ring for O(1) exec reads. `_SHADOW` cross-checks.
+        let coalesce_overlay = std::env::var("ARB_COALESCE_OVERLAY")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false);
+        let coalesce_shadow = std::env::var("ARB_COALESCE_SHADOW")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false);
 
         // The serial state root only actually runs when parallel is disabled OR the ring overlay is
         // off (parallel is a ring-overlay-only path). Warn loudly while we phase serial out.
@@ -718,6 +938,8 @@ where
             ring_overlay = tuning.ring_overlay,
             shadow_stateroot,
             parallel_stateroot,
+            coalesce_overlay,
+            coalesce_shadow,
             "engine-tree persistence tuning",
         );
 
@@ -786,6 +1008,8 @@ where
             ring: VecDeque::new(),
             shadow_stateroot,
             parallel_stateroot,
+            coalesce_overlay,
+            coalesce_shadow,
             state_trie_overlays: StateTrieOverlayManager::default(),
             provider_factory: driver_factory,
             changeset_cache: driver_changeset_cache,
@@ -842,7 +1066,22 @@ where
                 Box::new(LatestStateProviderRef::new(&db_ro));
             let trie_hist: Box<dyn StateProvider + '_> =
                 Box::new(LatestStateProviderRef::new(&db_ro));
-            let exec_sp = MemoryOverlayStateProviderRef::new(exec_hist, ring_vec.clone()).boxed();
+            let exec_overlay = MemoryOverlayStateProviderRef::new(exec_hist, ring_vec.clone()).boxed();
+            // Coalesced exec provider (opt-in): flatten the ring for O(1) value reads over the same
+            // pinned anchor; falls through to the DB on a miss, exactly like the overlay walk.
+            let exec_sp: Box<dyn StateProvider + '_> = if self.coalesce_overlay {
+                let (accounts, storage, known) = CoalescedExecProvider::flatten(&ring_vec);
+                Box::new(CoalescedExecProvider {
+                    historical: Box::new(LatestStateProviderRef::new(&db_ro)),
+                    inner: exec_overlay,
+                    accounts,
+                    storage,
+                    known,
+                    shadow: self.coalesce_shadow,
+                })
+            } else {
+                exec_overlay
+            };
             let trie_sp = MemoryOverlayStateProviderRef::new(trie_hist, ring_vec).boxed();
             // Parallel state-root mode: wrap the trie provider so `finish`'s
             // `state_root_with_updates` runs in parallel and DRIVES the block. Exec provider is
