@@ -995,6 +995,10 @@ where
         // Seed the dedup cursor from the resumed tip: the next message to apply is the one that
         // produces block tip+1, i.e. message index tip.number - genesis_block + 1.
         let next_seq = genesis_tip.number.saturating_sub(genesis_block) + 1;
+        // Match the engine tree: precompute the next flattened trie overlay while the current
+        // block is being canonicalized, rather than rebuilding it on the next root's hot path.
+        let state_trie_overlays =
+            StateTrieOverlayManager::new(driver_runtime.state_trie_overlay_worker_pool());
 
         Ok(Self {
             provider,
@@ -1010,7 +1014,7 @@ where
             parallel_stateroot,
             coalesce_overlay,
             coalesce_shadow,
-            state_trie_overlays: StateTrieOverlayManager::default(),
+            state_trie_overlays,
             provider_factory: driver_factory,
             changeset_cache: driver_changeset_cache,
             runtime: driver_runtime,
