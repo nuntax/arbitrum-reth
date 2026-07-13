@@ -19,6 +19,26 @@ Use the phase metrics to locate the delay:
 - `reth_arb_reth_feed_engine_{insert,forkchoice}_seconds` and `canonicalization_wait_seconds` cover the reth handoff.
 - `reth_arb_reth_feed_tracking_dropped_total` should remain zero during normal operation.
 
+## ArbOS transaction execution
+
+The executor exports these bounded-label series for each consensus transaction family (`legacy`,
+`eip1559`, `deposit`, `unsigned`, `contract`, `retry`, `submit_retryable`, and `internal`):
+
+- `reth_arb_reth_arbos_transaction_execution_seconds` measures the full ArbOS handler transition,
+  including the applicable pre-execution hooks and EVM or protocol transaction body.
+- `reth_arb_reth_arbos_transaction_commit_seconds` measures receipt construction and the in-memory
+  state commit after that transition.
+- `reth_arb_reth_arbos_transaction_{,l1_}gas_used` records L2 gas and L1 poster-gas distributions.
+- `reth_arb_reth_arbos_pre_execution_system_call_seconds` measures the EIP-2935 parent-hash
+  prelude, and `post_execution_header_info_seconds` measures the ArbOS header-field read.
+- `reth_arb_revm_arbos_handler_phase_seconds{phase,tx_type,mode}` splits the transition itself.
+  `pre_execution` covers ArbOS gas charging and filtering, `execution` covers the protocol or EVM
+  frame, and `end_tx_hook` covers fee distribution, refunds, and backlog updates. `mode="execute"`
+  is block production; `mode="inspect"` is debug tracing and should be excluded from latency views.
+
+These labels deliberately exclude addresses, transaction hashes, block numbers, and ArbOS version
+to keep Prometheus cardinality bounded. Use a one-off profiler for per-contract or opcode detail.
+
 Samples collected while catching up from a feed backlog include that backlog in the end-to-end measurement. Use a node at the live tip to judge MEV-facing latency.
 
 ## Execute and persist loop

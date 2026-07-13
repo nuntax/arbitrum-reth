@@ -22,7 +22,10 @@ use alloy_consensus::{
     TxReceipt, proofs,
 };
 use alloy_eips::{Encodable2718, Typed2718};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use alloy_evm::{
     Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
@@ -184,6 +187,25 @@ fn receipt_envelope_for_type(
     }
 }
 
+/// Stable, low-cardinality label for the consensus transaction families ArbOS executes.
+#[inline]
+fn tx_type_label(tx_type: u8) -> &'static str {
+    match tx_type {
+        0x00 => "legacy",
+        0x01 => "eip2930",
+        0x02 => "eip1559",
+        0x03 => "eip4844",
+        0x04 => "eip7702",
+        0x64 => "deposit",
+        0x65 => "unsigned",
+        0x66 => "contract",
+        0x68 => "retry",
+        0x69 => "submit_retryable",
+        0x6a => "internal",
+        _ => "unknown",
+    }
+}
+
 impl<DB, I, H> BlockExecutor for ArbBlockExecutor<ArbEvm<DB, I>, H>
 where
     DB: Database + DatabaseCommit + StateDB,
@@ -203,14 +225,17 @@ where
         // `InternalTxStartBlock` (0x6a) is NOT run here. It is a real block transaction with its
         // own receipt; the caller drives it through `execute_transaction` like any other tx. Running
         // it here would exclude it from the transactions/receipts roots and diverge from Nitro.
+        let started_at = Instant::now();
         let result = self
             .evm
             .transact_system_call(
                 SYSTEM_ADDRESS,
                 HISTORY_STORAGE_ADDRESS,
                 Bytes::copy_from_slice(self.ctx.parent_hash.as_slice()),
-            )
-            .map_err(|err| BlockExecutionError::evm(err, self.ctx.parent_hash))?;
+            );
+        metrics::histogram!("arb_reth.arbos.pre_execution_system_call_seconds")
+            .record(started_at.elapsed().as_secs_f64());
+        let result = result.map_err(|err| BlockExecutionError::evm(err, self.ctx.parent_hash))?;
         self.evm.db_mut().commit(result.state);
 
         Ok(())
@@ -222,11 +247,18 @@ where
     ) -> Result<Self::Result, BlockExecutionError> {
         let (tx_env, tx) = tx.into_parts();
         let tx_type = tx.tx().ty();
+        let tx_type_label = tx_type_label(tx_type);
 
+        let started_at = Instant::now();
         let result = self
             .evm
-            .transact(tx_env)
-            .map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
+            .transact(tx_env);
+        metrics::histogram!(
+            "arb_reth.arbos.transaction_execution_seconds",
+            "tx_type" => tx_type_label,
+        )
+        .record(started_at.elapsed().as_secs_f64());
+        let result = result.map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
 
         // `chain().poster_gas` is set by the ArbOS handler during pre_execution; it is the
         // L2-gas equivalent of the L1 poster cost, recorded as the receipt's `gas_used_for_l1`.
@@ -240,6 +272,7 @@ where
     }
 
     fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
+        let started_at = Instant::now();
         let ArbTxResult {
             result: ResultAndState { result, state },
             gas_used_for_l1,
@@ -258,6 +291,22 @@ where
 
         self.evm.db_mut().commit(state);
 
+        metrics::histogram!(
+            "arb_reth.arbos.transaction_commit_seconds",
+            "tx_type" => tx_type_label(tx_type),
+        )
+        .record(started_at.elapsed().as_secs_f64());
+        metrics::histogram!(
+            "arb_reth.arbos.transaction_gas_used",
+            "tx_type" => tx_type_label(tx_type),
+        )
+        .record(gas_used as f64);
+        metrics::histogram!(
+            "arb_reth.arbos.transaction_l1_gas_used",
+            "tx_type" => tx_type_label(tx_type),
+        )
+        .record(gas_used_for_l1 as f64);
+
         GasOutput::new(gas_used)
     }
 
@@ -268,8 +317,11 @@ where
         // base fee) and write it to the shared ctx cell for the assembler. All txs are committed at
         // this point, so the journal reads committed values. Mirrors what Nitro's `FinalizeBlock`/
         // `createNewHeader` pull from `arbosState`.
+        let started_at = Instant::now();
         let header_info = ArbosState::read_block_header_info(self.evm.ctx_mut().journal_mut())
             .map_err(|e| BlockExecutionError::msg(format!("read ArbOS block header info: {e}")))?;
+        metrics::histogram!("arb_reth.arbos.post_execution_header_info_seconds")
+            .record(started_at.elapsed().as_secs_f64());
         if let Ok(mut slot) = self.ctx.header_info_out.lock() {
             *slot = Some(header_info);
         }

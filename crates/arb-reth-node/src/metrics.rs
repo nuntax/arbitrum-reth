@@ -36,6 +36,12 @@ struct FeedLatencyMetrics {
     block_state_setup_seconds: Histogram,
     /// ArbOS pre-execution and transaction execution.
     block_execution_seconds: Histogram,
+    /// Block-builder creation, ArbOS pre-execution changes, and base-fee setup.
+    block_execution_setup_seconds: Histogram,
+    /// Execution of ArbOS's mandatory internal start-block transaction.
+    block_start_block_transaction_seconds: Histogram,
+    /// Execution of derived user and retry transactions, including retry scheduling.
+    block_derived_transactions_seconds: Histogram,
     /// State-root computation plus final block and header construction.
     block_finish_seconds: Histogram,
     /// Sending the executed block to reth's engine tree.
@@ -186,6 +192,15 @@ impl FeedLatencyTracker {
             metrics
                 .block_execution_seconds
                 .record(applied.block_execution.as_secs_f64());
+            metrics
+                .block_execution_setup_seconds
+                .record(applied.block_execution_setup.as_secs_f64());
+            metrics
+                .block_start_block_transaction_seconds
+                .record(applied.block_start_block_transaction.as_secs_f64());
+            metrics
+                .block_derived_transactions_seconds
+                .record(applied.block_derived_transactions.as_secs_f64());
             metrics
                 .block_finish_seconds
                 .record(applied.block_finish.as_secs_f64());

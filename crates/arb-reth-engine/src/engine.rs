@@ -207,6 +207,9 @@ fn produce_with_timing<'a>(
         .ctx_mut()
         .modify_block(|b| b.basefee = block_base_fee);
 
+    let execution_setup = phase_started_at.elapsed();
+    let mut start_block_transaction = Duration::ZERO;
+    let mut derived_transactions = Duration::ZERO;
     let mut first = builder.executor().start_block_tx();
     loop {
         let (tx, is_internal) = if let Some(t) = first.take() {
@@ -225,10 +228,17 @@ fn produce_with_timing<'a>(
         let recovered = Recovered::new_unchecked(tx, sender);
         let mut tx_logs: Vec<Log> = Vec::new();
         let mut tx_success = false;
+        let tx_started_at = Instant::now();
         if let Err(e) = builder.execute_transaction_with_result_closure(recovered, |res| {
             tx_success = res.result.result.is_success();
             tx_logs = res.result.result.logs().to_vec();
         }) {
+            let tx_execution = tx_started_at.elapsed();
+            if is_internal {
+                start_block_transaction += tx_execution;
+            } else {
+                derived_transactions += tx_execution;
+            }
             // Nitro `arbos/block_processor.go` (~l.503-549): a derived tx that is INVALID under the
             // state transition, a validation failure like lack-of-funds / NonceTooHigh, NOT a
             // revert, is reverted and dropped, and block production continues without it. This is
@@ -255,6 +265,13 @@ fn produce_with_timing<'a>(
             let retries =
                 scheduled_retries_from_redeem_logs(builder.evm_mut().ctx_mut(), &tx_logs, chain_id);
             redeems.extend(retries);
+        }
+
+        let tx_execution = tx_started_at.elapsed();
+        if is_internal {
+            start_block_transaction += tx_execution;
+        } else {
+            derived_transactions += tx_execution;
         }
     }
 
@@ -294,6 +311,9 @@ fn produce_with_timing<'a>(
             message_preparation,
             state_setup,
             execution,
+            execution_setup,
+            start_block_transaction,
+            derived_transactions,
             finish,
         },
     ))
@@ -807,6 +827,12 @@ pub struct ArbAppliedMessageTiming {
     pub block_state_setup: Duration,
     /// ArbOS pre-execution and transaction execution.
     pub block_execution: Duration,
+    /// Block-builder creation, pre-execution changes, and base-fee setup before the first tx.
+    pub block_execution_setup: Duration,
+    /// Execution of ArbOS's mandatory internal start-block transaction.
+    pub block_start_block_transaction: Duration,
+    /// Execution of derived user and retry transactions, including retry scheduling.
+    pub block_derived_transactions: Duration,
     /// State-root computation plus final block and header construction.
     pub block_finish: Duration,
     /// Sending the executed block to the engine tree.
@@ -826,6 +852,9 @@ struct ArbBlockProductionTiming {
     message_preparation: Duration,
     state_setup: Duration,
     execution: Duration,
+    execution_setup: Duration,
+    start_block_transaction: Duration,
+    derived_transactions: Duration,
     finish: Duration,
 }
 
@@ -1474,6 +1503,9 @@ where
                 block_message_preparation: production_timing.message_preparation,
                 block_state_setup: production_timing.state_setup,
                 block_execution: production_timing.execution,
+                block_execution_setup: production_timing.execution_setup,
+                block_start_block_transaction: production_timing.start_block_transaction,
+                block_derived_transactions: production_timing.derived_transactions,
                 block_finish: production_timing.finish,
                 engine_insert,
                 engine_forkchoice,
