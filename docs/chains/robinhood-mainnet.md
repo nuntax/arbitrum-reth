@@ -1,8 +1,14 @@
 # Robinhood mainnet
 
-Robinhood Chain is an Orbit chain with chain ID `4663`, rooted on Ethereum mainnet. `arb-reth` boots it from the committed `chaininfo.json` and genesis files, then derives batches from L1. It can follow the public sequencer feed while it catches up.
+Robinhood Chain is an Orbit chain with chain ID `4663`, rooted on Ethereum mainnet. `arb-reth` boots it from Robinhood's `chaininfo.json` and genesis files, then derives batches from L1. It can follow the public sequencer feed while it catches up.
 
 This is an operator recipe for the current mainnet configuration. Keep credentials out of shell history, repository files, and process listings.
+
+## Bootstrap files
+
+Download the mainnet `chaininfo.json` and `genesis.json` from Robinhood's [Run a full node guide](https://docs.robinhood.com/chain/run-a-full-node/). Robinhood publishes both files there for full-node operators.
+
+The copies currently under `crates/arb-reth-node/tests/fixtures` exist to exercise the Orbit boot parser. They are test fixtures, not an operator distribution contract, and may be moved or removed from this repository at any time. Keep downloaded files in operator-controlled storage and pass their paths explicitly.
 
 ## Requirements
 
@@ -26,19 +32,21 @@ export L1_RPC="https://your-ethereum-archive-rpc.example"
 export L1_BEACON="https://your-ethereum-beacon-api.example"
 export FEED_URL="wss://feed.mainnet.chain.robinhood.com"
 export METRICS_ADDR="127.0.0.1:9001"
+export CHAIN_INFO="$HOME/rh/config/robinhood-chain-info.json"
+export GENESIS="$HOME/rh/config/robinhood-genesis.json"
 ```
 
 The canonical RPC is `https://rpc.mainnet.chain.robinhood.com`. It is useful for parity checks, not for L1 derivation.
 
 ## Start the node
 
-The committed boot fixtures are under `crates/arb-reth-node/tests/fixtures`. The command below creates the datadir when absent and resumes from its stored L1 checkpoint on later starts.
+The command below creates the datadir when absent and resumes from its stored L1 checkpoint on later starts.
 
 ```sh
 "$ARB_RETH/target/release/arb-reth" node \
   --datadir "$DATADIR" \
-  --chain-info "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-chain-info.json" \
-  --genesis "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-genesis.json" \
+  --chain-info "$CHAIN_INFO" \
+  --genesis "$GENESIS" \
   --l1-rpc "$L1_RPC" \
   --l1-beacon "$L1_BEACON" \
   --l1-getlogs-range 500 \
@@ -83,8 +91,8 @@ Stop the node before modifying the datadir. If `N` is the first divergent L2 blo
 ```sh
 "$ARB_RETH/target/release/arb-reth" rewind \
   --datadir "$DATADIR" \
-  --chain-info "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-chain-info.json" \
-  --genesis "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-genesis.json" \
+  --chain-info "$CHAIN_INFO" \
+  --genesis "$GENESIS" \
   --diverged-at N
 ```
 
