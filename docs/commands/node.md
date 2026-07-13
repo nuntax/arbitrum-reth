@@ -46,6 +46,23 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 `--no-l1-derive` makes the feed the only producer. It still needs `--l1-rpc` to bootstrap chain information, and it is appropriate only for a datadir that is already at the feed's retained range.
 
+## Metrics
+
+Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. It includes reth's engine-tree and persistence metrics, so no separate pipeline service is needed.
+
+With `--feed-url`, `reth_arb_reth_feed_frame_to_canonical_seconds` measures from receiving a WebSocket data frame through JSON decoding, queueing, block execution, and reth in-memory canonicalization. It ends when the shared provider state backing RPC has the new canonical head. It does not include an RPC client's network round trip or response serialization.
+
+The dashboard should focus on the execution loop:
+
+- `reth_blockchain_tree_in_mem_state_num_blocks` and `reth_consensus_engine_beacon_backpressure_active` show the unpersisted window and whether it is stalling execution.
+- `reth_consensus_engine_beacon_persistence_duration` and `reth_consensus_engine_persistence_save_blocks_*` show persistence batch latency and size.
+- `reth_executor_worker_pool_job_{duration,queue_wait}_seconds{pool="state-ovly"}` exposes the parallel state-root worker pool.
+- `reth_sync_block_validation_state_trie_overlay_overlay_cache_*` and `reth_trie_parallel_*` show overlay reuse and parallel state-root work.
+
+The standard reth pipeline and `newPayload` metrics are also exported, but they stay unused in this execute-then-persist architecture.
+
+`reth_arb_reth_feed_tracking_dropped_total` counts samples intentionally skipped when telemetry would contend with the feed reader or block producer. It should stay at zero during normal operation.
+
 ## Persistence controls
 
 - `--persistence-threshold`: number of canonical blocks before a persistence batch.

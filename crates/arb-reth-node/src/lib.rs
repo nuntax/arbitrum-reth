@@ -51,6 +51,9 @@ pub use arb_reth_sync::resume::{L1ResumeCheckpoint, L1ResumeLog};
 pub mod launcher;
 pub use launcher::{ArbLauncher, ArbNodeHandle};
 
+mod metrics;
+pub use metrics::FeedLatencyTracker;
+
 pub mod executor;
 pub use executor::ArbExecutorBuilder;
 

@@ -61,6 +61,7 @@
             genesis_block: 0,
             tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
             messages: rx,
+            feed_latency: None,
             rpc_addr: Some(rpc_addr),
         };
 

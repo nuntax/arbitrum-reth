@@ -1,0 +1,93 @@
+# Robinhood mainnet
+
+Robinhood Chain is an Orbit chain with chain ID `4663`, rooted on Ethereum mainnet. `arb-reth` boots it from the committed `chaininfo.json` and genesis files, then derives batches from L1. It can follow the public sequencer feed while it catches up.
+
+This is an operator recipe for the current mainnet configuration. Keep credentials out of shell history, repository files, and process listings.
+
+## Requirements
+
+- A release build of `arb-reth`.
+- An archive-capable Ethereum mainnet execution RPC.
+- An Ethereum mainnet beacon API. Robinhood has blob batches, so the beacon endpoint is required for a complete sync.
+- Disk space for the full chain and a persistent datadir. Do not place the datadir in a temporary directory.
+
+Build the binary from the repository root:
+
+```sh
+cargo build --release -p arb-reth-node --bin arb-reth
+```
+
+Set the paths and RPC credentials in the environment. The execution and beacon endpoints below are placeholders and should be supplied by the operator.
+
+```sh
+export ARB_RETH="$PWD"
+export DATADIR="$HOME/arb-data/robinhood-mainnet"
+export L1_RPC="https://your-ethereum-archive-rpc.example"
+export L1_BEACON="https://your-ethereum-beacon-api.example"
+export FEED_URL="wss://feed.mainnet.chain.robinhood.com"
+export METRICS_ADDR="127.0.0.1:9001"
+```
+
+The canonical RPC is `https://rpc.mainnet.chain.robinhood.com`. It is useful for parity checks, not for L1 derivation.
+
+## Start the node
+
+The committed boot fixtures are under `crates/arb-reth-node/tests/fixtures`. The command below creates the datadir when absent and resumes from its stored L1 checkpoint on later starts.
+
+```sh
+"$ARB_RETH/target/release/arb-reth" node \
+  --datadir "$DATADIR" \
+  --chain-info "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-chain-info.json" \
+  --genesis "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-genesis.json" \
+  --l1-rpc "$L1_RPC" \
+  --l1-beacon "$L1_BEACON" \
+  --l1-getlogs-range 500 \
+  --l1-prefetch 32 \
+  --feed-url "$FEED_URL" \
+  --persistence-threshold 128 \
+  --memory-buffer-target 0 \
+  --persistence-backpressure 512 \
+  --http --http.port 8547 \
+  --metrics "$METRICS_ADDR"
+```
+
+The feed and L1 derivation may run together. The feed improves time at the tip, while L1 remains the source of durable historical derivation. Feed messages ahead of the L1 cursor are reconciled by sequence number and applied when they become contiguous.
+
+`--l1-getlogs-range 500` and `--l1-prefetch 32` are good starting values for an endpoint that permits wide log ranges and concurrent blob requests. Reduce the range when the provider limits `eth_getLogs`; reduce prefetch when the beacon service is rate-limited.
+
+Keep metrics on loopback unless a metrics network is explicitly configured. A local Prometheus container can scrape `127.0.0.1:9001` through the host bridge.
+
+## Check progress
+
+The local RPC reports the produced tip:
+
+```sh
+curl -fsS \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+  http://127.0.0.1:8547
+```
+
+The Prometheus endpoint exposes feed latency, execution, engine-tree, parallel-root, and persistence metrics:
+
+```sh
+curl -fsS http://127.0.0.1:9001/metrics | grep -E 'reth_(arb_reth_feed|blockchain_tree|consensus_engine)'
+```
+
+At the tip, compare the local and canonical block hashes and state roots only at a height both endpoints serve. The feed can place the local node slightly ahead of the canonical RPC, which is not a divergence.
+
+## Recover from a confirmed divergence
+
+Stop the node before modifying the datadir. If `N` is the first divergent L2 block, retain `N - 1` and re-derive the suffix after fixing the state-transition bug:
+
+```sh
+"$ARB_RETH/target/release/arb-reth" rewind \
+  --datadir "$DATADIR" \
+  --chain-info "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-chain-info.json" \
+  --genesis "$ARB_RETH/crates/arb-reth-node/tests/fixtures/robinhood-genesis.json" \
+  --diverged-at N
+```
+
+Run the same `node` command again afterwards. Start with `rewind --dry-run` when the target has not been independently verified.
+
+See the [node command](../commands/node.md) and [rewind command](../commands/rewind.md) for option details.

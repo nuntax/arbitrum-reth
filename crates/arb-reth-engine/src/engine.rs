@@ -29,6 +29,7 @@ use arb_revm::executor::{
 };
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::{WrapErr as _, eyre};
+use std::time::{Duration, Instant};
 
 use reth_chain_state::{
     CanonicalInMemoryState, ComputedTrieData, ExecutedBlock, MemoryOverlayStateProviderRef,
@@ -95,6 +96,31 @@ pub fn produce<'a>(
     exec_state_provider: Box<dyn StateProvider + 'a>,
     trie_state_provider: Box<dyn StateProvider + 'a>,
 ) -> eyre::Result<BuiltPayloadExecutedBlock<ArbPrimitives>> {
+    Ok(
+        produce_with_timing(
+            evm_config,
+            chain_id,
+            parent,
+            feed_msg,
+            exec_state_provider,
+            trie_state_provider,
+        )?
+        .0,
+    )
+}
+
+/// Produce one block and retain a breakdown of the local block-production work.
+///
+/// Kept private so the public [`produce`] helper remains the small, stable test-facing API.
+fn produce_with_timing<'a>(
+    evm_config: &ArbEvmConfig,
+    chain_id: u64,
+    parent: &SealedHeader<Header>,
+    feed_msg: &BroadcastFeedMessage,
+    exec_state_provider: Box<dyn StateProvider + 'a>,
+    trie_state_provider: Box<dyn StateProvider + 'a>,
+) -> eyre::Result<(BuiltPayloadExecutedBlock<ArbPrimitives>, ArbBlockProductionTiming)> {
+    let started_at = Instant::now();
     let parent_header = parent.header();
     let version = arbitrum_alloy_consensus::header::ArbHeaderInfo::decode_header(parent_header)
         .map(|i| i.arbos_format_version as u8)
@@ -130,8 +156,7 @@ pub fn produce<'a>(
         withdrawals: None,
     };
 
-    // Bench sub-timing: overlay build vs execution vs state-root `finish`.
-    let __ov0 = std::time::Instant::now();
+    let phase_started_at = Instant::now();
 
     // `exec_state_provider` / `trie_state_provider` are supplied by the caller and must be
     // independent instances (sharing one corrupts execution reads vs the trie build). The caller
@@ -141,8 +166,9 @@ pub fn produce<'a>(
         .with_bundle_update()
         .build();
 
-    let __us_overlay = __ov0.elapsed().as_micros();
-    let __ex0 = std::time::Instant::now();
+    let state_setup = phase_started_at.elapsed();
+    let message_preparation = started_at.elapsed().saturating_sub(state_setup);
+    let phase_started_at = Instant::now();
 
     let mut builder = evm_config
         .builder_for_next_block(&mut state, parent, attrs)
@@ -232,21 +258,14 @@ pub fn produce<'a>(
         }
     }
 
-    let __us_exec = __ex0.elapsed().as_micros();
-    let __fi0 = std::time::Instant::now();
+    let execution = phase_started_at.elapsed();
+    let phase_started_at = Instant::now();
 
     let outcome = builder
         .finish(trie_state_provider, None)
         .wrap_err("BlockBuilder::finish failed")?;
 
-    tracing::debug!(
-        target: "arb-reth::engine::timing",
-        block = parent_header.number + 1,
-        us_overlay = __us_overlay as u64,
-        us_exec = __us_exec as u64,
-        us_finish = __fi0.elapsed().as_micros() as u64,
-        "produce timing",
-    );
+    let finish = phase_started_at.elapsed();
 
     let bundle = state.take_bundle();
     drop(state);
@@ -263,12 +282,21 @@ pub fn produce<'a>(
     });
 
     // BuiltPayloadExecutedBlock wants unsorted hashed_state / trie_updates.
-    Ok(BuiltPayloadExecutedBlock {
-        recovered_block: Arc::new(recovered_block),
-        execution_output,
-        hashed_state: Arc::new(outcome.hashed_state),
-        trie_updates: Arc::new(outcome.trie_updates),
-    })
+    Ok((
+        BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(recovered_block),
+            execution_output,
+            hashed_state: Arc::new(outcome.hashed_state),
+            trie_updates: Arc::new(outcome.trie_updates),
+        },
+        ArbBlockProductionTiming {
+            parent_state: Duration::ZERO,
+            message_preparation,
+            state_setup,
+            execution,
+            finish,
+        },
+    ))
 }
 
 /// A [`StateProvider`] that wraps the ring-overlay trie provider and overrides only the
@@ -760,6 +788,47 @@ impl ArbEngineTuning {
     }
 }
 
+/// Timings for one message that produced a canonical block.
+///
+/// `block_production` includes ArbOS execution, state-root computation, and header sealing.
+/// The other fields cover the engine-tree handoff through in-memory canonicalization. Persistence
+/// to MDBX remains asynchronous and is intentionally outside this critical-path measurement.
+#[derive(Debug, Clone, Copy)]
+pub struct ArbAppliedMessageTiming {
+    /// Instant immediately before block production begins.
+    pub started_at: Instant,
+    /// Execution, state-root computation, and block/header construction.
+    pub block_production: Duration,
+    /// Parent-state provider setup before `produce` begins.
+    pub block_parent_state: Duration,
+    /// Feed-message digesting and next-block environment construction.
+    pub block_message_preparation: Duration,
+    /// Creation of revm's journaled state over the parent provider.
+    pub block_state_setup: Duration,
+    /// ArbOS pre-execution and transaction execution.
+    pub block_execution: Duration,
+    /// State-root computation plus final block and header construction.
+    pub block_finish: Duration,
+    /// Sending the executed block to the engine tree.
+    pub engine_insert: Duration,
+    /// Forkchoice request and response from the engine tree.
+    pub engine_forkchoice: Duration,
+    /// Waiting for the shared canonical in-memory state to observe the new head.
+    pub canonicalization_wait: Duration,
+    /// Total time in the in-order apply path.
+    pub total: Duration,
+}
+
+/// Breakdown of local work performed while producing an Arbitrum block.
+#[derive(Debug, Clone, Copy)]
+struct ArbBlockProductionTiming {
+    parent_state: Duration,
+    message_preparation: Duration,
+    state_setup: Duration,
+    execution: Duration,
+    finish: Duration,
+}
+
 /// Engine-tree driver for `ArbNode`.
 ///
 /// Owns the tree's request sender, the current tip, and a receiver of canonicalization
@@ -1028,7 +1097,8 @@ where
     fn build_block(
         &self,
         msg: &BroadcastFeedMessage,
-    ) -> eyre::Result<BuiltPayloadExecutedBlock<ArbPrimitives>> {
+    ) -> eyre::Result<(BuiltPayloadExecutedBlock<ArbPrimitives>, ArbBlockProductionTiming)> {
+        let started_at = Instant::now();
         if self.ring_overlay {
             // Pin one MDBX RO tx: read the persisted tip and the immune latest state from the same
             // tx so the state-root path's historical anchor sits exactly at `persisted_tip` (the
@@ -1102,7 +1172,7 @@ where
             } else {
                 trie_sp
             };
-            let built = produce(
+            let (built, mut timing) = produce_with_timing(
                 &self.evm_config,
                 self.chain_id,
                 &self.tip,
@@ -1110,11 +1180,14 @@ where
                 exec_sp,
                 trie_sp,
             )?;
+            timing.parent_state = started_at
+                .elapsed()
+                .saturating_sub(timing.message_preparation + timing.state_setup + timing.execution + timing.finish);
             // Zero-risk probe: also compute the root in parallel and assert it equals the serial
             // one just produced (serial still drives the chain). No-op unless ARB_SHADOW_STATEROOT
             // is set.
             self.shadow_compare(&built);
-            Ok(built)
+            Ok((built, timing))
         } else {
             let exec_sp = self
                 .provider
@@ -1124,14 +1197,18 @@ where
                 .provider
                 .state_by_block_hash(self.tip.hash())
                 .wrap_err("state_by_block_hash (trie) failed")?;
-            produce(
+            let (built, mut timing) = produce_with_timing(
                 &self.evm_config,
                 self.chain_id,
                 &self.tip,
                 msg,
                 exec_sp,
                 trie_sp,
-            )
+            )?;
+            timing.parent_state = started_at
+                .elapsed()
+                .saturating_sub(timing.message_preparation + timing.state_setup + timing.execution + timing.finish);
+            Ok((built, timing))
         }
     }
 
@@ -1248,6 +1325,20 @@ where
     /// applies it if it is the next expected message, or buffers it as feed-ahead otherwise; after
     /// applying, drains any now-contiguous buffered messages. Returns the resulting head hash.
     pub async fn advance(&mut self, msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
+        self.advance_with_applied(msg, |_, _| {}).await
+    }
+
+    /// Like [`Self::advance`], while notifying the caller after each message has become the
+    /// canonical in-memory head. This includes buffered feed-ahead messages drained after a gap
+    /// closes, and deliberately excludes duplicate messages that were not applied.
+    pub async fn advance_with_applied<F>(
+        &mut self,
+        msg: &BroadcastFeedMessage,
+        mut on_applied: F,
+    ) -> eyre::Result<B256>
+    where
+        F: FnMut(u64, ArbAppliedMessageTiming),
+    {
         const MAX_PENDING: usize = 50_000;
         let seq = msg.sequence_number;
         if seq < self.next_seq {
@@ -1262,10 +1353,13 @@ where
             return Ok(self.tip.hash());
         }
         // seq == next_seq: this is the next block. Apply it, then drain the buffer forward.
-        let mut hash = self.apply_one(msg).await?;
+        let (mut hash, timing) = self.apply_one(msg).await?;
+        on_applied(seq, timing);
         self.next_seq += 1;
         while let Some(buffered) = self.pending.remove(&self.next_seq) {
-            hash = self.apply_one(&buffered).await?;
+            let (new_hash, timing) = self.apply_one(&buffered).await?;
+            hash = new_hash;
+            on_applied(self.next_seq, timing);
             self.next_seq += 1;
         }
         // Discard any stragglers now below the cursor (a feed dup that lost the race to L1).
@@ -1276,9 +1370,11 @@ where
     /// Apply exactly one in-order message: build the next block from `self.tip`, insert it into the
     /// engine tree, canonicalize, and advance `self.tip`. [`Self::advance`]'s sequence guard ensures
     /// this is only called for the message that produces `tip + 1`.
-    async fn apply_one(&mut self, msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
-        use std::time::Instant;
-        let __t0 = Instant::now();
+    async fn apply_one(
+        &mut self,
+        msg: &BroadcastFeedMessage,
+    ) -> eyre::Result<(B256, ArbAppliedMessageTiming)> {
+        let started_at = Instant::now();
 
         // Legacy path (`ring_overlay=false`): `produce` reads parent state via
         // `provider.state_by_block_hash(parent)`, which snapshots the tree overlay + the DB
@@ -1286,11 +1382,11 @@ where
         // deep-buffer failures with a retry: some torn reads mis-execute without erroring, baking a
         // wrong root into the chain. The `--ring-overlay` path reads from the driver-held ring over
         // the immune latest provider and is not raced by persistence.
-        let built = self.build_block(msg)?;
+        let (built, production_timing) = self.build_block(msg)?;
         let new_hash = built.recovered_block.hash();
         let new_header = built.recovered_block.header().clone();
         let new_number = new_header.number;
-        let __us_produce = __t0.elapsed().as_micros();
+        let block_production = started_at.elapsed();
 
         // Ring bookkeeping (no-op unless `--ring-overlay`): record this block as an unpersisted
         // parent for the next `build_block`, and prune what the DB has since persisted. Must run
@@ -1298,16 +1394,16 @@ where
         self.maintain_ring(&built);
 
         // Feed the executed block to the tree (no re-execution).
-        let __t = Instant::now();
+        let phase_started_at = Instant::now();
         self.to_tree
             .send(FromEngine::Request(EngineApiRequest::InsertExecutedBlock(
                 built,
             )))
             .map_err(|e| eyre!("send InsertExecutedBlock: {e}"))?;
-        let __us_insert = __t.elapsed().as_micros();
+        let engine_insert = phase_started_at.elapsed();
 
         // Drive canonicalization via ForkchoiceUpdated (head = new block).
-        let __t = Instant::now();
+        let phase_started_at = Instant::now();
         let (fcu_tx, fcu_rx) = tokio::sync::oneshot::channel();
         let fcu_state = alloy_rpc_types_engine::ForkchoiceState {
             head_block_hash: new_hash,
@@ -1328,10 +1424,10 @@ where
         fcu_res
             .await
             .map_err(|e| eyre!("block {new_number} FCU error: {e:?}"))?;
-        let __us_fcu = __t.elapsed().as_micros();
+        let engine_forkchoice = phase_started_at.elapsed();
 
         // Wait for the tree to actually canonicalize the block (bounded).
-        let __t = Instant::now();
+        let phase_started_at = Instant::now();
         let canonicalized = wait_for_head(
             &self.provider,
             &self.provider.canonical_in_memory_state(),
@@ -1345,7 +1441,8 @@ where
                 "block {new_number} was NOT canonicalized within timeout (head hash {new_hash:#x})"
             ));
         }
-        let __us_wait = __t.elapsed().as_micros();
+        let canonicalization_wait = phase_started_at.elapsed();
+        let total = started_at.elapsed();
 
         // Per-block production trace (observability) + per-phase timing breakdown.
         tracing::info!(
@@ -1359,16 +1456,31 @@ where
         tracing::debug!(
             target: "arb-reth::engine::timing",
             number = new_number,
-            us_produce = __us_produce,
-            us_insert = __us_insert,
-            us_fcu = __us_fcu,
-            us_wait = __us_wait,
-            us_total = __t0.elapsed().as_micros(),
+            us_produce = block_production.as_micros(),
+            us_insert = engine_insert.as_micros(),
+            us_fcu = engine_forkchoice.as_micros(),
+            us_wait = canonicalization_wait.as_micros(),
+            us_total = total.as_micros(),
             "advance timing",
         );
 
         self.tip = SealedHeader::new(new_header, new_hash);
-        Ok(new_hash)
+        Ok((
+            new_hash,
+            ArbAppliedMessageTiming {
+                started_at,
+                block_production,
+                block_parent_state: production_timing.parent_state,
+                block_message_preparation: production_timing.message_preparation,
+                block_state_setup: production_timing.state_setup,
+                block_execution: production_timing.execution,
+                block_finish: production_timing.finish,
+                engine_insert,
+                engine_forkchoice,
+                canonicalization_wait,
+                total,
+            },
+        ))
     }
 
     /// Returns the current chain tip (the parent for the next block).

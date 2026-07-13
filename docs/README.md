@@ -1,4 +1,4 @@
-# Command guide
+# Documentation
 
 Use the release binary in the examples below. Replace paths and endpoints with values for the target chain.
 
@@ -7,5 +7,6 @@ Use the release binary in the examples below. Replace paths and endpoints with v
 - [genesis](commands/genesis.md): verify state roots before import.
 - [rewind](commands/rewind.md): remove a bad local suffix.
 - [dump-blocks](commands/dump-blocks.md): inspect persisted blocks.
+- [chains](chains/README.md): chain-specific operator notes.
 
 Every command exposes its complete flag list through `arb-reth <command> --help`.

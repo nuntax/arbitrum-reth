@@ -48,6 +48,7 @@ The command above is for a snapshot-seeded database. Orbit chains can instead bo
 ```
 
 See [node command](docs/commands/node.md) before selecting persistence or feed options.
+For a complete Robinhood mainnet invocation, see the [Robinhood chain guide](docs/chains/robinhood-mainnet.md).
 
 ## Commands
 

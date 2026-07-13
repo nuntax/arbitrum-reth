@@ -75,6 +75,7 @@ reth-static-file-types = { git = "https://github.com/paradigmxyz/reth.git", rev 
 # H/#1: launch genesis-acceptance gate (init_genesis_with_settings_and_validate)
 reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 tracing = "0.1"
+metrics = "0.24"
 
 # D.4: standalone launcher (tokio channels)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
@@ -94,6 +95,7 @@ clap = { version = "4", features = ["derive"] }
 reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
+reth-metrics = { git = "https://github.com/paradigmxyz/reth.git", rev = "224b087672690ae2ef85ad706bd18f40d8e5b265" }
 
 # D.5: Arbitrum RPC converters (receipt/rpc converters), consumed by the canonical RpcAddOns wiring.
 arb-reth-rpc = { path = "../arb-reth-rpc" }

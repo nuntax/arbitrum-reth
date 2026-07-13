@@ -20,7 +20,7 @@
 //! With `--chain <PATH>` an Arbitrum chain-config JSON is parsed to produce a real
 //! ArbOS genesis allocation instead of the MAINNET placeholder.
 
-use std::{fs, net::IpAddr, path::PathBuf};
+use std::{fs, net::{IpAddr, SocketAddr}, path::PathBuf};
 
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
@@ -31,6 +31,7 @@ use crate::{
 };
 use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
 use crate::launcher::ArbLauncher;
+use crate::metrics::FeedLatencyTracker;
 use reth_provider::BlockNumReader;
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use clap::Parser;
@@ -39,7 +40,7 @@ use reth_cli_runner::CliContext;
 use reth_db::{init_db, mdbx::DatabaseArguments, mdbx::SyncMode, ClientVersion};
 use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
 use reth_node_core::{
-    args::DatadirArgs,
+    args::{DatadirArgs, MetricArgs},
     dirs::{DataDirPath, MaybePlatformPath},
 };
 use reth_tracing::tracing::info;
@@ -64,6 +65,10 @@ pub struct NodeArgs {
     /// HTTP-RPC server port.
     #[arg(long = "http.port", default_value_t = 8545)]
     http_port: u16,
+
+    /// Enable the reth Prometheus endpoint at this address.
+    #[arg(long = "metrics", alias = "metrics.prometheus", value_name = "ADDR")]
+    metrics: Option<SocketAddr>,
 
     /// Engine-tree persistence threshold: persist once the canonical tip is this many blocks
     /// ahead of the last persisted block (larger = bigger, less frequent commit batches).
@@ -443,7 +448,12 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         }
         None => DatadirArgs::default(),
     };
-    let config = NodeConfig::new(chain_spec).with_datadir_args(datadir_args);
+    let config = NodeConfig::new(chain_spec)
+        .with_datadir_args(datadir_args)
+        .with_metrics(MetricArgs {
+            prometheus: args.metrics,
+            ..Default::default()
+        });
     let data_dir = config.datadir();
 
     // Resolve the L1-derivation resume log path before `data_dir` is moved into the launcher.
@@ -461,6 +471,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
     // The held sender keeps the driver parked (and the node alive) until SIGTERM.
     let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
+    // Only live WebSocket messages carry an ingress timestamp. L1-derived and replay messages
+    // still drive the same engine callback, but have no sample to record.
+    let feed_latency = args.feed_url.as_ref().map(|_| FeedLatencyTracker::new());
 
     let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
 
@@ -481,6 +494,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             ring_overlay: !args.no_ring_overlay,
         },
         messages: feed_rx,
+        feed_latency: feed_latency.clone(),
         rpc_addr,
     };
 
@@ -543,6 +557,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // network and unbounded in time; the low-latency path that rides the sequencer tip directly.
     if let Some(feed_url) = args.feed_url.clone() {
         let tx = feed_tx.clone();
+        let feed_latency = feed_latency.expect("feed latency tracker exists with --feed-url");
         // Ask the relay to start at our tip's next message index (block - genesis + 1). The relay is
         // a bounded tip backlog: if this predates what it holds it just streams its current backlog,
         // and the driver's sequence guard dedups/buffers regardless, so this is an optimization.
@@ -578,6 +593,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                         info!(target: "arb-reth", url = %feed_url, from_seq = next_seq, "feed: connected to sequencer feed");
                         let mut pushed = 0usize;
                         while let Some(frame) = ws.next().await {
+                            // This is the ingress edge: take the timestamp before converting or
+                            // parsing the WebSocket frame so the metric includes that work too.
+                            let frame_received_at = std::time::Instant::now();
                             let text = match frame {
                                 Ok(Message::Text(t)) => t.as_str().to_owned(),
                                 Ok(Message::Binary(b)) => match core::str::from_utf8(b.as_ref()) {
@@ -597,8 +615,17 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                             // and are skipped.
                             match serde_json::from_str::<Root>(&text) {
                                 Ok(root) => {
+                                    let ready_for_channel_at = std::time::Instant::now();
                                     for msg in root.messages.into_iter().flatten() {
                                         next_seq = msg.sequence_number + 1;
+                                        feed_latency.record_frame_arrival(
+                                            msg.sequence_number,
+                                            frame_received_at,
+                                        );
+                                        feed_latency.record_ready_for_channel(
+                                            msg.sequence_number,
+                                            ready_for_channel_at,
+                                        );
                                         if tx.send(msg).await.is_err() {
                                             reth_tracing::tracing::warn!(target: "arb-reth", "feed channel closed; stopping feed follower");
                                             return;
