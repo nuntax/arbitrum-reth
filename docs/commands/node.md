@@ -46,6 +46,10 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 `--no-l1-derive` makes the feed the only producer. It still needs `--l1-rpc` to bootstrap chain information, and it is appropriate only for a datadir that is already at the feed's retained range.
 
+## Metrics
+
+Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [observability guide](../observability/README.md) for feed latency, engine-tree, persistence, and Prometheus scrape details.
+
 ## Persistence controls
 
 - `--persistence-threshold`: number of canonical blocks before a persistence batch.

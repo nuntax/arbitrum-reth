@@ -19,16 +19,17 @@ use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::map::{HashMap, HashSet};
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
-use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
-use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
 use arb_revm::ArbosState;
 use arb_revm::executor::{
     ArbExecCfg, ArbParentHeader, digest_message, scheduled_retries_from_redeem_logs,
 };
+use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
+use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::{WrapErr as _, eyre};
+use std::time::{Duration, Instant};
 
 use reth_chain_state::{
     CanonicalInMemoryState, ComputedTrieData, ExecutedBlock, MemoryOverlayStateProviderRef,
@@ -39,9 +40,12 @@ use reth_engine_primitives::{
 };
 use reth_engine_tree::engine::{EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine};
 use reth_engine_tree::persistence::PersistenceHandle;
-use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler};
+use reth_engine_tree::tree::precompile_cache::PrecompileCacheMap;
+use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler, PayloadProcessor};
 use reth_evm::ConfigureEvm as _;
+use reth_evm::Evm as _;
 use reth_evm::execute::BlockBuilder as _;
+use reth_execution_cache::{CacheFillMode, CacheStats, CachedStateProvider, ExecutionCache};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::BuiltPayloadExecutedBlock;
@@ -69,6 +73,7 @@ use reth_trie_common::{
 };
 use reth_trie_db::ChangesetCache;
 use reth_trie_parallel::root::ParallelStateRoot;
+use reth_trie_parallel::state_root_task::StateRootHandle;
 use revm::context_interface::ContextTr as _;
 use revm_database::BundleState;
 
@@ -95,6 +100,34 @@ pub fn produce<'a>(
     exec_state_provider: Box<dyn StateProvider + 'a>,
     trie_state_provider: Box<dyn StateProvider + 'a>,
 ) -> eyre::Result<BuiltPayloadExecutedBlock<ArbPrimitives>> {
+    Ok(produce_with_timing(
+        evm_config,
+        chain_id,
+        parent,
+        feed_msg,
+        exec_state_provider,
+        trie_state_provider,
+        None,
+    )?
+    .0)
+}
+
+/// Produce one block and retain a breakdown of the local block-production work.
+///
+/// Kept private so the public [`produce`] helper remains the small, stable test-facing API.
+fn produce_with_timing<'a>(
+    evm_config: &ArbEvmConfig,
+    chain_id: u64,
+    parent: &SealedHeader<Header>,
+    feed_msg: &BroadcastFeedMessage,
+    exec_state_provider: Box<dyn StateProvider + 'a>,
+    trie_state_provider: Box<dyn StateProvider + 'a>,
+    mut sparse_state_root: Option<(StateRootHandle, SparseStateRootMode)>,
+) -> eyre::Result<(
+    BuiltPayloadExecutedBlock<ArbPrimitives>,
+    ArbBlockProductionTiming,
+)> {
+    let started_at = Instant::now();
     let parent_header = parent.header();
     let version = arbitrum_alloy_consensus::header::ArbHeaderInfo::decode_header(parent_header)
         .map(|i| i.arbos_format_version as u8)
@@ -130,8 +163,7 @@ pub fn produce<'a>(
         withdrawals: None,
     };
 
-    // Bench sub-timing: overlay build vs execution vs state-root `finish`.
-    let __ov0 = std::time::Instant::now();
+    let phase_started_at = Instant::now();
 
     // `exec_state_provider` / `trie_state_provider` are supplied by the caller and must be
     // independent instances (sharing one corrupts execution reads vs the trie build). The caller
@@ -141,12 +173,19 @@ pub fn produce<'a>(
         .with_bundle_update()
         .build();
 
-    let __us_overlay = __ov0.elapsed().as_micros();
-    let __ex0 = std::time::Instant::now();
+    let state_setup = phase_started_at.elapsed();
+    let message_preparation = started_at.elapsed().saturating_sub(state_setup);
+    let phase_started_at = Instant::now();
 
     let mut builder = evm_config
         .builder_for_next_block(&mut state, parent, attrs)
         .map_err(|e| eyre!("builder_for_next_block: {e:?}"))?;
+    if let Some((handle, _)) = sparse_state_root.as_ref() {
+        builder
+            .evm_mut()
+            .db_mut()
+            .set_state_hook(Some(Box::new(handle.state_hook())));
+    }
     builder
         .apply_pre_execution_changes()
         .wrap_err("apply_pre_execution_changes failed")?;
@@ -181,7 +220,15 @@ pub fn produce<'a>(
         .ctx_mut()
         .modify_block(|b| b.basefee = block_base_fee);
 
+    let execution_setup = phase_started_at.elapsed();
+    let phase_started_at = Instant::now();
     let mut first = builder.executor().start_block_tx();
+    let start_block_transaction_construction = phase_started_at.elapsed();
+    let phase_started_at = Instant::now();
+    let mut start_block_transaction = Duration::ZERO;
+    let mut derived_transactions = Duration::ZERO;
+    let mut derived_transaction_execution = Duration::ZERO;
+    let mut derived_retry_scheduling = Duration::ZERO;
     loop {
         let (tx, is_internal) = if let Some(t) = first.take() {
             (t, true)
@@ -199,10 +246,18 @@ pub fn produce<'a>(
         let recovered = Recovered::new_unchecked(tx, sender);
         let mut tx_logs: Vec<Log> = Vec::new();
         let mut tx_success = false;
+        let tx_started_at = Instant::now();
         if let Err(e) = builder.execute_transaction_with_result_closure(recovered, |res| {
             tx_success = res.result.result.is_success();
             tx_logs = res.result.result.logs().to_vec();
         }) {
+            let tx_execution = tx_started_at.elapsed();
+            if is_internal {
+                start_block_transaction += tx_execution;
+            } else {
+                derived_transactions += tx_execution;
+                derived_transaction_execution += tx_execution;
+            }
             // Nitro `arbos/block_processor.go` (~l.503-549): a derived tx that is INVALID under the
             // state transition, a validation failure like lack-of-funds / NonceTooHigh, NOT a
             // revert, is reverted and dropped, and block production continues without it. This is
@@ -224,29 +279,88 @@ pub fn produce<'a>(
             );
             continue;
         }
+        let mut retry_scheduling = Duration::ZERO;
         if tx_success {
             // FIFO, drained before the next user tx, matching Nitro's cascading-redeem order.
+            let retry_scheduling_started_at = Instant::now();
             let retries =
                 scheduled_retries_from_redeem_logs(builder.evm_mut().ctx_mut(), &tx_logs, chain_id);
+            retry_scheduling = retry_scheduling_started_at.elapsed();
             redeems.extend(retries);
+        }
+
+        let tx_execution = tx_started_at.elapsed();
+        if is_internal {
+            start_block_transaction += tx_execution;
+        } else {
+            derived_transactions += tx_execution;
+            derived_transaction_execution += tx_execution.saturating_sub(retry_scheduling);
+            derived_retry_scheduling += retry_scheduling;
         }
     }
 
-    let __us_exec = __ex0.elapsed().as_micros();
-    let __fi0 = std::time::Instant::now();
+    let derived_transactions_unattributed = derived_transactions
+        .saturating_sub(derived_transaction_execution + derived_retry_scheduling);
+
+    let execution =
+        phase_started_at.elapsed() + execution_setup + start_block_transaction_construction;
+    let execution_unattributed = execution.saturating_sub(
+        execution_setup
+            + start_block_transaction_construction
+            + start_block_transaction
+            + derived_transactions,
+    );
+    let phase_started_at = Instant::now();
+
+    // Dropping the hook sends `FinishedStateUpdates`, allowing the sparse-trie task to finalize.
+    if sparse_state_root.is_some() {
+        builder.evm_mut().db_mut().set_state_hook(None);
+    }
+
+    let sparse_precomputed = match sparse_state_root.as_mut() {
+        Some((handle, SparseStateRootMode::Drive)) => {
+            let result = handle
+                .state_root()
+                .map_err(|e| eyre!("sparse state-root computation failed: {e}"))?;
+            Some((result.state_root, Arc::unwrap_or_clone(result.trie_updates)))
+        }
+        _ => None,
+    };
 
     let outcome = builder
-        .finish(trie_state_provider, None)
+        .finish(trie_state_provider, sparse_precomputed)
         .wrap_err("BlockBuilder::finish failed")?;
 
-    tracing::debug!(
-        target: "arb-reth::engine::timing",
-        block = parent_header.number + 1,
-        us_overlay = __us_overlay as u64,
-        us_exec = __us_exec as u64,
-        us_finish = __fi0.elapsed().as_micros() as u64,
-        "produce timing",
-    );
+    if let Some((handle, SparseStateRootMode::Shadow)) = sparse_state_root.as_mut() {
+        let sparse = handle
+            .state_root()
+            .map_err(|e| eyre!("shadow sparse state-root computation failed: {e}"))?;
+        let sparse_updates = Arc::unwrap_or_clone(sparse.trie_updates).into_sorted();
+        let authoritative_updates = outcome.trie_updates.clone().into_sorted();
+        let root_matches = sparse.state_root == outcome.block.header().state_root;
+        let updates_match = sparse_updates == authoritative_updates;
+        metrics::counter!(
+            "arb_reth.sparse_state_root_shadow_total",
+            "result" => match (root_matches, updates_match) {
+                (true, true) => "root_and_updates_match",
+                (true, false) => "root_matches_updates_differ",
+                (false, _) => "root_mismatch",
+            },
+        )
+        .increment(1);
+        if !root_matches {
+            return Err(eyre!(
+                "sparse state-root shadow mismatch at block {}: root_matches={} updates_match={} sparse={} authoritative={}",
+                outcome.block.header().number,
+                root_matches,
+                updates_match,
+                sparse.state_root,
+                outcome.block.header().state_root,
+            ));
+        }
+    }
+
+    let finish = phase_started_at.elapsed();
 
     let bundle = state.take_bundle();
     drop(state);
@@ -263,12 +377,54 @@ pub fn produce<'a>(
     });
 
     // BuiltPayloadExecutedBlock wants unsorted hashed_state / trie_updates.
-    Ok(BuiltPayloadExecutedBlock {
-        recovered_block: Arc::new(recovered_block),
-        execution_output,
-        hashed_state: Arc::new(outcome.hashed_state),
-        trie_updates: Arc::new(outcome.trie_updates),
-    })
+    Ok((
+        BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(recovered_block),
+            execution_output,
+            hashed_state: Arc::new(outcome.hashed_state),
+            trie_updates: Arc::new(outcome.trie_updates),
+        },
+        ArbBlockProductionTiming {
+            parent_state: Duration::ZERO,
+            message_preparation,
+            state_setup,
+            execution,
+            execution_setup,
+            start_block_transaction_construction,
+            start_block_transaction,
+            derived_transactions,
+            derived_transaction_execution,
+            derived_retry_scheduling,
+            derived_transactions_unattributed,
+            execution_unattributed,
+            finish,
+        },
+    ))
+}
+
+/// Sparse-trie rollout mode. Shadow computes both algorithms and refuses to insert a block on any
+/// mismatch. Drive passes the sparse result into `BlockBuilder::finish`, skipping the fallback
+/// parallel trie walk.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SparseStateRootMode {
+    #[default]
+    Off,
+    Shadow,
+    Drive,
+}
+
+impl SparseStateRootMode {
+    fn from_env() -> Self {
+        match std::env::var("ARB_SPARSE_STATEROOT") {
+            Err(_) => Self::Drive,
+            Ok(value) => match value.to_ascii_lowercase().as_str() {
+                "shadow" => Self::Shadow,
+                "1" | "true" | "on" | "yes" | "drive" => Self::Drive,
+                "0" | "false" | "off" | "no" => Self::Off,
+                _ => Self::Off,
+            },
+        }
+    }
 }
 
 /// A [`StateProvider`] that wraps the ring-overlay trie provider and overrides only the
@@ -473,6 +629,216 @@ type CoalescedAccounts = HashMap<Address, Option<Account>>;
 /// Ring-flattened storage values (newest-wins), keyed by (address, slot).
 type CoalescedStorage = HashMap<(Address, StorageKey), StorageValue>;
 
+/// Records the source and duration of an execution-state lookup. A historical-provider lookup is
+/// an MDBX-provider request, not necessarily a physical disk read: MDBX is memory-mapped and the
+/// OS page cache can satisfy it without I/O.
+#[inline]
+fn record_state_read(kind: &'static str, source: &'static str, started_at: Instant) {
+    let elapsed = started_at.elapsed().as_secs_f64();
+    metrics::counter!(
+        "arb_reth.state_read_total",
+        "kind" => kind,
+        "source" => source,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "arb_reth.state_read_seconds",
+        "kind" => kind,
+        "source" => source,
+    )
+    .record(elapsed);
+}
+
+/// Flush one block's cross-block execution-cache statistics after the provider has dropped.
+/// Keeping these counters block-local avoids a metrics operation on every cache access.
+fn record_execution_cache_stats(stats: &CacheStats) {
+    for (kind, hits, misses) in [
+        ("account", stats.account_hits(), stats.account_misses()),
+        ("storage", stats.storage_hits(), stats.storage_misses()),
+        ("bytecode", stats.code_hits(), stats.code_misses()),
+    ] {
+        metrics::counter!(
+            "arb_reth.execution_cache_access_total",
+            "kind" => kind,
+            "result" => "hit",
+        )
+        .increment(hits as u64);
+        metrics::counter!(
+            "arb_reth.execution_cache_access_total",
+            "kind" => kind,
+            "result" => "miss",
+        )
+        .increment(misses as u64);
+        metrics::histogram!(
+            "arb_reth.execution_cache_accesses_per_block",
+            "kind" => kind,
+            "result" => "hit",
+        )
+        .record(hits as f64);
+        metrics::histogram!(
+            "arb_reth.execution_cache_accesses_per_block",
+            "kind" => kind,
+            "result" => "miss",
+        )
+        .record(misses as f64);
+    }
+}
+
+/// Exact read-source wrapper for reth's ordinary ring overlay.
+///
+/// The wrapper implements the same newest-first ring walk as
+/// `MemoryOverlayStateProviderRef` for account and storage reads, while exposing whether a read
+/// resolved from an unpersisted block or fell through to the pinned historical provider. Other
+/// provider methods delegate unchanged to reth's overlay implementation.
+struct InstrumentedRingOverlayProvider<'a> {
+    historical: Box<dyn StateProvider + 'a>,
+    inner: Box<dyn StateProvider + 'a>,
+    in_memory: Vec<ExecutedBlock<ArbPrimitives>>,
+}
+
+impl BlockHashReader for InstrumentedRingOverlayProvider<'_> {
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        self.inner.block_hash(number)
+    }
+
+    fn canonical_hashes_range(
+        &self,
+        start: BlockNumber,
+        end: BlockNumber,
+    ) -> ProviderResult<Vec<B256>> {
+        self.inner.canonical_hashes_range(start, end)
+    }
+}
+
+impl AccountReader for InstrumentedRingOverlayProvider<'_> {
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        let started_at = Instant::now();
+        for block in &self.in_memory {
+            if let Some(account) = block.execution_output.account(address) {
+                record_state_read("account", "ring_overlay", started_at);
+                return Ok(account);
+            }
+        }
+
+        let account = self.historical.basic_account(address)?;
+        record_state_read("account", "historical_provider", started_at);
+        Ok(account)
+    }
+}
+
+impl BytecodeReader for InstrumentedRingOverlayProvider<'_> {
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        self.inner.bytecode_by_hash(code_hash)
+    }
+}
+
+impl StorageRootProvider for InstrumentedRingOverlayProvider<'_> {
+    fn storage_root(
+        &self,
+        address: Address,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<B256> {
+        self.inner.storage_root(address, hashed_storage)
+    }
+
+    fn storage_proof(
+        &self,
+        address: Address,
+        slot: B256,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageProof> {
+        self.inner.storage_proof(address, slot, hashed_storage)
+    }
+
+    fn storage_multiproof(
+        &self,
+        address: Address,
+        slots: &[B256],
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        self.inner
+            .storage_multiproof(address, slots, hashed_storage)
+    }
+}
+
+impl StateProofProvider for InstrumentedRingOverlayProvider<'_> {
+    fn proof(
+        &self,
+        input: TrieInput,
+        address: Address,
+        slots: &[B256],
+    ) -> ProviderResult<AccountProof> {
+        self.inner.proof(input, address, slots)
+    }
+
+    fn multiproof(
+        &self,
+        input: TrieInput,
+        targets: MultiProofTargets,
+    ) -> ProviderResult<MultiProof> {
+        self.inner.multiproof(input, targets)
+    }
+
+    fn witness(
+        &self,
+        input: TrieInput,
+        target: HashedPostState,
+        mode: ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
+        self.inner.witness(input, target, mode)
+    }
+}
+
+impl HashedPostStateProvider for InstrumentedRingOverlayProvider<'_> {
+    fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
+        self.inner.hashed_post_state(bundle_state)
+    }
+}
+
+impl StateRootProvider for InstrumentedRingOverlayProvider<'_> {
+    fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
+        self.inner.state_root(hashed_state)
+    }
+
+    fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
+        self.inner.state_root_from_nodes(input)
+    }
+
+    fn state_root_with_updates(
+        &self,
+        hashed_state: HashedPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_with_updates(hashed_state)
+    }
+
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: TrieInput,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_from_nodes_with_updates(input)
+    }
+}
+
+impl StateProvider for InstrumentedRingOverlayProvider<'_> {
+    fn storage(
+        &self,
+        address: Address,
+        storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        let started_at = Instant::now();
+        for block in &self.in_memory {
+            if let Some(value) = block.execution_output.storage(&address, storage_key.into()) {
+                record_state_read("storage", "ring_overlay", started_at);
+                return Ok(Some(value));
+            }
+        }
+
+        let value = self.historical.storage(address, storage_key)?;
+        record_state_read("storage", "historical_provider", started_at);
+        Ok(value)
+    }
+}
+
 struct CoalescedExecProvider<'a> {
     /// DB anchor for value fallthrough (a `LatestStateProviderRef` over the pinned RO tx).
     historical: Box<dyn StateProvider + 'a>,
@@ -548,9 +914,17 @@ impl BlockHashReader for CoalescedExecProvider<'_> {
 
 impl AccountReader for CoalescedExecProvider<'_> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        let started_at = Instant::now();
         let v = match self.accounts.get(address) {
-            Some(a) => *a,
-            None => self.historical.basic_account(address)?,
+            Some(a) => {
+                record_state_read("account", "coalesced", started_at);
+                *a
+            }
+            None => {
+                let account = self.historical.basic_account(address)?;
+                record_state_read("account", "historical_provider", started_at);
+                account
+            }
         };
         if self.shadow {
             let want = self.inner.basic_account(address)?;
@@ -567,7 +941,11 @@ impl BytecodeReader for CoalescedExecProvider<'_> {
 }
 
 impl StorageRootProvider for CoalescedExecProvider<'_> {
-    fn storage_root(&self, address: Address, hashed_storage: HashedStorage) -> ProviderResult<B256> {
+    fn storage_root(
+        &self,
+        address: Address,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<B256> {
         self.inner.storage_root(address, hashed_storage)
     }
     fn storage_proof(
@@ -584,7 +962,8 @@ impl StorageRootProvider for CoalescedExecProvider<'_> {
         slots: &[B256],
         hashed_storage: HashedStorage,
     ) -> ProviderResult<StorageMultiProof> {
-        self.inner.storage_multiproof(address, slots, hashed_storage)
+        self.inner
+            .storage_multiproof(address, slots, hashed_storage)
     }
 }
 
@@ -647,10 +1026,21 @@ impl StateProvider for CoalescedExecProvider<'_> {
         account: Address,
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
+        let started_at = Instant::now();
         let v = match self.storage.get(&(account, storage_key)) {
-            Some(val) => Some(*val),
-            None if self.known.contains(&account) => Some(StorageValue::ZERO),
-            None => self.historical.storage(account, storage_key)?,
+            Some(val) => {
+                record_state_read("storage", "coalesced", started_at);
+                Some(*val)
+            }
+            None if self.known.contains(&account) => {
+                record_state_read("storage", "coalesced", started_at);
+                Some(StorageValue::ZERO)
+            }
+            None => {
+                let value = self.historical.storage(account, storage_key)?;
+                record_state_read("storage", "historical_provider", started_at);
+                value
+            }
         };
         if self.shadow {
             let want = self.inner.storage(account, storage_key)?;
@@ -679,9 +1069,10 @@ where
     loop {
         // committed to DB?
         if let Ok(best) = provider.best_block_number()
-            && best >= bn {
-                return true;
-            }
+            && best >= bn
+        {
+            return true;
+        }
         // canonical in memory (not yet persisted)?
         let head = canonical.get_canonical_head();
         if head.header().number >= bn && head.hash() == expected_hash {
@@ -760,6 +1151,71 @@ impl ArbEngineTuning {
     }
 }
 
+/// Timings for one message that produced a canonical block.
+///
+/// `block_production` includes ArbOS execution, state-root computation, and header sealing.
+/// The other fields cover the engine-tree handoff through in-memory canonicalization. Persistence
+/// to MDBX remains asynchronous and is intentionally outside this critical-path measurement.
+#[derive(Debug, Clone, Copy)]
+pub struct ArbAppliedMessageTiming {
+    /// Instant immediately before block production begins.
+    pub started_at: Instant,
+    /// Execution, state-root computation, and block/header construction.
+    pub block_production: Duration,
+    /// Parent-state provider setup before `produce` begins.
+    pub block_parent_state: Duration,
+    /// Feed-message digesting and next-block environment construction.
+    pub block_message_preparation: Duration,
+    /// Creation of revm's journaled state over the parent provider.
+    pub block_state_setup: Duration,
+    /// ArbOS pre-execution and transaction execution.
+    pub block_execution: Duration,
+    /// Block-builder creation, pre-execution changes, and base-fee setup before the first tx.
+    pub block_execution_setup: Duration,
+    /// Construction of ArbOS's mandatory internal start-block transaction.
+    pub block_start_block_transaction_construction: Duration,
+    /// Execution of ArbOS's mandatory internal start-block transaction.
+    pub block_start_block_transaction: Duration,
+    /// Execution of derived user and retry transactions, including retry scheduling.
+    pub block_derived_transactions: Duration,
+    /// Derived transaction execution and commit work, excluding retry scheduling.
+    pub block_derived_transaction_execution: Duration,
+    /// Extraction and enqueueing of retries emitted by successful derived transactions.
+    pub block_derived_retry_scheduling: Duration,
+    /// Small remainder after named derived-transaction phases, kept for exact accounting.
+    pub block_derived_transactions_unattributed: Duration,
+    /// Small remainder after the named block-execution phases, kept to make the breakdown exact.
+    pub block_execution_unattributed: Duration,
+    /// State-root computation plus final block and header construction.
+    pub block_finish: Duration,
+    /// Sending the executed block to the engine tree.
+    pub engine_insert: Duration,
+    /// Forkchoice request and response from the engine tree.
+    pub engine_forkchoice: Duration,
+    /// Waiting for the shared canonical in-memory state to observe the new head.
+    pub canonicalization_wait: Duration,
+    /// Total time in the in-order apply path.
+    pub total: Duration,
+}
+
+/// Breakdown of local work performed while producing an Arbitrum block.
+#[derive(Debug, Clone, Copy)]
+struct ArbBlockProductionTiming {
+    parent_state: Duration,
+    message_preparation: Duration,
+    state_setup: Duration,
+    execution: Duration,
+    execution_setup: Duration,
+    start_block_transaction_construction: Duration,
+    start_block_transaction: Duration,
+    derived_transactions: Duration,
+    derived_transaction_execution: Duration,
+    derived_retry_scheduling: Duration,
+    derived_transactions_unattributed: Duration,
+    execution_unattributed: Duration,
+    finish: Duration,
+}
+
 /// Engine-tree driver for `ArbNode`.
 ///
 /// Owns the tree's request sender, the current tip, and a receiver of canonicalization
@@ -820,6 +1276,16 @@ where
     coalesce_overlay: bool,
     /// `ARB_COALESCE_SHADOW=1`: when coalescing, assert each value read equals reth's overlay walk.
     coalesce_shadow: bool,
+    /// Cross-block account/storage/bytecode cache used by the execution provider. This is updated
+    /// from each canonical block's final `BundleState`, so it always represents `execution_cache_tip`.
+    execution_cache: ExecutionCache,
+    execution_cache_tip: B256,
+    execution_cache_enabled: bool,
+    /// Retained sparse-trie pipeline for the direct feed driver. It streams transaction state
+    /// updates during execution and preserves revealed trie nodes across the linear chain.
+    state_root_processor: PayloadProcessor<ArbEvmConfig>,
+    state_root_config: TreeConfig,
+    sparse_state_root_mode: SparseStateRootMode,
     /// reth's native "ring" for the parallel/overlay path: resolves the (trie + hashed) overlay for
     /// the unpersisted blocks between the persisted anchor and the parent. Kept in lockstep with
     /// `ring` (insert on produce, remove on persist). Only populated when `shadow_stateroot` is on.
@@ -897,6 +1363,22 @@ where
         let coalesce_shadow = std::env::var("ARB_COALESCE_SHADOW")
             .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
             .unwrap_or(false);
+        // The engine tree owns a separate cache for its validation/payload paths. The direct
+        // feed driver does not execute through that path, so keep a dedicated sequential cache.
+        // 256 MiB holds roughly 1.8 million storage entries and avoids duplicating reth's 4 GiB
+        // default allocation. Operators can tune it without changing consensus behavior.
+        let execution_cache_enabled = std::env::var("ARB_EXECUTION_CACHE")
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+        let execution_cache_mb = std::env::var("ARB_EXECUTION_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(256);
+        let execution_cache_bytes = execution_cache_mb.saturating_mul(1024 * 1024);
+        let execution_cache = ExecutionCache::new(execution_cache_bytes);
+        let execution_cache_tip = genesis_tip.hash();
+        let sparse_state_root_mode = SparseStateRootMode::from_env();
 
         // The serial state root only actually runs when parallel is disabled OR the ring overlay is
         // off (parallel is a ring-overlay-only path). Warn loudly while we phase serial out.
@@ -930,6 +1412,13 @@ where
         let changeset_cache = ChangesetCache::new();
         let driver_changeset_cache = changeset_cache.clone();
         let tree_config = tuning.to_tree_config();
+        let state_root_config = tree_config.clone();
+        let state_root_processor = PayloadProcessor::new(
+            driver_runtime.clone(),
+            evm_config.clone(),
+            &state_root_config,
+            PrecompileCacheMap::default(),
+        );
         tracing::info!(
             target: "arb-reth::engine",
             persistence_threshold = tuning.persistence_threshold,
@@ -940,6 +1429,9 @@ where
             parallel_stateroot,
             coalesce_overlay,
             coalesce_shadow,
+            execution_cache_enabled,
+            execution_cache_mb,
+            ?sparse_state_root_mode,
             "engine-tree persistence tuning",
         );
 
@@ -1014,6 +1506,12 @@ where
             parallel_stateroot,
             coalesce_overlay,
             coalesce_shadow,
+            execution_cache,
+            execution_cache_tip,
+            execution_cache_enabled,
+            state_root_processor,
+            state_root_config,
+            sparse_state_root_mode,
             state_trie_overlays,
             provider_factory: driver_factory,
             changeset_cache: driver_changeset_cache,
@@ -1026,9 +1524,25 @@ where
     /// Build the two parent-state providers and produce one block. Selects the immune ring overlay
     /// (`--ring-overlay`) or the legacy `state_by_block_hash(parent)` path.
     fn build_block(
-        &self,
+        &mut self,
         msg: &BroadcastFeedMessage,
-    ) -> eyre::Result<BuiltPayloadExecutedBlock<ArbPrimitives>> {
+    ) -> eyre::Result<(
+        BuiltPayloadExecutedBlock<ArbPrimitives>,
+        ArbBlockProductionTiming,
+    )> {
+        // A discontinuity can only happen on restart/reorg today, but the hash guard makes stale
+        // cached values impossible if another caller changes the driver's tip in the future.
+        if self.execution_cache_enabled && self.execution_cache_tip != self.tip.hash() {
+            tracing::warn!(
+                target: "arb-reth::engine",
+                cache_tip = %self.execution_cache_tip,
+                parent = %self.tip.hash(),
+                "execution cache tip mismatch; clearing cache",
+            );
+            self.execution_cache.clear();
+            self.execution_cache_tip = self.tip.hash();
+        }
+        let started_at = Instant::now();
         if self.ring_overlay {
             // Pin one MDBX RO tx: read the persisted tip and the immune latest state from the same
             // tx so the state-root path's historical anchor sits exactly at `persisted_tip` (the
@@ -1070,7 +1584,8 @@ where
                 Box::new(LatestStateProviderRef::new(&db_ro));
             let trie_hist: Box<dyn StateProvider + '_> =
                 Box::new(LatestStateProviderRef::new(&db_ro));
-            let exec_overlay = MemoryOverlayStateProviderRef::new(exec_hist, ring_vec.clone()).boxed();
+            let exec_overlay =
+                MemoryOverlayStateProviderRef::new(exec_hist, ring_vec.clone()).boxed();
             // Coalesced exec provider (opt-in): flatten the ring for O(1) value reads over the same
             // pinned anchor; falls through to the DB on a miss, exactly like the overlay walk.
             let exec_sp: Box<dyn StateProvider + '_> = if self.coalesce_overlay {
@@ -1084,13 +1599,19 @@ where
                     shadow: self.coalesce_shadow,
                 })
             } else {
-                exec_overlay
+                Box::new(InstrumentedRingOverlayProvider {
+                    historical: Box::new(LatestStateProviderRef::new(&db_ro)),
+                    inner: exec_overlay,
+                    in_memory: ring_vec.clone(),
+                })
             };
             let trie_sp = MemoryOverlayStateProviderRef::new(trie_hist, ring_vec).boxed();
             // Parallel state-root mode: wrap the trie provider so `finish`'s
             // `state_root_with_updates` runs in parallel and DRIVES the block. Exec provider is
             // left untouched. Off = the serial `finish` path exactly as before.
-            let trie_sp: Box<dyn StateProvider + '_> = if self.parallel_stateroot {
+            let trie_sp: Box<dyn StateProvider + '_> = if self.parallel_stateroot
+                && self.sparse_state_root_mode != SparseStateRootMode::Drive
+            {
                 Box::new(ParallelRootProvider {
                     inner: trie_sp,
                     provider_factory: self.provider_factory.clone(),
@@ -1102,19 +1623,60 @@ where
             } else {
                 trie_sp
             };
-            let built = produce(
+            let sparse_state_root = if self.sparse_state_root_mode == SparseStateRootMode::Off {
+                None
+            } else {
+                let overlay_builder =
+                    OverlayBuilder::new(self.tip.hash(), self.changeset_cache.clone())
+                        .with_state_trie_overlay_manager(self.state_trie_overlays.clone());
+                let overlay_factory = OverlayStateProviderFactory::new(
+                    self.provider_factory.clone(),
+                    overlay_builder,
+                );
+                Some((
+                    self.state_root_processor.spawn_state_root(
+                        overlay_factory,
+                        self.tip.header().state_root,
+                        false,
+                        &self.state_root_config,
+                        None,
+                    ),
+                    self.sparse_state_root_mode,
+                ))
+            };
+            let cache_stats = self
+                .execution_cache_enabled
+                .then(|| Arc::new(CacheStats::default()));
+            let exec_sp: Box<dyn StateProvider + '_> = match &cache_stats {
+                Some(stats) => Box::new(CachedStateProvider::new_with_mode(
+                    exec_sp,
+                    self.execution_cache.clone(),
+                    CacheFillMode::FillOnMiss,
+                    None,
+                    Some(Arc::clone(stats)),
+                )),
+                None => exec_sp,
+            };
+            let (built, mut timing) = produce_with_timing(
                 &self.evm_config,
                 self.chain_id,
                 &self.tip,
                 msg,
                 exec_sp,
                 trie_sp,
+                sparse_state_root,
             )?;
+            if let Some(stats) = cache_stats {
+                record_execution_cache_stats(&stats);
+            }
+            timing.parent_state = started_at.elapsed().saturating_sub(
+                timing.message_preparation + timing.state_setup + timing.execution + timing.finish,
+            );
             // Zero-risk probe: also compute the root in parallel and assert it equals the serial
             // one just produced (serial still drives the chain). No-op unless ARB_SHADOW_STATEROOT
             // is set.
             self.shadow_compare(&built);
-            Ok(built)
+            Ok((built, timing))
         } else {
             let exec_sp = self
                 .provider
@@ -1124,14 +1686,35 @@ where
                 .provider
                 .state_by_block_hash(self.tip.hash())
                 .wrap_err("state_by_block_hash (trie) failed")?;
-            produce(
+            let cache_stats = self
+                .execution_cache_enabled
+                .then(|| Arc::new(CacheStats::default()));
+            let exec_sp: Box<dyn StateProvider + '_> = match &cache_stats {
+                Some(stats) => Box::new(CachedStateProvider::new_with_mode(
+                    exec_sp,
+                    self.execution_cache.clone(),
+                    CacheFillMode::FillOnMiss,
+                    None,
+                    Some(Arc::clone(stats)),
+                )),
+                None => exec_sp,
+            };
+            let (built, mut timing) = produce_with_timing(
                 &self.evm_config,
                 self.chain_id,
                 &self.tip,
                 msg,
                 exec_sp,
                 trie_sp,
-            )
+                None,
+            )?;
+            if let Some(stats) = cache_stats {
+                record_execution_cache_stats(&stats);
+            }
+            timing.parent_state = started_at.elapsed().saturating_sub(
+                timing.message_preparation + timing.state_setup + timing.execution + timing.finish,
+            );
+            Ok((built, timing))
         }
     }
 
@@ -1215,28 +1798,36 @@ where
         // Mirror the block into reth's overlay manager (the parallel/shadow root path reads it),
         // in lockstep with `ring`. Only when shadowing or driving the parallel root, to avoid its
         // cache work otherwise.
-        if self.shadow_stateroot || self.parallel_stateroot {
+        if self.shadow_stateroot
+            || self.parallel_stateroot
+            || self.sparse_state_root_mode != SparseStateRootMode::Off
+        {
             self.state_trie_overlays.insert_block(exec.clone());
         }
         self.ring.push_back(exec);
         // Prune everything at/below the persisted (on-disk) tip. Use the RO provider's tip, not
         // `BlockchainProvider::best_block_number` (that's the in-memory canonical tip).
         if let Ok(db_ro) = self.provider.database_provider_ro()
-            && let Ok(persisted) = db_ro.best_block_number() {
-                let mut pruned: Vec<B256> = Vec::new();
-                while self
-                    .ring
-                    .front()
-                    .is_some_and(|b| b.recovered_block.header().number <= persisted)
-                {
-                    if let Some(b) = self.ring.pop_front() {
-                        pruned.push(b.recovered_block.hash());
-                    }
-                }
-                if (self.shadow_stateroot || self.parallel_stateroot) && !pruned.is_empty() {
-                    self.state_trie_overlays.remove_blocks(pruned);
+            && let Ok(persisted) = db_ro.best_block_number()
+        {
+            let mut pruned: Vec<B256> = Vec::new();
+            while self
+                .ring
+                .front()
+                .is_some_and(|b| b.recovered_block.header().number <= persisted)
+            {
+                if let Some(b) = self.ring.pop_front() {
+                    pruned.push(b.recovered_block.hash());
                 }
             }
+            if (self.shadow_stateroot
+                || self.parallel_stateroot
+                || self.sparse_state_root_mode != SparseStateRootMode::Off)
+                && !pruned.is_empty()
+            {
+                self.state_trie_overlays.remove_blocks(pruned);
+            }
+        }
     }
 
     /// Produce, insert, and canonicalize one block from a feed message.
@@ -1248,6 +1839,20 @@ where
     /// applies it if it is the next expected message, or buffers it as feed-ahead otherwise; after
     /// applying, drains any now-contiguous buffered messages. Returns the resulting head hash.
     pub async fn advance(&mut self, msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
+        self.advance_with_applied(msg, |_, _| {}).await
+    }
+
+    /// Like [`Self::advance`], while notifying the caller after each message has become the
+    /// canonical in-memory head. This includes buffered feed-ahead messages drained after a gap
+    /// closes, and deliberately excludes duplicate messages that were not applied.
+    pub async fn advance_with_applied<F>(
+        &mut self,
+        msg: &BroadcastFeedMessage,
+        mut on_applied: F,
+    ) -> eyre::Result<B256>
+    where
+        F: FnMut(u64, ArbAppliedMessageTiming),
+    {
         const MAX_PENDING: usize = 50_000;
         let seq = msg.sequence_number;
         if seq < self.next_seq {
@@ -1262,10 +1867,13 @@ where
             return Ok(self.tip.hash());
         }
         // seq == next_seq: this is the next block. Apply it, then drain the buffer forward.
-        let mut hash = self.apply_one(msg).await?;
+        let (mut hash, timing) = self.apply_one(msg).await?;
+        on_applied(seq, timing);
         self.next_seq += 1;
         while let Some(buffered) = self.pending.remove(&self.next_seq) {
-            hash = self.apply_one(&buffered).await?;
+            let (new_hash, timing) = self.apply_one(&buffered).await?;
+            hash = new_hash;
+            on_applied(self.next_seq, timing);
             self.next_seq += 1;
         }
         // Discard any stragglers now below the cursor (a feed dup that lost the race to L1).
@@ -1276,9 +1884,11 @@ where
     /// Apply exactly one in-order message: build the next block from `self.tip`, insert it into the
     /// engine tree, canonicalize, and advance `self.tip`. [`Self::advance`]'s sequence guard ensures
     /// this is only called for the message that produces `tip + 1`.
-    async fn apply_one(&mut self, msg: &BroadcastFeedMessage) -> eyre::Result<B256> {
-        use std::time::Instant;
-        let __t0 = Instant::now();
+    async fn apply_one(
+        &mut self,
+        msg: &BroadcastFeedMessage,
+    ) -> eyre::Result<(B256, ArbAppliedMessageTiming)> {
+        let started_at = Instant::now();
 
         // Legacy path (`ring_overlay=false`): `produce` reads parent state via
         // `provider.state_by_block_hash(parent)`, which snapshots the tree overlay + the DB
@@ -1286,11 +1896,12 @@ where
         // deep-buffer failures with a retry: some torn reads mis-execute without erroring, baking a
         // wrong root into the chain. The `--ring-overlay` path reads from the driver-held ring over
         // the immune latest provider and is not raced by persistence.
-        let built = self.build_block(msg)?;
+        let (built, production_timing) = self.build_block(msg)?;
         let new_hash = built.recovered_block.hash();
         let new_header = built.recovered_block.header().clone();
         let new_number = new_header.number;
-        let __us_produce = __t0.elapsed().as_micros();
+        let execution_output = Arc::clone(&built.execution_output);
+        let block_production = started_at.elapsed();
 
         // Ring bookkeeping (no-op unless `--ring-overlay`): record this block as an unpersisted
         // parent for the next `build_block`, and prune what the DB has since persisted. Must run
@@ -1298,16 +1909,16 @@ where
         self.maintain_ring(&built);
 
         // Feed the executed block to the tree (no re-execution).
-        let __t = Instant::now();
+        let phase_started_at = Instant::now();
         self.to_tree
             .send(FromEngine::Request(EngineApiRequest::InsertExecutedBlock(
                 built,
             )))
             .map_err(|e| eyre!("send InsertExecutedBlock: {e}"))?;
-        let __us_insert = __t.elapsed().as_micros();
+        let engine_insert = phase_started_at.elapsed();
 
         // Drive canonicalization via ForkchoiceUpdated (head = new block).
-        let __t = Instant::now();
+        let phase_started_at = Instant::now();
         let (fcu_tx, fcu_rx) = tokio::sync::oneshot::channel();
         let fcu_state = alloy_rpc_types_engine::ForkchoiceState {
             head_block_hash: new_hash,
@@ -1328,10 +1939,10 @@ where
         fcu_res
             .await
             .map_err(|e| eyre!("block {new_number} FCU error: {e:?}"))?;
-        let __us_fcu = __t.elapsed().as_micros();
+        let engine_forkchoice = phase_started_at.elapsed();
 
         // Wait for the tree to actually canonicalize the block (bounded).
-        let __t = Instant::now();
+        let phase_started_at = Instant::now();
         let canonicalized = wait_for_head(
             &self.provider,
             &self.provider.canonical_in_memory_state(),
@@ -1345,7 +1956,29 @@ where
                 "block {new_number} was NOT canonicalized within timeout (head hash {new_hash:#x})"
             ));
         }
-        let __us_wait = __t.elapsed().as_micros();
+        let canonicalization_wait = phase_started_at.elapsed();
+        let total = started_at.elapsed();
+
+        // Source-independent production timings. The feed-latency recorder only observes messages
+        // seen on the websocket and therefore intentionally omits L1-derived catch-up blocks.
+        // These histograms cover every canonical block and are the stable benchmark surface for
+        // execution/cache/state-root work.
+        metrics::histogram!("arb_reth.engine_block_production_seconds")
+            .record(block_production.as_secs_f64());
+        metrics::histogram!("arb_reth.engine_block_parent_state_seconds")
+            .record(production_timing.parent_state.as_secs_f64());
+        metrics::histogram!("arb_reth.engine_block_execution_seconds")
+            .record(production_timing.execution.as_secs_f64());
+        metrics::histogram!("arb_reth.engine_block_finish_seconds")
+            .record(production_timing.finish.as_secs_f64());
+        metrics::histogram!("arb_reth.engine_block_total_seconds").record(total.as_secs_f64());
+        let production_seconds = block_production.as_secs_f64();
+        let mgas_per_second = if production_seconds > 0.0 {
+            new_header.gas_used as f64 / 1_000_000.0 / production_seconds
+        } else {
+            0.0
+        };
+        metrics::histogram!("arb_reth.engine_block_mgas_per_second").record(mgas_per_second);
 
         // Per-block production trace (observability) + per-phase timing breakdown.
         tracing::info!(
@@ -1359,16 +1992,61 @@ where
         tracing::debug!(
             target: "arb-reth::engine::timing",
             number = new_number,
-            us_produce = __us_produce,
-            us_insert = __us_insert,
-            us_fcu = __us_fcu,
-            us_wait = __us_wait,
-            us_total = __t0.elapsed().as_micros(),
+            us_produce = block_production.as_micros(),
+            us_insert = engine_insert.as_micros(),
+            us_fcu = engine_forkchoice.as_micros(),
+            us_wait = canonicalization_wait.as_micros(),
+            us_total = total.as_micros(),
             "advance timing",
         );
 
         self.tip = SealedHeader::new(new_header, new_hash);
-        Ok(new_hash)
+        if self.execution_cache_enabled {
+            let cache_update_started_at = Instant::now();
+            if self
+                .execution_cache
+                .insert_state(&execution_output.state)
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "arb-reth::engine",
+                    number = new_number,
+                    "inconsistent execution-cache update; clearing cache",
+                );
+                self.execution_cache.clear();
+            }
+            self.execution_cache_tip = new_hash;
+            let cache_update_seconds = cache_update_started_at.elapsed().as_secs_f64();
+            metrics::histogram!("arb_reth.execution_cache_update_seconds")
+                .record(cache_update_seconds);
+        }
+        Ok((
+            new_hash,
+            ArbAppliedMessageTiming {
+                started_at,
+                block_production,
+                block_parent_state: production_timing.parent_state,
+                block_message_preparation: production_timing.message_preparation,
+                block_state_setup: production_timing.state_setup,
+                block_execution: production_timing.execution,
+                block_execution_setup: production_timing.execution_setup,
+                block_start_block_transaction_construction: production_timing
+                    .start_block_transaction_construction,
+                block_start_block_transaction: production_timing.start_block_transaction,
+                block_derived_transactions: production_timing.derived_transactions,
+                block_derived_transaction_execution: production_timing
+                    .derived_transaction_execution,
+                block_derived_retry_scheduling: production_timing.derived_retry_scheduling,
+                block_derived_transactions_unattributed: production_timing
+                    .derived_transactions_unattributed,
+                block_execution_unattributed: production_timing.execution_unattributed,
+                block_finish: production_timing.finish,
+                engine_insert,
+                engine_forkchoice,
+                canonicalization_wait,
+                total,
+            },
+        ))
     }
 
     /// Returns the current chain tip (the parent for the next block).
@@ -1390,9 +2068,10 @@ where
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if let Ok(best) = self.provider.best_block_number()
-                && best >= target {
-                    return;
-                }
+                && best >= target
+            {
+                return;
+            }
             if std::time::Instant::now() >= deadline {
                 return;
             }

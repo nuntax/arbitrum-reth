@@ -23,7 +23,7 @@ use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 pub mod engine;
 pub mod engine_spike;
 
-pub use engine::{produce, wait_for_head, ArbEngineDriver, ArbEngineTuning};
+pub use engine::{produce, wait_for_head, ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning};
 pub use engine_spike::ArbPayloadValidator;
 
 /// A minimal built-payload stub for Arbitrum.

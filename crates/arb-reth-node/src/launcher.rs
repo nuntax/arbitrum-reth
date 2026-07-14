@@ -12,6 +12,7 @@
 use core::{future::Future, pin::Pin};
 use std::net::SocketAddr;
 
+use crate::metrics::FeedLatencyTracker;
 use alloy_consensus::Header;
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -89,6 +90,9 @@ pub struct ArbLauncher {
     /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
     /// tip, so no per-message version is carried.
     pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    /// Correlates live WebSocket feed messages with canonical in-memory state for Prometheus.
+    /// `None` keeps replay and L1-only operation free of feed-latency instrumentation.
+    pub feed_latency: Option<FeedLatencyTracker>,
     /// Optional HTTP bind address for the `eth_*` RPC server (`None` disables RPC).
     pub rpc_addr: Option<SocketAddr>,
 }
@@ -190,6 +194,7 @@ impl ArbLauncher {
             genesis_block,
             tuning,
             messages,
+            feed_latency,
             rpc_addr,
         } = self;
 
@@ -240,6 +245,10 @@ impl ArbLauncher {
                 disabled_stages,
             )
             .await?;
+
+        // Install reth's Prometheus recorder before any feed metric handles are initialized, and
+        // serve it when `--metrics <addr>` is configured.
+        let ctx = ctx.with_prometheus_server().await?;
 
         // Open the DB in storage v2 (hashed-state canonical, `PackedKeyAdapter`). This has to
         // happen before `with_genesis()` uses the factory. Cache the flag so every provider
@@ -321,8 +330,18 @@ impl ArbLauncher {
                         break;
                     };
                     bench_recv_us += __r.elapsed().as_micros();
+                    let driver_dequeued_at = std::time::Instant::now();
+                    if let Some(feed_latency) = feed_latency.as_ref() {
+                        feed_latency.record_driver_dequeue(msg.sequence_number, driver_dequeued_at);
+                    }
                     let __w = std::time::Instant::now();
-                    driver.advance(&msg).await?;
+                    driver
+                        .advance_with_applied(&msg, |sequence_number, applied| {
+                            if let Some(feed_latency) = feed_latency.as_ref() {
+                                feed_latency.record_canonical(sequence_number, applied);
+                            }
+                        })
+                        .await?;
                     bench_work_us += __w.elapsed().as_micros();
                     bench_n += 1;
                     if bench_n.is_multiple_of(1000) {
@@ -441,6 +460,7 @@ mod tests {
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             messages: rx,
+            feed_latency: None,
             rpc_addr: None,
         };
 
