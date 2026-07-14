@@ -180,6 +180,7 @@ fn arb_tx_from_envelope(tx: &ArbTxEnvelope, caller: Address, encoded: Bytes) -> 
     ArbTx(ArbTransaction {
         base,
         retry_meta,
+        tx_hash: Some(tx.hash()),
         encoded_2718: Some(encoded),
     })
 }

@@ -22,14 +22,19 @@ use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
 use arb_revm::ArbosState;
 use arb_revm::executor::{
-    ArbExecCfg, ArbParentHeader, digest_message, scheduled_retries_from_redeem_logs,
+    ArbExecCfg, ArbParentHeader, digest_message, is_redeem_scheduled_log,
+    scheduled_retries_from_redeem_logs,
 };
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::{WrapErr as _, eyre};
+use metrics::{Counter, Histogram};
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -42,7 +47,9 @@ use reth_engine_tree::persistence::PersistenceHandle;
 use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler};
 use reth_evm::ConfigureEvm as _;
 use reth_evm::execute::BlockBuilder as _;
-use reth_execution_cache::{CacheFillMode, CacheStats, CachedStateProvider, ExecutionCache};
+use reth_execution_cache::{
+    CacheFillMode, CacheStats, CachedStateCacheMetrics, CachedStateProvider, ExecutionCache,
+};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::BuiltPayloadExecutedBlock;
@@ -232,7 +239,14 @@ fn produce_with_timing<'a>(
         let tx_started_at = Instant::now();
         if let Err(e) = builder.execute_transaction_with_result_closure(recovered, |res| {
             tx_success = res.result.result.is_success();
-            tx_logs = res.result.result.logs().to_vec();
+            tx_logs.extend(
+                res.result
+                    .result
+                    .logs()
+                    .iter()
+                    .filter(|log| is_redeem_scheduled_log(log))
+                    .cloned(),
+            );
         }) {
             let tx_execution = tx_started_at.elapsed();
             if is_internal {
@@ -263,7 +277,7 @@ fn produce_with_timing<'a>(
             continue;
         }
         let mut retry_scheduling = Duration::ZERO;
-        if tx_success {
+        if tx_success && !tx_logs.is_empty() {
             // FIFO, drained before the next user tx, matching Nitro's cascading-redeem order.
             let retry_scheduling_started_at = Instant::now();
             let retries =
@@ -363,39 +377,115 @@ fn produce_with_timing<'a>(
     ))
 }
 
-/// Flush one block's cross-block execution-cache statistics after the provider has dropped.
-/// Keeping these counters block-local avoids a metrics operation on every cache access.
-fn record_execution_cache_stats(stats: &CacheStats) {
-    for (kind, hits, misses) in [
-        ("account", stats.account_hits(), stats.account_misses()),
-        ("storage", stats.storage_hits(), stats.storage_misses()),
-        ("bytecode", stats.code_hits(), stats.code_misses()),
-    ] {
-        metrics::counter!(
-            "arb_reth.execution_cache_access_total",
-            "kind" => kind,
-            "result" => "hit",
-        )
-        .increment(hits as u64);
-        metrics::counter!(
-            "arb_reth.execution_cache_access_total",
-            "kind" => kind,
-            "result" => "miss",
-        )
-        .increment(misses as u64);
-        metrics::histogram!(
-            "arb_reth.execution_cache_accesses_per_block",
-            "kind" => kind,
-            "result" => "hit",
-        )
-        .record(hits as f64);
-        metrics::histogram!(
-            "arb_reth.execution_cache_accesses_per_block",
-            "kind" => kind,
-            "result" => "miss",
-        )
-        .record(misses as f64);
+struct CacheAccessMetricHandles {
+    hit_counter: Counter,
+    miss_counter: Counter,
+    hit_histogram: Histogram,
+    miss_histogram: Histogram,
+}
+
+impl CacheAccessMetricHandles {
+    fn new(kind: &'static str) -> Self {
+        Self {
+            hit_counter: metrics::counter!(
+                "arb_reth.execution_cache_access_total",
+                "kind" => kind,
+                "result" => "hit",
+            ),
+            miss_counter: metrics::counter!(
+                "arb_reth.execution_cache_access_total",
+                "kind" => kind,
+                "result" => "miss",
+            ),
+            hit_histogram: metrics::histogram!(
+                "arb_reth.execution_cache_accesses_per_block",
+                "kind" => kind,
+                "result" => "hit",
+            ),
+            miss_histogram: metrics::histogram!(
+                "arb_reth.execution_cache_accesses_per_block",
+                "kind" => kind,
+                "result" => "miss",
+            ),
+        }
     }
+}
+
+struct ExecutionCacheMetricHandles {
+    account: CacheAccessMetricHandles,
+    storage: CacheAccessMetricHandles,
+    bytecode: CacheAccessMetricHandles,
+}
+
+fn execution_cache_metric_handles() -> &'static ExecutionCacheMetricHandles {
+    static HANDLES: OnceLock<ExecutionCacheMetricHandles> = OnceLock::new();
+    HANDLES.get_or_init(|| ExecutionCacheMetricHandles {
+        account: CacheAccessMetricHandles::new("account"),
+        storage: CacheAccessMetricHandles::new("storage"),
+        bytecode: CacheAccessMetricHandles::new("bytecode"),
+    })
+}
+
+/// Flush one block's cross-block execution-cache statistics after the provider has dropped.
+/// Keeping these counters block-local avoids a metrics operation on every cache access, and the
+/// recorder handles are registered once instead of once per block.
+fn record_execution_cache_stats(stats: &CacheStats) {
+    let handles = execution_cache_metric_handles();
+    for (handles, hits, misses) in [
+        (
+            &handles.account,
+            stats.account_hits(),
+            stats.account_misses(),
+        ),
+        (
+            &handles.storage,
+            stats.storage_hits(),
+            stats.storage_misses(),
+        ),
+        (&handles.bytecode, stats.code_hits(), stats.code_misses()),
+    ] {
+        handles.hit_counter.increment(hits as u64);
+        handles.miss_counter.increment(misses as u64);
+        handles.hit_histogram.record(hits as f64);
+        handles.miss_histogram.record(misses as f64);
+    }
+}
+
+struct EngineBlockMetricHandles {
+    production: Histogram,
+    parent_state: Histogram,
+    execution: Histogram,
+    finish: Histogram,
+    finish_executor: Histogram,
+    finish_hashed_state: Histogram,
+    finish_state_root: Histogram,
+    finish_assembly: Histogram,
+    finish_unattributed: Histogram,
+    total: Histogram,
+    mgas_per_second: Histogram,
+    execution_cache_update: Histogram,
+}
+
+fn engine_block_metric_handles() -> &'static EngineBlockMetricHandles {
+    static HANDLES: OnceLock<EngineBlockMetricHandles> = OnceLock::new();
+    HANDLES.get_or_init(|| EngineBlockMetricHandles {
+        production: metrics::histogram!("arb_reth.engine_block_production_seconds"),
+        parent_state: metrics::histogram!("arb_reth.engine_block_parent_state_seconds"),
+        execution: metrics::histogram!("arb_reth.engine_block_execution_seconds"),
+        finish: metrics::histogram!("arb_reth.engine_block_finish_seconds"),
+        finish_executor: metrics::histogram!("arb_reth.engine_block_finish_executor_seconds"),
+        finish_hashed_state: metrics::histogram!(
+            "arb_reth.engine_block_finish_hashed_state_seconds"
+        ),
+        finish_state_root: metrics::histogram!("arb_reth.engine_block_finish_state_root_seconds"),
+        finish_assembly: metrics::histogram!("arb_reth.engine_block_finish_assembly_seconds"),
+        finish_unattributed: metrics::histogram!(
+            "arb_reth.engine_block_finish_unattributed_seconds"
+        ),
+        total: metrics::histogram!("arb_reth.engine_block_total_seconds"),
+        mgas_per_second: metrics::histogram!("arb_reth.engine_block_mgas_per_second"),
+        execution_cache_update: metrics::histogram!("arb_reth.execution_cache_update_seconds"),
+    })
 }
 
 /// Poll the tree's view (events, best block number, and in-memory head) until block `bn` with
@@ -771,6 +861,8 @@ where
     /// Cross-block account/storage/bytecode cache used by the execution provider. This is updated
     /// from each canonical block's final `BundleState`, so it always represents `execution_cache_tip`.
     execution_cache: ExecutionCache,
+    /// Reth-native cache occupancy and collision gauges. Updated after every canonical block.
+    execution_cache_metrics: Option<CachedStateCacheMetrics>,
     execution_cache_tip: B256,
     execution_cache_enabled: bool,
     /// Sequence-reconciliation cursor (arb-reth's `TransactionStreamer` analogue). `next_seq` is the
@@ -835,6 +927,8 @@ where
             .unwrap_or(256);
         let execution_cache_bytes = execution_cache_mb.saturating_mul(1024 * 1024);
         let execution_cache = ExecutionCache::new(execution_cache_bytes);
+        let execution_cache_metrics =
+            execution_cache_enabled.then(CachedStateCacheMetrics::default);
         let execution_cache_tip = genesis_tip.hash();
 
         // ---- persistence service (real MDBX writer, noop pruner) ----
@@ -931,6 +1025,7 @@ where
             canonical,
             obs_rx,
             execution_cache,
+            execution_cache_metrics,
             execution_cache_tip,
             execution_cache_enabled,
             next_seq,
@@ -1120,32 +1215,42 @@ where
         // seen on the websocket and therefore intentionally omits L1-derived catch-up blocks.
         // These histograms cover every canonical block and are the stable benchmark surface for
         // execution/cache/state-root work.
-        metrics::histogram!("arb_reth.engine_block_production_seconds")
+        let block_metrics = engine_block_metric_handles();
+        block_metrics
+            .production
             .record(block_production.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_parent_state_seconds")
+        block_metrics
+            .parent_state
             .record(production_timing.parent_state.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_execution_seconds")
+        block_metrics
+            .execution
             .record(production_timing.execution.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_finish_seconds")
+        block_metrics
+            .finish
             .record(production_timing.finish.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_finish_executor_seconds")
+        block_metrics
+            .finish_executor
             .record(production_timing.finish_executor.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_finish_hashed_state_seconds")
+        block_metrics
+            .finish_hashed_state
             .record(production_timing.finish_hashed_state.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_finish_state_root_seconds")
+        block_metrics
+            .finish_state_root
             .record(production_timing.finish_state_root.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_finish_assembly_seconds")
+        block_metrics
+            .finish_assembly
             .record(production_timing.finish_assembly.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_finish_unattributed_seconds")
+        block_metrics
+            .finish_unattributed
             .record(production_timing.finish_unattributed.as_secs_f64());
-        metrics::histogram!("arb_reth.engine_block_total_seconds").record(total.as_secs_f64());
+        block_metrics.total.record(total.as_secs_f64());
         let production_seconds = block_production.as_secs_f64();
         let mgas_per_second = if production_seconds > 0.0 {
             new_header.gas_used as f64 / 1_000_000.0 / production_seconds
         } else {
             0.0
         };
-        metrics::histogram!("arb_reth.engine_block_mgas_per_second").record(mgas_per_second);
+        block_metrics.mgas_per_second.record(mgas_per_second);
 
         // Per-block production trace (observability) + per-phase timing breakdown.
         tracing::info!(
@@ -1182,9 +1287,13 @@ where
                 );
                 self.execution_cache.clear();
             }
+            if let Some(metrics) = &self.execution_cache_metrics {
+                self.execution_cache.update_metrics(metrics);
+            }
             self.execution_cache_tip = new_hash;
             let cache_update_seconds = cache_update_started_at.elapsed().as_secs_f64();
-            metrics::histogram!("arb_reth.execution_cache_update_seconds")
+            block_metrics
+                .execution_cache_update
                 .record(cache_update_seconds);
         }
         Ok((

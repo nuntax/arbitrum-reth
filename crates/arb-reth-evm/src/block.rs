@@ -42,12 +42,16 @@ use arbitrum_alloy_consensus::receipt::{ArbReceipt, ArbReceiptEnvelope};
 use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
 use arbitrum_alloy_consensus::transactions::internal::ArbInternalTx;
 use core::fmt::Debug;
+use metrics::Histogram;
 use reth_evm::execute::{BlockAssembler, BlockAssemblerInput};
 use revm::context::{Block as _, ContextTr, result::ResultAndState};
 use revm::handler::SYSTEM_ADDRESS;
 use revm::{DatabaseCommit, Inspector, context::result::ExecutionResult};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -110,6 +114,8 @@ pub struct ArbTxResult<H> {
     pub gas_used_for_l1: u64,
     /// Consensus tx type byte (selects the receipt envelope variant).
     pub tx_type: u8,
+    /// Whether detailed transaction metrics were selected for this transaction.
+    pub metrics_sampled: bool,
 }
 
 impl<H: Send + 'static> TxResult for ArbTxResult<H> {
@@ -199,22 +205,103 @@ fn receipt_envelope_for_type(
     }
 }
 
-/// Stable, low-cardinality label for the consensus transaction families ArbOS executes.
+/// Stable, low-cardinality labels for the consensus transaction families ArbOS executes.
+const TX_TYPE_LABELS: [&str; 12] = [
+    "legacy",
+    "eip2930",
+    "eip1559",
+    "eip4844",
+    "eip7702",
+    "deposit",
+    "unsigned",
+    "contract",
+    "retry",
+    "submit_retryable",
+    "internal",
+    "unknown",
+];
+
 #[inline]
-fn tx_type_label(tx_type: u8) -> &'static str {
+const fn tx_type_metric_index(tx_type: u8) -> usize {
     match tx_type {
-        0x00 => "legacy",
-        0x01 => "eip2930",
-        0x02 => "eip1559",
-        0x03 => "eip4844",
-        0x04 => "eip7702",
-        0x64 => "deposit",
-        0x65 => "unsigned",
-        0x66 => "contract",
-        0x68 => "retry",
-        0x69 => "submit_retryable",
-        0x6a => "internal",
-        _ => "unknown",
+        0x00 => 0,
+        0x01 => 1,
+        0x02 => 2,
+        0x03 => 3,
+        0x04 => 4,
+        0x64 => 5,
+        0x65 => 6,
+        0x66 => 7,
+        0x68 => 8,
+        0x69 => 9,
+        0x6a => 10,
+        _ => 11,
+    }
+}
+
+struct TransactionMetrics {
+    execution: Histogram,
+    receipt_build: Histogram,
+    state_commit: Histogram,
+    commit: Histogram,
+    gas_used: Histogram,
+    l1_gas_used: Histogram,
+}
+
+impl TransactionMetrics {
+    fn for_type(tx_type: u8) -> &'static Self {
+        static METRICS: [OnceLock<TransactionMetrics>; TX_TYPE_LABELS.len()] =
+            [const { OnceLock::new() }; TX_TYPE_LABELS.len()];
+        let index = tx_type_metric_index(tx_type);
+        METRICS[index].get_or_init(|| {
+            let tx_type = TX_TYPE_LABELS[index];
+            Self {
+                execution: metrics::histogram!(
+                    "arb_reth.arbos.transaction_execution_seconds",
+                    "tx_type" => tx_type,
+                ),
+                receipt_build: metrics::histogram!(
+                    "arb_reth.arbos.transaction_receipt_build_seconds",
+                    "tx_type" => tx_type,
+                ),
+                state_commit: metrics::histogram!(
+                    "arb_reth.arbos.transaction_state_commit_seconds",
+                    "tx_type" => tx_type,
+                ),
+                commit: metrics::histogram!(
+                    "arb_reth.arbos.transaction_commit_seconds",
+                    "tx_type" => tx_type,
+                ),
+                gas_used: metrics::histogram!(
+                    "arb_reth.arbos.transaction_gas_used",
+                    "tx_type" => tx_type,
+                ),
+                l1_gas_used: metrics::histogram!(
+                    "arb_reth.arbos.transaction_l1_gas_used",
+                    "tx_type" => tx_type,
+                ),
+            }
+        })
+    }
+}
+
+/// Selects one transaction per type and sample-rate window. A rate of zero disables the detailed
+/// transaction histograms; block-level execution and end-to-end latency metrics remain complete.
+fn sample_transaction_metrics(tx_type: u8) -> bool {
+    static SAMPLE_RATE: OnceLock<u64> = OnceLock::new();
+    static COUNTERS: [AtomicU64; TX_TYPE_LABELS.len()] =
+        [const { AtomicU64::new(0) }; TX_TYPE_LABELS.len()];
+
+    let sample_rate = *SAMPLE_RATE.get_or_init(|| {
+        std::env::var("ARB_EXECUTION_METRICS_SAMPLE_RATE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+    });
+    match sample_rate {
+        0 => false,
+        1 => true,
+        rate => COUNTERS[tx_type_metric_index(tx_type)].fetch_add(1, Ordering::Relaxed) % rate == 0,
     }
 }
 
@@ -259,16 +346,14 @@ where
     ) -> Result<Self::Result, BlockExecutionError> {
         let (tx_env, tx) = tx.into_parts();
         let tx_type = tx.tx().ty();
-        let tx_type_label = tx_type_label(tx_type);
-
-        let execution_histogram = metrics::histogram!(
-            "arb_reth.arbos.transaction_execution_seconds",
-            "tx_type" => tx_type_label,
-        );
-        let started_at = Instant::now();
+        let metrics_sampled = sample_transaction_metrics(tx_type);
+        let started_at = metrics_sampled.then(Instant::now);
         let result = self.evm.transact(tx_env);
-        let execution_seconds = started_at.elapsed().as_secs_f64();
-        execution_histogram.record(execution_seconds);
+        if let Some(started_at) = started_at {
+            TransactionMetrics::for_type(tx_type)
+                .execution
+                .record(started_at.elapsed().as_secs_f64());
+        }
         let result = result.map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
 
         // `chain().poster_gas` is set by the ArbOS handler during pre_execution; it is the
@@ -279,6 +364,7 @@ where
             result,
             gas_used_for_l1,
             tx_type,
+            metrics_sampled,
         })
     }
 
@@ -287,33 +373,13 @@ where
             result: ResultAndState { result, state },
             gas_used_for_l1,
             tx_type,
+            metrics_sampled,
         } = output;
 
         let gas_used = result.tx_gas_used();
-        let tx_type_label = tx_type_label(tx_type);
-        let receipt_histogram = metrics::histogram!(
-            "arb_reth.arbos.transaction_receipt_build_seconds",
-            "tx_type" => tx_type_label,
-        );
-        let state_commit_histogram = metrics::histogram!(
-            "arb_reth.arbos.transaction_state_commit_seconds",
-            "tx_type" => tx_type_label,
-        );
-        let commit_histogram = metrics::histogram!(
-            "arb_reth.arbos.transaction_commit_seconds",
-            "tx_type" => tx_type_label,
-        );
-        let gas_used_histogram = metrics::histogram!(
-            "arb_reth.arbos.transaction_gas_used",
-            "tx_type" => tx_type_label,
-        );
-        let l1_gas_used_histogram = metrics::histogram!(
-            "arb_reth.arbos.transaction_l1_gas_used",
-            "tx_type" => tx_type_label,
-        );
 
-        let started_at = Instant::now();
-        let receipt_started_at = Instant::now();
+        let started_at = metrics_sampled.then(Instant::now);
+        let receipt_started_at = metrics_sampled.then(Instant::now);
         self.gas_used += gas_used;
         self.receipts.push(build_arb_receipt(
             tx_type,
@@ -321,18 +387,25 @@ where
             self.gas_used,
             gas_used_for_l1,
         ));
-        let receipt_seconds = receipt_started_at.elapsed().as_secs_f64();
+        let receipt_seconds =
+            receipt_started_at.map(|started_at| started_at.elapsed().as_secs_f64());
 
-        let state_commit_started_at = Instant::now();
+        let state_commit_started_at = metrics_sampled.then(Instant::now);
         self.evm.db_mut().commit(state);
-        let state_commit_seconds = state_commit_started_at.elapsed().as_secs_f64();
-        let commit_seconds = started_at.elapsed().as_secs_f64();
+        let state_commit_seconds =
+            state_commit_started_at.map(|started_at| started_at.elapsed().as_secs_f64());
+        let commit_seconds = started_at.map(|started_at| started_at.elapsed().as_secs_f64());
 
-        receipt_histogram.record(receipt_seconds);
-        state_commit_histogram.record(state_commit_seconds);
-        commit_histogram.record(commit_seconds);
-        gas_used_histogram.record(gas_used as f64);
-        l1_gas_used_histogram.record(gas_used_for_l1 as f64);
+        if let (Some(receipt_seconds), Some(state_commit_seconds), Some(commit_seconds)) =
+            (receipt_seconds, state_commit_seconds, commit_seconds)
+        {
+            let tx_metrics = TransactionMetrics::for_type(tx_type);
+            tx_metrics.receipt_build.record(receipt_seconds);
+            tx_metrics.state_commit.record(state_commit_seconds);
+            tx_metrics.commit.record(commit_seconds);
+            tx_metrics.gas_used.record(gas_used as f64);
+            tx_metrics.l1_gas_used.record(gas_used_for_l1 as f64);
+        }
 
         GasOutput::new(gas_used)
     }

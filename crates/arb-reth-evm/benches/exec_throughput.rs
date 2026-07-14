@@ -17,10 +17,12 @@ use arb_reth_evm::block::{ArbBlockExecutionCtx, ArbBlockExecutorFactory};
 use arb_revm::ArbSpecId;
 use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use revm::context::{BlockEnv, CfgEnv};
 use revm::database::{CacheDB, EmptyDB, State};
 use revm::primitives::{Address, B256, Bytes, TxKind, U256};
 use revm::state::AccountInfo;
+use std::sync::Once;
 
 const CHAIN_ID: u64 = 42_161;
 const POSTER: Address = Address::with_last_byte(0xAA);
@@ -32,6 +34,17 @@ const BLOCK_GAS_LIMIT: u64 = 100_000_000_000;
 const PARENT_NUMBER: u64 = 100;
 const PARENT_TIMESTAMP: u64 = 1_000;
 const L1_TIMESTAMP: u64 = 1_005;
+
+/// Install the same recorder implementation the node exposes. Without a recorder, `metrics`
+/// macros use a no-op handle and hide registration costs that are part of production execution.
+fn install_metrics_recorder() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        PrometheusBuilder::new()
+            .install_recorder()
+            .expect("install Prometheus recorder");
+    });
+}
 
 /// One well-funded sender so the whole train can pay fees + value.
 fn funded_db() -> CacheDB<EmptyDB> {
@@ -131,6 +144,7 @@ fn run_block(txs: &[ArbTxEnvelope]) -> u64 {
 }
 
 fn bench_exec(c: &mut Criterion) {
+    install_metrics_recorder();
     let mut group = c.benchmark_group("exec_throughput");
     for n in [64u64, 256, 1024] {
         let txs = transfer_train(n);

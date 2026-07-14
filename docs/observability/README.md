@@ -39,6 +39,12 @@ The executor exports these bounded-label series for each consensus transaction f
 These labels deliberately exclude addresses, transaction hashes, block numbers, and ArbOS version
 to keep Prometheus cardinality bounded. Use a one-off profiler for per-contract or opcode detail.
 
+Detailed transaction and handler histograms can be sampled with
+`ARB_EXECUTION_METRICS_SAMPLE_RATE`. The default is `1`, which records every transaction. A value
+of `16` records one transaction of each type per 16-transaction window and is the recommended
+throughput setting. `0` disables only these detailed histograms. Block production, MGas/s,
+execution-cache, persistence, and feed-to-canonical metrics are never sampled by this setting.
+
 Samples collected while catching up from a feed backlog include that backlog in the end-to-end measurement. Use a node at the live tip to judge MEV-facing latency.
 
 ## Execute and persist loop
@@ -51,6 +57,12 @@ These reth metrics describe the path arb-reth actually uses:
 - `reth_consensus_engine_beacon_inserted_already_executed_blocks` and `forkchoice_updated_*` show engine-tree throughput and outcomes.
 
 The standard reth pipeline and `newPayload` metrics are exported too, but they do not drive arb-reth's execute-then-persist loop.
+
+The direct execution cache exports cumulative access counters at
+`reth_arb_reth_execution_cache_access_total{kind,result}`. Reth's
+`reth_sync_caching_{account,storage,code}_cache_{size,capacity,collisions}` gauges show whether the
+configured cache is under pressure. Increase `ARB_EXECUTION_CACHE_MB` only when occupancy or
+collisions justify it.
 
 ## Prometheus scrape
 

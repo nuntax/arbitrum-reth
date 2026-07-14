@@ -9,7 +9,7 @@ authors.workspace = true
 # extension points. See docs/arb-reth-roadmap.md.
 
 [dependencies]
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "e5b83cecdda6321e72893a83a616e1f9981e1a5a", features = ["stylus"] } # pure revm/ArbOS; stylus feature is self-contained (vendors Nitro's wasmer)
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "156f3666fc54de115fb95bfd3aaba3bda9945caf", features = ["stylus"] } # pure revm/ArbOS; stylus feature is self-contained (vendors Nitro's wasmer)
 revm = { workspace = true }
 
 # Arbitrum consensus primitives (ArbTxEnvelope, ArbReceiptEnvelope, ArbHeaderInfo). reth-trait
@@ -38,6 +38,7 @@ rpc = ["arbitrum-alloy-rpc-types", "alloy-rpc-types-eth", "alloy-evm/rpc", "reth
 # Local execution-throughput calibration bench (benches/exec_throughput.rs). Benching stays local;
 # CI compiles the target under --all-targets but does not run it (see codspeed backlog).
 criterion = "0.5"
+metrics-exporter-prometheus = "0.18"
 
 [[bench]]
 name = "exec_throughput"
