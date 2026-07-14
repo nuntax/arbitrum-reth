@@ -38,10 +38,20 @@ struct FeedLatencyMetrics {
     block_execution_seconds: Histogram,
     /// Block-builder creation, ArbOS pre-execution changes, and base-fee setup.
     block_execution_setup_seconds: Histogram,
+    /// Construction of ArbOS's mandatory internal start-block transaction.
+    block_start_block_transaction_construction_seconds: Histogram,
     /// Execution of ArbOS's mandatory internal start-block transaction.
     block_start_block_transaction_seconds: Histogram,
     /// Execution of derived user and retry transactions, including retry scheduling.
     block_derived_transactions_seconds: Histogram,
+    /// Derived transaction execution and commit work, excluding retry scheduling.
+    block_derived_transaction_execution_seconds: Histogram,
+    /// Extraction and enqueueing of retries emitted by successful derived transactions.
+    block_derived_retry_scheduling_seconds: Histogram,
+    /// Remainder after named derived-transaction phases, retained for exact accounting.
+    block_derived_transactions_unattributed_seconds: Histogram,
+    /// Remainder after named block-execution phases, retained for exact accounting.
+    block_execution_unattributed_seconds: Histogram,
     /// State-root computation plus final block and header construction.
     block_finish_seconds: Histogram,
     /// Sending the executed block to reth's engine tree.
@@ -196,11 +206,26 @@ impl FeedLatencyTracker {
                 .block_execution_setup_seconds
                 .record(applied.block_execution_setup.as_secs_f64());
             metrics
+                .block_start_block_transaction_construction_seconds
+                .record(applied.block_start_block_transaction_construction.as_secs_f64());
+            metrics
                 .block_start_block_transaction_seconds
                 .record(applied.block_start_block_transaction.as_secs_f64());
             metrics
                 .block_derived_transactions_seconds
                 .record(applied.block_derived_transactions.as_secs_f64());
+            metrics
+                .block_derived_transaction_execution_seconds
+                .record(applied.block_derived_transaction_execution.as_secs_f64());
+            metrics
+                .block_derived_retry_scheduling_seconds
+                .record(applied.block_derived_retry_scheduling.as_secs_f64());
+            metrics
+                .block_derived_transactions_unattributed_seconds
+                .record(applied.block_derived_transactions_unattributed.as_secs_f64());
+            metrics
+                .block_execution_unattributed_seconds
+                .record(applied.block_execution_unattributed.as_secs_f64());
             metrics
                 .block_finish_seconds
                 .record(applied.block_finish.as_secs_f64());

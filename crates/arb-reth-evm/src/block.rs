@@ -225,6 +225,8 @@ where
         // `InternalTxStartBlock` (0x6a) is NOT run here. It is a real block transaction with its
         // own receipt; the caller drives it through `execute_transaction` like any other tx. Running
         // it here would exclude it from the transactions/receipts roots and diverge from Nitro.
+        let execution_histogram =
+            metrics::histogram!("arb_reth.arbos.pre_execution_system_call_seconds");
         let started_at = Instant::now();
         let result = self
             .evm
@@ -233,8 +235,8 @@ where
                 HISTORY_STORAGE_ADDRESS,
                 Bytes::copy_from_slice(self.ctx.parent_hash.as_slice()),
             );
-        metrics::histogram!("arb_reth.arbos.pre_execution_system_call_seconds")
-            .record(started_at.elapsed().as_secs_f64());
+        let execution_seconds = started_at.elapsed().as_secs_f64();
+        execution_histogram.record(execution_seconds);
         let result = result.map_err(|err| BlockExecutionError::evm(err, self.ctx.parent_hash))?;
         self.evm.db_mut().commit(result.state);
 
@@ -249,15 +251,16 @@ where
         let tx_type = tx.tx().ty();
         let tx_type_label = tx_type_label(tx_type);
 
+        let execution_histogram = metrics::histogram!(
+            "arb_reth.arbos.transaction_execution_seconds",
+            "tx_type" => tx_type_label,
+        );
         let started_at = Instant::now();
         let result = self
             .evm
             .transact(tx_env);
-        metrics::histogram!(
-            "arb_reth.arbos.transaction_execution_seconds",
-            "tx_type" => tx_type_label,
-        )
-        .record(started_at.elapsed().as_secs_f64());
+        let execution_seconds = started_at.elapsed().as_secs_f64();
+        execution_histogram.record(execution_seconds);
         let result = result.map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
 
         // `chain().poster_gas` is set by the ArbOS handler during pre_execution; it is the
@@ -272,7 +275,6 @@ where
     }
 
     fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
-        let started_at = Instant::now();
         let ArbTxResult {
             result: ResultAndState { result, state },
             gas_used_for_l1,
@@ -280,32 +282,49 @@ where
         } = output;
 
         let gas_used = result.tx_gas_used();
-        self.gas_used += gas_used;
+        let tx_type_label = tx_type_label(tx_type);
+        let receipt_histogram = metrics::histogram!(
+            "arb_reth.arbos.transaction_receipt_build_seconds",
+            "tx_type" => tx_type_label,
+        );
+        let state_commit_histogram = metrics::histogram!(
+            "arb_reth.arbos.transaction_state_commit_seconds",
+            "tx_type" => tx_type_label,
+        );
+        let commit_histogram = metrics::histogram!(
+            "arb_reth.arbos.transaction_commit_seconds",
+            "tx_type" => tx_type_label,
+        );
+        let gas_used_histogram = metrics::histogram!(
+            "arb_reth.arbos.transaction_gas_used",
+            "tx_type" => tx_type_label,
+        );
+        let l1_gas_used_histogram = metrics::histogram!(
+            "arb_reth.arbos.transaction_l1_gas_used",
+            "tx_type" => tx_type_label,
+        );
 
+        let started_at = Instant::now();
+        let receipt_started_at = Instant::now();
+        self.gas_used += gas_used;
         self.receipts.push(build_arb_receipt(
             tx_type,
             result,
             self.gas_used,
             gas_used_for_l1,
         ));
+        let receipt_seconds = receipt_started_at.elapsed().as_secs_f64();
 
+        let state_commit_started_at = Instant::now();
         self.evm.db_mut().commit(state);
+        let state_commit_seconds = state_commit_started_at.elapsed().as_secs_f64();
+        let commit_seconds = started_at.elapsed().as_secs_f64();
 
-        metrics::histogram!(
-            "arb_reth.arbos.transaction_commit_seconds",
-            "tx_type" => tx_type_label(tx_type),
-        )
-        .record(started_at.elapsed().as_secs_f64());
-        metrics::histogram!(
-            "arb_reth.arbos.transaction_gas_used",
-            "tx_type" => tx_type_label(tx_type),
-        )
-        .record(gas_used as f64);
-        metrics::histogram!(
-            "arb_reth.arbos.transaction_l1_gas_used",
-            "tx_type" => tx_type_label(tx_type),
-        )
-        .record(gas_used_for_l1 as f64);
+        receipt_histogram.record(receipt_seconds);
+        state_commit_histogram.record(state_commit_seconds);
+        commit_histogram.record(commit_seconds);
+        gas_used_histogram.record(gas_used as f64);
+        l1_gas_used_histogram.record(gas_used_for_l1 as f64);
 
         GasOutput::new(gas_used)
     }
@@ -317,11 +336,13 @@ where
         // base fee) and write it to the shared ctx cell for the assembler. All txs are committed at
         // this point, so the journal reads committed values. Mirrors what Nitro's `FinalizeBlock`/
         // `createNewHeader` pull from `arbosState`.
+        let header_info_histogram =
+            metrics::histogram!("arb_reth.arbos.post_execution_header_info_seconds");
         let started_at = Instant::now();
         let header_info = ArbosState::read_block_header_info(self.evm.ctx_mut().journal_mut())
             .map_err(|e| BlockExecutionError::msg(format!("read ArbOS block header info: {e}")))?;
-        metrics::histogram!("arb_reth.arbos.post_execution_header_info_seconds")
-            .record(started_at.elapsed().as_secs_f64());
+        let header_info_seconds = started_at.elapsed().as_secs_f64();
+        header_info_histogram.record(header_info_seconds);
         if let Ok(mut slot) = self.ctx.header_info_out.lock() {
             *slot = Some(header_info);
         }
