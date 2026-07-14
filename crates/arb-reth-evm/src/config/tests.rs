@@ -7,13 +7,13 @@
 
 use super::*;
 use crate::{ArbBlockExecutorFactory, ArbEvmFactory};
-use alloy_consensus::transaction::Recovered;
 use alloy_consensus::Header;
+use alloy_consensus::transaction::Recovered;
 use alloy_evm::block::{BlockExecutor, BlockExecutorFactory, TxResult};
 use alloy_evm::{Evm, EvmFactory};
+use arb_revm::ArbSpecId;
 use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
-use arb_revm::ArbSpecId;
 use revm::database::{CacheDB, EmptyDB, State};
 use revm::primitives::{Address, Bytes, TxKind, U256};
 use revm::state::{AccountInfo, Bytecode};
@@ -174,7 +174,11 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
         U256::from(L1_BLOCK_NUMBER),
         "NUMBER opcode must return the L1 block number threaded from the header, got {returned}"
     );
-    assert_ne!(returned, U256::from(L2_BLOCK_NUMBER), "must not be the L2 number");
+    assert_ne!(
+        returned,
+        U256::from(L2_BLOCK_NUMBER),
+        "must not be the L2 number"
+    );
     assert_ne!(returned, U256::ZERO, "must not be the defaulted 0");
 }
 
@@ -185,8 +189,8 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
 fn block_executes_through_reth_generic_executor() {
     use alloy_consensus::{BlockBody, TxReceipt};
     use arbitrum_alloy_consensus::reth::ArbBlock;
-    use reth_evm::execute::Executor;
     use reth_evm::ConfigureEvm;
+    use reth_evm::execute::Executor;
     use reth_primitives_traits::RecoveredBlock;
 
     const ALICE: Address = Address::with_last_byte(0x11);
@@ -203,7 +207,11 @@ fn block_executes_through_reth_generic_executor() {
     for a in [ALICE, BOB] {
         db.insert_account_info(
             a,
-            AccountInfo { balance: U256::from(FUND), nonce: 0, ..AccountInfo::default() },
+            AccountInfo {
+                balance: U256::from(FUND),
+                nonce: 0,
+                ..AccountInfo::default()
+            },
         );
     }
 
@@ -235,13 +243,25 @@ fn block_executes_through_reth_generic_executor() {
         .expect("block executes through reth's generic Executor");
 
     assert_eq!(output.result.receipts.len(), 2, "one receipt per user tx");
-    assert!(output.result.receipts.iter().all(TxReceipt::status), "both txs must succeed");
+    assert!(
+        output.result.receipts.iter().all(TxReceipt::status),
+        "both txs must succeed"
+    );
     assert!(output.result.gas_used > 0, "block must consume gas");
 
     let balance_of = |addr: &Address| {
-        output.state.account(addr).and_then(|a| a.info.as_ref()).map(|i| i.balance).unwrap_or_default()
+        output
+            .state
+            .account(addr)
+            .and_then(|a| a.info.as_ref())
+            .map(|i| i.balance)
+            .unwrap_or_default()
     };
-    assert_eq!(balance_of(&CAROL), U256::from(XFER1), "CAROL must receive XFER1");
+    assert_eq!(
+        balance_of(&CAROL),
+        U256::from(XFER1),
+        "CAROL must receive XFER1"
+    );
     assert_eq!(
         balance_of(&BOB),
         U256::from(FUND + XFER0 - XFER1),
@@ -266,6 +286,7 @@ fn next_block_env_and_ctx_use_attributes() {
         delayed_messages_read: 0,
         extra_data: Bytes::new(),
         withdrawals: None,
+        finish_timing_out: Default::default(),
     };
 
     let env = config.next_evm_env(&parent, &attrs);

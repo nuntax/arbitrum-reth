@@ -14,9 +14,9 @@ use alloy_evm::EvmFactory;
 use alloy_evm::block::{BlockExecutor, BlockExecutorFactory};
 use arb_reth_evm::ArbEvmFactory;
 use arb_reth_evm::block::{ArbBlockExecutionCtx, ArbBlockExecutorFactory};
-use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use arb_revm::ArbSpecId;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use revm::context::{BlockEnv, CfgEnv};
 use revm::database::{CacheDB, EmptyDB, State};
 use revm::primitives::{Address, B256, Bytes, TxKind, U256};
@@ -97,6 +97,7 @@ fn block_ctx() -> ArbBlockExecutionCtx {
         poster: POSTER,
         delayed_messages_read: 0,
         header_info_out: Default::default(),
+        finish_timing_out: Default::default(),
     }
 }
 

@@ -69,7 +69,12 @@ fn oracle_result() -> (u64, U256, U256) {
     let mut evm = ctx.build_arb();
     let out = evm.transact(transfer_tx()).expect("oracle execution");
     let gas_used = out.result.tx_gas_used();
-    let sender = out.state.get(&SENDER).expect("sender in state").info.balance;
+    let sender = out
+        .state
+        .get(&SENDER)
+        .expect("sender in state")
+        .info
+        .balance;
     let recipient = out
         .state
         .get(&RECIPIENT)
@@ -91,7 +96,11 @@ fn arb_evm_factory_transact_matches_arb_revm() {
         .transact_raw(ArbTx(transfer_tx()))
         .expect("bridge execution");
 
-    assert!(out.result.is_success(), "transfer must succeed: {:?}", out.result);
+    assert!(
+        out.result.is_success(),
+        "transfer must succeed: {:?}",
+        out.result
+    );
 
     assert_eq!(
         out.result.tx_gas_used(),
@@ -99,15 +108,26 @@ fn arb_evm_factory_transact_matches_arb_revm() {
         "bridge gas_used must match arb_revm oracle"
     );
 
-    let sender_bal = out.state.get(&SENDER).expect("sender in state").info.balance;
+    let sender_bal = out
+        .state
+        .get(&SENDER)
+        .expect("sender in state")
+        .info
+        .balance;
     let recipient_bal = out
         .state
         .get(&RECIPIENT)
         .map(|a| a.info.balance)
         .unwrap_or_default();
 
-    assert_eq!(sender_bal, oracle_sender_bal, "sender balance must match oracle");
-    assert_eq!(recipient_bal, oracle_recipient_bal, "recipient balance must match oracle");
+    assert_eq!(
+        sender_bal, oracle_sender_bal,
+        "sender balance must match oracle"
+    );
+    assert_eq!(
+        recipient_bal, oracle_recipient_bal,
+        "recipient balance must match oracle"
+    );
 
     assert_eq!(
         recipient_bal,
@@ -175,7 +195,9 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
         .with_cfg(cfg())
         .with_tx(ArbTransaction::<TxEnv>::default());
     let mut oracle_evm = octx.build_arb();
-    let oracle = oracle_evm.transact(call_tx()).expect("oracle precompile call");
+    let oracle = oracle_evm
+        .transact(call_tx())
+        .expect("oracle precompile call");
 
     // Bridge: ArbEvmFactory (node ArbPrecompilesMap provider path).
     let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
@@ -184,8 +206,16 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
         .transact_raw(ArbTx(call_tx()))
         .expect("bridge precompile call");
 
-    assert!(oracle.result.is_success(), "oracle call failed: {:?}", oracle.result);
-    assert!(bridge.result.is_success(), "bridge call failed: {:?}", bridge.result);
+    assert!(
+        oracle.result.is_success(),
+        "oracle call failed: {:?}",
+        oracle.result
+    );
+    assert!(
+        bridge.result.is_success(),
+        "bridge call failed: {:?}",
+        bridge.result
+    );
 
     let oracle_out = oracle.result.output().cloned().unwrap_or_default();
     let bridge_out = bridge.result.output().cloned().unwrap_or_default();
@@ -220,7 +250,10 @@ fn create_evm_with_inspector_runs_inspecting_path() {
         .expect("inspecting execution");
     assert!(matches!(out.result, ExecutionResult::Success { .. }));
     assert_eq!(
-        out.state.get(&RECIPIENT).map(|a| a.info.balance).unwrap_or_default(),
+        out.state
+            .get(&RECIPIENT)
+            .map(|a| a.info.balance)
+            .unwrap_or_default(),
         U256::from(TRANSFER_VALUE)
     );
 }

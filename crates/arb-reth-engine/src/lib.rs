@@ -2,7 +2,7 @@
 //!
 //! [`ArbEngineDriver`] stands up reth's `EngineApiTreeHandler` and mints execute-to-derive blocks
 //! by sending `InsertExecutedBlock` + `ForkchoiceUpdated` to the tree (no re-execution), reading
-//! parent state through the ring overlay with an optional parallel state root. This crate also owns
+//! parent state through reth's native provider path. This crate also owns
 //! the payload-type stubs ([`ArbPayloadTypes`] and friends) that exist only to satisfy
 //! `NodeTypes::Payload`, and the minimal [`ArbPayloadValidator`] / `ConfigureEngineEvm` impls the
 //! engine-tree generics require. They live here rather than in the node crate so the driver can

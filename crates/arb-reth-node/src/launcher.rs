@@ -514,4 +514,92 @@ mod tests {
             "cumulative balance must be 2× single deposit"
         );
     }
+
+    /// Drives the production parent-state provider path as fast as the local CPU can execute it.
+    ///
+    /// This is intentionally ignored in normal CI. It feeds sequential deposits directly into the
+    /// real launcher, so every block performs ArbOS execution, engine-tree canonicalization, and
+    /// async Storage V2 persistence. The deep persistence window is deliberate: it creates the
+    /// maximum opportunity for `state_by_block_hash` to observe a persistence handoff.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual persistence stress test; run with ARB_RACE_BLOCKS=<n>"]
+    async fn deep_buffer_persistence_stress() {
+        let blocks = std::env::var("ARB_RACE_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(10_000);
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
+            .expect("read fixture");
+        let feed_msg: BroadcastFeedMessage =
+            serde_json::from_str(&json).expect("parse BroadcastFeedMessage");
+        let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
+        let single_deposit = U256::from(111_000_000_000_000_000u128);
+
+        let task_executor = Runtime::test();
+        let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
+        let datadir = reth_db::test_utils::tempdir_path();
+        let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
+        let maybe_path =
+            reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
+                datadir.clone(),
+            );
+        let config = NodeConfig::test()
+            .with_chain(MAINNET.clone())
+            .with_datadir_args(reth_node_core::args::DatadirArgs {
+                datadir: maybe_path.clone(),
+                ..Default::default()
+            });
+        let data_dir = maybe_path.unwrap_or_chain_default(MAINNET.chain(), config.datadir.clone());
+        let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
+        let launcher = ArbLauncher {
+            ctx: LaunchContext::new(task_executor, data_dir),
+            chain_id: crate::ARB_ONE_CHAIN_ID,
+            genesis_block: 0,
+            tuning: ArbEngineTuning {
+                persistence_threshold: 128,
+                memory_block_buffer_target: 0,
+                persistence_backpressure_threshold: 512,
+            },
+            messages: rx,
+            feed_latency: None,
+            rpc_addr: None,
+        };
+        let handle = launcher
+            .launch_node(node_builder_with_components)
+            .await
+            .expect("launch must succeed");
+        let provider = handle.provider.clone();
+
+        let started = std::time::Instant::now();
+        for sequence_number in 1..=blocks {
+            let mut message = feed_msg.clone();
+            message.sequence_number = sequence_number;
+            tx.send(message)
+                .await
+                .expect("driver must accept the next message");
+        }
+        drop(tx);
+        handle
+            .wait_for_node_exit()
+            .await
+            .expect("driver task must complete without a state-provider error");
+
+        let elapsed = started.elapsed();
+        assert_eq!(provider.best_block_number().expect("best block"), blocks);
+        // The driver exits when the input channel closes, while the engine tree intentionally
+        // owns persistence independently. Validate the canonical provider state here; a graceful
+        // node shutdown is responsible for flushing a remaining sub-threshold tail to MDBX.
+        let state = provider.latest().expect("latest state must open");
+        let account = state
+            .basic_account(&deposit_to)
+            .expect("account lookup")
+            .expect("deposit recipient must exist");
+        assert_eq!(account.balance, single_deposit * U256::from(blocks));
+        eprintln!(
+            "deep-buffer stress: blocks={blocks} elapsed={elapsed:?} blocks_per_second={:.1}",
+            blocks as f64 / elapsed.as_secs_f64()
+        );
+    }
 }

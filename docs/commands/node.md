@@ -55,7 +55,6 @@ Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [ob
 - `--persistence-threshold`: number of canonical blocks before a persistence batch.
 - `--memory-buffer-target`: recent blocks retained in memory before flushing.
 - `--persistence-backpressure`: maximum unpersisted gap before block production stalls.
-- `--no-ring-overlay`: debug-only switch to the legacy parent-state path. The ring overlay is enabled by default.
 - `--no-fsync`: bulk-sync durability tradeoff. A crash can lose a recently produced suffix, which derivation can reproduce.
 
 Start with the defaults unless a benchmark or recovery plan justifies changing them.

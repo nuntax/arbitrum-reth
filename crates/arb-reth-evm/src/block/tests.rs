@@ -9,23 +9,25 @@ use super::*;
 use crate::ArbEvmFactory;
 use alloy_consensus::transaction::Recovered;
 use alloy_evm::{EvmEnv, EvmFactory};
-use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use arb_revm::executor::{
     ArbExecCfg, ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader, execute_message,
 };
 use arb_revm::{ArbSpecId, ArbTransaction};
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
+use revm::DatabaseRef;
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::database::{CacheDB, EmptyDB, State};
 use revm::primitives::{Address, Bytes, TxKind, U256};
 use revm::state::AccountInfo;
-use revm::DatabaseRef;
 
 /// Reads `gas_used_for_l1` off any `ArbReceiptEnvelope` variant (public fields).
 fn gas_used_for_l1(r: &ArbReceiptEnvelope<alloy_primitives::Log>) -> u64 {
     use ArbReceiptEnvelope::*;
     match r {
-        Legacy(r) | Eip2930(r) | Eip1559(r) | Eip4844(r) | Eip7702(r) | Deposit(r) | Unsigned(r)
-        | Contract(r) | Retry(r) | SubmitRetryable(r) | Internal(r) => r.receipt.gas_used_for_l1,
+        Legacy(r) | Eip2930(r) | Eip1559(r) | Eip4844(r) | Eip7702(r) | Deposit(r)
+        | Unsigned(r) | Contract(r) | Retry(r) | SubmitRetryable(r) | Internal(r) => {
+            r.receipt.gas_used_for_l1
+        }
     }
 }
 
@@ -203,6 +205,7 @@ fn block_ctx() -> ArbBlockExecutionCtx {
         poster: POSTER,
         delayed_messages_read: 0,
         header_info_out: Default::default(),
+        finish_timing_out: Default::default(),
     }
 }
 
@@ -226,7 +229,9 @@ fn block_executor_matches_execute_message() {
 
     // InternalTxStartBlock (0x6a) is a real block tx; run it first (like Nitro).
     let start_tx = executor.start_block_tx().expect("start-block tx");
-    let sb_sender = start_tx.sender().expect("start-block tx carries explicit from");
+    let sb_sender = start_tx
+        .sender()
+        .expect("start-block tx carries explicit from");
     executor
         .execute_transaction(&Recovered::new_unchecked(start_tx, sb_sender))
         .expect("execute start-block tx");
@@ -266,7 +271,11 @@ fn block_executor_matches_execute_message() {
             0,
             "start-block tx uses zero gas"
         );
-        assert_eq!(result.receipts[0].ty(), 0x6a, "first receipt is the internal start-block tx");
+        assert_eq!(
+            result.receipts[0].ty(),
+            0x6a,
+            "first receipt is the internal start-block tx"
+        );
     }
 
     let mut prev_cum = result.receipts[0].cumulative_gas_used();

@@ -26,19 +26,22 @@
 //! [`ConfigureEvm`] impl is at the bottom of this file; per-header logic lives in the inherent
 //! methods below, which the trait methods delegate to.
 
-use crate::block::{ArbBlockAssembler, ArbBlockExecutionCtx, ArbBlockExecutorFactory};
 use crate::ArbEvmFactory;
+use crate::block::{
+    ArbBlockAssembler, ArbBlockExecutionCtx, ArbBlockExecutorFactory, ArbBlockFinishTiming,
+};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::EvmEnv;
 use alloy_primitives::{Address, B256, Bytes, U256};
+use arb_revm::ArbSpecId;
 use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
-use arb_revm::ArbSpecId;
 use core::convert::Infallible;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use revm::context::{BlockEnv, CfgEnv};
+use std::sync::{Arc, Mutex};
 
 /// Arbitrum One mainnet chain id.
 pub const ARB_ONE_CHAIN_ID: u64 = 42_161;
@@ -52,7 +55,7 @@ pub type ArbEvmConfigError = Infallible;
 /// carries. Mirrors `OpNextBlockEnvAttributes` / reth's `NextBlockEnvAttributes`.
 ///
 /// On Arbitrum these come from the sequencer message being executed (an `L1IncomingMessage`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ArbNextBlockEnvAttributes {
     /// Timestamp for the next block.
     pub timestamp: u64,
@@ -75,7 +78,29 @@ pub struct ArbNextBlockEnvAttributes {
     pub extra_data: Bytes,
     /// Consensus-layer withdrawals (always empty on Arbitrum; kept for trait-surface parity).
     pub withdrawals: Option<Withdrawals>,
+    /// Per-block finalization timing sink. It is observability-only and not part of EVM state or
+    /// block construction inputs.
+    pub finish_timing_out: Arc<Mutex<ArbBlockFinishTiming>>,
 }
+
+// The timing sink is intentionally excluded: it cannot affect block construction and must not
+// change the meaning of equality for this consensus input type.
+impl PartialEq for ArbNextBlockEnvAttributes {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp
+            && self.suggested_fee_recipient == other.suggested_fee_recipient
+            && self.prev_randao == other.prev_randao
+            && self.gas_limit == other.gas_limit
+            && self.l1_block_number == other.l1_block_number
+            && self.l1_base_fee_wei == other.l1_base_fee_wei
+            && self.arbos_format_version == other.arbos_format_version
+            && self.delayed_messages_read == other.delayed_messages_read
+            && self.extra_data == other.extra_data
+            && self.withdrawals == other.withdrawals
+    }
+}
+
+impl Eq for ArbNextBlockEnvAttributes {}
 
 /// Arbitrum EVM configuration: implements reth's [`ConfigureEvm`], wiring the EVM factory and block
 /// layer together.
@@ -284,6 +309,7 @@ impl ArbEvmConfig {
             // The header nonce holds the cumulative delayed-messages-read count (Nitro `EncodeNonce`).
             delayed_messages_read: u64::from_be_bytes(header.nonce.0),
             header_info_out: Default::default(),
+            finish_timing_out: Default::default(),
         }
     }
 
@@ -305,6 +331,7 @@ impl ArbEvmConfig {
             poster: attributes.suggested_fee_recipient,
             delayed_messages_read: attributes.delayed_messages_read,
             header_info_out: Default::default(),
+            finish_timing_out: attributes.finish_timing_out,
         }
     }
 

@@ -12,13 +12,13 @@ use arbitrum_alloy_consensus::{
     reth::{ArbBlock, ArbPrimitives},
 };
 use eyre::eyre;
-use reth_chain_state::{ComputedTrieData, ExecutedBlock};
+use reth_chain_state::ExecutedBlock;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::providers::ProviderNodeTypes;
 use reth_provider::{ProviderFactory, SaveBlocksMode};
 use reth_storage_api::StateRootProvider;
-use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+use reth_trie_common::{ComputedTrieData, HashedPostState, KeccakKeyHasher};
 use revm_database::BundleState;
 
 /// Persist an executed Arbitrum block to MDBX.
@@ -49,7 +49,8 @@ where
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state().iter());
 
     let state_provider = factory.latest()?;
-    let (computed_root, trie_updates) = state_provider.state_root_with_updates(hashed_state.clone())?;
+    let (computed_root, trie_updates) =
+        state_provider.state_root_with_updates(hashed_state.clone())?;
 
     // Assert consistency: the caller baked the root into the header.
     let expected_root = recovered_block.header().state_root;
@@ -90,17 +91,13 @@ mod tests {
     use alloc::vec;
 
     use alloy_consensus::Header;
-    use alloy_primitives::{address, U256};
+    use alloy_primitives::{U256, address};
     use reth_chainspec::MAINNET;
-    use reth_chain_state::ComputedTrieData;
     use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
     use reth_primitives_traits::SealedBlock;
-    use reth_provider::{
-        HeaderProvider,
-        test_utils::create_test_provider_factory_with_node_types,
-    };
+    use reth_provider::{HeaderProvider, test_utils::create_test_provider_factory_with_node_types};
     use reth_storage_api::{AccountReader, BlockHashReader, StateRootProvider};
-    use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+    use reth_trie_common::{ComputedTrieData, HashedPostState, KeccakKeyHasher};
     use revm_database::BundleState;
     use revm_state::AccountInfo;
 
@@ -113,14 +110,16 @@ mod tests {
     #[test]
     fn persist_block_roundtrip() {
         let chain_spec = MAINNET.clone();
-        let factory =
-            create_test_provider_factory_with_node_types::<ArbNode>(chain_spec.clone());
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(chain_spec.clone());
 
         // Persist genesis (block 0) so static files are seeded; save_blocks requires
         // contiguous static files starting from genesis before it accepts block 1.
         {
             let genesis_block = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
-                header: Header { number: 0, ..Default::default() },
+                header: Header {
+                    number: 0,
+                    ..Default::default()
+                },
                 body: Default::default(),
             });
             let genesis_executed = ExecutedBlock::new(
@@ -137,7 +136,9 @@ mod tests {
                 ComputedTrieData::default(),
             );
             let provider_rw = factory.provider_rw().unwrap();
-            provider_rw.save_blocks(vec![genesis_executed], SaveBlocksMode::Full).unwrap();
+            provider_rw
+                .save_blocks(vec![genesis_executed], SaveBlocksMode::Full)
+                .unwrap();
             provider_rw.commit().unwrap();
         }
 
@@ -160,8 +161,9 @@ mod tests {
         let hashed_state =
             HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state().iter());
         let state_provider = factory.latest().unwrap();
-        let (computed_root, _trie_updates) =
-            state_provider.state_root_with_updates(hashed_state).unwrap();
+        let (computed_root, _trie_updates) = state_provider
+            .state_root_with_updates(hashed_state)
+            .unwrap();
         drop(state_provider); // release any read TX before taking write TX
 
         let genesis_hash = factory
@@ -177,12 +179,10 @@ mod tests {
             state_root: computed_root,
             ..Default::default()
         };
-        let sealed_block = SealedBlock::<ArbBlock>::seal_slow(
-            alloy_consensus::Block {
-                header: block_header,
-                body: Default::default(),
-            },
-        );
+        let sealed_block = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
+            header: block_header,
+            body: Default::default(),
+        });
         let recovered_block = sealed_block.try_recover().unwrap();
 
         // Re-build bundle (moved into persist_executed_block).
@@ -204,7 +204,9 @@ mod tests {
         let provider = factory.provider().expect("fresh provider must open");
 
         use reth_provider::BlockNumReader;
-        let best = provider.best_block_number().expect("best_block_number should succeed");
+        let best = provider
+            .best_block_number()
+            .expect("best_block_number should succeed");
         assert_eq!(best, BLOCK_NUM, "best block should now be {BLOCK_NUM}");
 
         let header = provider

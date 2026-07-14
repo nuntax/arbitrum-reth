@@ -30,13 +30,11 @@ pub use precompiles::ArbPrecompilesMap;
 pub mod block;
 pub use block::{
     ArbBlockAssembler, ArbBlockExecutionCtx, ArbBlockExecutor, ArbBlockExecutorFactory,
-    ArbTxResult,
+    ArbBlockFinishTiming, ArbTxResult,
 };
 
 pub mod config;
-pub use config::{
-    ARB_ONE_CHAIN_ID, ArbEvmConfig, ArbEvmConfigError, ArbNextBlockEnvAttributes,
-};
+pub use config::{ARB_ONE_CHAIN_ID, ArbEvmConfig, ArbEvmConfigError, ArbNextBlockEnvAttributes};
 
 /// RPC compatibility impls (TryIntoTxEnv for ArbTransactionRequest → ArbTx).
 #[cfg(feature = "rpc")]
@@ -59,8 +57,12 @@ use arb_revm::ArbSpecId;
 
 /// The `arb_revm` EVM type this owns: the ArbOS EVM over [`ArbContext<DB>`] with the Arbitrum
 /// precompile set.
-type ArbRethEvm<DB, I> =
-    arb_revm::ArbEvm<ArbContext<DB>, I, EthInstructions<EthInterpreter, ArbContext<DB>>, ArbPrecompilesMap>;
+type ArbRethEvm<DB, I> = arb_revm::ArbEvm<
+    ArbContext<DB>,
+    I,
+    EthInstructions<EthInterpreter, ArbContext<DB>>,
+    ArbPrecompilesMap,
+>;
 
 /// EVM error surfaced by the Arbitrum bridge. Matches `arb_revm`'s `ArbError`:
 /// `EVMError<DBError, InvalidTransaction>`.
@@ -150,7 +152,12 @@ where
     }
 
     fn finish(self) -> (Self::DB, EvmEnv<Self::Spec, Self::BlockEnv>) {
-        let Context { block: block_env, cfg: cfg_env, journaled_state, .. } = self.inner.0.ctx;
+        let Context {
+            block: block_env,
+            cfg: cfg_env,
+            journaled_state,
+            ..
+        } = self.inner.0.ctx;
         (journaled_state.database, EvmEnv { block_env, cfg_env })
     }
 
@@ -203,7 +210,8 @@ impl EvmFactory for ArbEvmFactory {
     type Evm<DB: Database, I: Inspector<Self::Context<DB>>> = ArbEvm<DB, I>;
     type Context<DB: Database> = ArbContext<DB>;
     type Tx = ArbTx;
-    type Error<DBError: core::error::Error + Send + Sync + 'static + DBErrorMarker> = ArbEvmError<DBError>;
+    type Error<DBError: core::error::Error + Send + Sync + 'static + DBErrorMarker> =
+        ArbEvmError<DBError>;
     type HaltReason = HaltReason;
     type Spec = ArbSpecId;
     type BlockEnv = BlockEnv;

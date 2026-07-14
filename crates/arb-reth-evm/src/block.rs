@@ -22,10 +22,6 @@ use alloy_consensus::{
     TxReceipt, proofs,
 };
 use alloy_eips::{Encodable2718, Typed2718};
-use std::{
-    sync::{Arc, Mutex},
-    time::Instant,
-};
 use alloy_evm::{
     Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
@@ -34,10 +30,6 @@ use alloy_evm::{
     },
 };
 use alloy_primitives::{Address, B64, B256, Bytes, Log, U256, logs_bloom};
-use arbitrum_alloy_consensus::header::ArbHeaderInfo;
-use arbitrum_alloy_consensus::receipt::{ArbReceipt, ArbReceiptEnvelope};
-use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
-use arbitrum_alloy_consensus::transactions::internal::ArbInternalTx;
 use arb_revm::api::default_ctx::ArbContext;
 use arb_revm::constants::{BATCH_POSTER_ADDRESS, HISTORY_STORAGE_ADDRESS};
 use arb_revm::executor::hooks::{
@@ -45,11 +37,19 @@ use arb_revm::executor::hooks::{
 };
 use arb_revm::executor::{ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader};
 use arb_revm::{ArbBlockHeaderInfo, ArbExecCfg, ArbosState};
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
+use arbitrum_alloy_consensus::receipt::{ArbReceipt, ArbReceiptEnvelope};
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::internal::ArbInternalTx;
 use core::fmt::Debug;
 use reth_evm::execute::{BlockAssembler, BlockAssemblerInput};
 use revm::context::{Block as _, ContextTr, result::ResultAndState};
 use revm::handler::SYSTEM_ADDRESS;
 use revm::{DatabaseCommit, Inspector, context::result::ExecutionResult};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 /// Block-execution context for an Arbitrum block, beyond what the EVM env carries.
 ///
@@ -87,6 +87,18 @@ pub struct ArbBlockExecutionCtx {
     /// Because `create_executor` receives `ctx.clone()` and `Arc` clones share the inner cell,
     /// a value stored here by the executor is visible to the assembler.
     pub header_info_out: Arc<Mutex<Option<ArbBlockHeaderInfo>>>,
+    /// Per-block timings from the two Arbitrum-owned portions of generic block finalization.
+    /// The engine adds state hashing and state-root timing around reth's generic builder.
+    pub finish_timing_out: Arc<Mutex<ArbBlockFinishTiming>>,
+}
+
+/// Timings emitted by Arbitrum's executor and assembler while finalizing one block.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ArbBlockFinishTiming {
+    /// Reads the post-execution ArbOS header information and packages executor output.
+    pub executor_finish: Duration,
+    /// Builds transaction/receipt roots, logs bloom, and seals the Arbitrum block header.
+    pub block_assembly: Duration,
 }
 
 /// Result of executing one Arbitrum transaction through the block executor.
@@ -228,13 +240,11 @@ where
         let execution_histogram =
             metrics::histogram!("arb_reth.arbos.pre_execution_system_call_seconds");
         let started_at = Instant::now();
-        let result = self
-            .evm
-            .transact_system_call(
-                SYSTEM_ADDRESS,
-                HISTORY_STORAGE_ADDRESS,
-                Bytes::copy_from_slice(self.ctx.parent_hash.as_slice()),
-            );
+        let result = self.evm.transact_system_call(
+            SYSTEM_ADDRESS,
+            HISTORY_STORAGE_ADDRESS,
+            Bytes::copy_from_slice(self.ctx.parent_hash.as_slice()),
+        );
         let execution_seconds = started_at.elapsed().as_secs_f64();
         execution_histogram.record(execution_seconds);
         let result = result.map_err(|err| BlockExecutionError::evm(err, self.ctx.parent_hash))?;
@@ -256,9 +266,7 @@ where
             "tx_type" => tx_type_label,
         );
         let started_at = Instant::now();
-        let result = self
-            .evm
-            .transact(tx_env);
+        let result = self.evm.transact(tx_env);
         let execution_seconds = started_at.elapsed().as_secs_f64();
         execution_histogram.record(execution_seconds);
         let result = result.map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
@@ -332,6 +340,7 @@ where
     fn finish(
         mut self,
     ) -> Result<(Self::Evm, BlockExecutionResult<Self::Receipt>), BlockExecutionError> {
+        let finish_started_at = Instant::now();
         // Read the post-execution ArbOS header info (send-Merkle root/count, ArbOS version, L2
         // base fee) and write it to the shared ctx cell for the assembler. All txs are committed at
         // this point, so the journal reads committed values. Mirrors what Nitro's `FinalizeBlock`/
@@ -352,6 +361,9 @@ where
             .last()
             .map(|r| r.cumulative_gas_used())
             .unwrap_or_default();
+        if let Ok(mut timing) = self.ctx.finish_timing_out.lock() {
+            timing.executor_finish = finish_started_at.elapsed();
+        }
         Ok((
             self.evm,
             BlockExecutionResult {
@@ -422,7 +434,10 @@ where
         };
         let input = self.start_block_input(l2_block_number);
         let call = self.hooks.start_block_prelude(&input, derived)?;
-        Some(ArbTxEnvelope::from(ArbInternalTx::new(self.chain_id, call.data)))
+        Some(ArbTxEnvelope::from(ArbInternalTx::new(
+            self.chain_id,
+            call.data,
+        )))
     }
 }
 
@@ -524,6 +539,7 @@ where
         &self,
         input: BlockAssemblerInput<'_, '_, F, Header>,
     ) -> Result<Self::Block, BlockExecutionError> {
+        let assembly_started_at = Instant::now();
         let BlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
@@ -590,14 +606,18 @@ where
             slot_number: None,
         };
 
-        Ok(Block::new(
+        let block = Block::new(
             header,
             BlockBody {
                 transactions,
                 ommers: Default::default(),
                 withdrawals: None,
             },
-        ))
+        );
+        if let Ok(mut timing) = ctx.finish_timing_out.lock() {
+            timing.block_assembly = assembly_started_at.elapsed();
+        }
+        Ok(block)
     }
 }
 

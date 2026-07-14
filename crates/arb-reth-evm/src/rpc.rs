@@ -5,11 +5,9 @@
 //! - `BuildPendingEnv<Header> for ArbNextBlockEnvAttributes`: satisfies the
 //!   `PendingEnvBuilder<ArbEvmConfig>` blanket so `EthApiBuilder::build()` compiles.
 
-use alloy_evm::{
-    rpc::{EthTxEnvError, TryIntoTxEnv},
-};
-use arbitrum_alloy_rpc_types::ArbTransactionRequest;
+use alloy_evm::rpc::{EthTxEnvError, TryIntoTxEnv};
 use arb_revm::ArbTransaction;
+use arbitrum_alloy_rpc_types::ArbTransactionRequest;
 
 use crate::{ArbNextBlockEnvAttributes, ArbTx};
 
@@ -29,11 +27,11 @@ impl TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest {
     }
 }
 
-use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
-use reth_primitives_traits::SealedHeader;
-use alloy_rpc_types_eth::BlockOverrides;
 use alloy_primitives::B256;
+use alloy_rpc_types_eth::BlockOverrides;
+use reth_primitives_traits::SealedHeader;
+use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 
 impl<H: AlloyBlockHeader> BuildPendingEnv<H> for ArbNextBlockEnvAttributes {
     fn build_pending_env(
@@ -53,6 +51,7 @@ impl<H: AlloyBlockHeader> BuildPendingEnv<H> for ArbNextBlockEnvAttributes {
             delayed_messages_read: parent.nonce().map(|n| u64::from_be_bytes(n.0)).unwrap_or(0),
             extra_data: alloy_primitives::Bytes::default(),
             withdrawals: None,
+            finish_timing_out: Default::default(),
         }
     }
 }

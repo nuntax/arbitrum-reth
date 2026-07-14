@@ -52,8 +52,18 @@ struct FeedLatencyMetrics {
     block_derived_transactions_unattributed_seconds: Histogram,
     /// Remainder after named block-execution phases, retained for exact accounting.
     block_execution_unattributed_seconds: Histogram,
-    /// State-root computation plus final block and header construction.
+    /// Total generic block finalization after ArbOS transactions complete.
     block_finish_seconds: Histogram,
+    /// ArbOS executor finalization, principally reading post-execution header metadata.
+    block_finish_executor_seconds: Histogram,
+    /// Hashing the executed bundle into the post-state representation used by the trie.
+    block_finish_hashed_state_seconds: Histogram,
+    /// Computing the post-state root and trie updates.
+    block_finish_state_root_seconds: Histogram,
+    /// Transaction/receipt roots, logs bloom, and Arbitrum header/block assembly.
+    block_finish_assembly_seconds: Histogram,
+    /// Generic finalization work not assigned to one of the named phases.
+    block_finish_unattributed_seconds: Histogram,
     /// Sending the executed block to reth's engine tree.
     engine_insert_seconds: Histogram,
     /// Forkchoice request and response through reth's engine tree.
@@ -156,11 +166,7 @@ impl FeedLatencyTracker {
 
     /// Records the end of the measurement and each engine phase after reth has canonicalized the
     /// corresponding block.
-    pub(crate) fn record_canonical(
-        &self,
-        sequence_number: u64,
-        applied: ArbAppliedMessageTiming,
-    ) {
+    pub(crate) fn record_canonical(&self, sequence_number: u64, applied: ArbAppliedMessageTiming) {
         let timing = match self.inner.messages.try_lock() {
             Ok(mut messages) => messages.remove(&sequence_number),
             Err(_) => {
@@ -175,16 +181,23 @@ impl FeedLatencyTracker {
                 .frame_to_canonical_seconds
                 .record(timing.frame_received_at.elapsed().as_secs_f64());
             if let Some(ready_at) = timing.ready_for_channel_at {
-                metrics
-                    .frame_decode_seconds
-                    .record(ready_at.saturating_duration_since(timing.frame_received_at).as_secs_f64());
+                metrics.frame_decode_seconds.record(
+                    ready_at
+                        .saturating_duration_since(timing.frame_received_at)
+                        .as_secs_f64(),
+                );
                 if let Some(dequeued_at) = timing.driver_dequeued_at {
-                    metrics
-                        .channel_wait_seconds
-                        .record(dequeued_at.saturating_duration_since(ready_at).as_secs_f64());
-                    metrics
-                        .sequencing_wait_seconds
-                        .record(applied.started_at.saturating_duration_since(dequeued_at).as_secs_f64());
+                    metrics.channel_wait_seconds.record(
+                        dequeued_at
+                            .saturating_duration_since(ready_at)
+                            .as_secs_f64(),
+                    );
+                    metrics.sequencing_wait_seconds.record(
+                        applied
+                            .started_at
+                            .saturating_duration_since(dequeued_at)
+                            .as_secs_f64(),
+                    );
                 }
             }
             metrics
@@ -207,7 +220,11 @@ impl FeedLatencyTracker {
                 .record(applied.block_execution_setup.as_secs_f64());
             metrics
                 .block_start_block_transaction_construction_seconds
-                .record(applied.block_start_block_transaction_construction.as_secs_f64());
+                .record(
+                    applied
+                        .block_start_block_transaction_construction
+                        .as_secs_f64(),
+                );
             metrics
                 .block_start_block_transaction_seconds
                 .record(applied.block_start_block_transaction.as_secs_f64());
@@ -222,13 +239,32 @@ impl FeedLatencyTracker {
                 .record(applied.block_derived_retry_scheduling.as_secs_f64());
             metrics
                 .block_derived_transactions_unattributed_seconds
-                .record(applied.block_derived_transactions_unattributed.as_secs_f64());
+                .record(
+                    applied
+                        .block_derived_transactions_unattributed
+                        .as_secs_f64(),
+                );
             metrics
                 .block_execution_unattributed_seconds
                 .record(applied.block_execution_unattributed.as_secs_f64());
             metrics
                 .block_finish_seconds
                 .record(applied.block_finish.as_secs_f64());
+            metrics
+                .block_finish_executor_seconds
+                .record(applied.block_finish_executor.as_secs_f64());
+            metrics
+                .block_finish_hashed_state_seconds
+                .record(applied.block_finish_hashed_state.as_secs_f64());
+            metrics
+                .block_finish_state_root_seconds
+                .record(applied.block_finish_state_root.as_secs_f64());
+            metrics
+                .block_finish_assembly_seconds
+                .record(applied.block_finish_assembly.as_secs_f64());
+            metrics
+                .block_finish_unattributed_seconds
+                .record(applied.block_finish_unattributed.as_secs_f64());
             metrics
                 .engine_insert_seconds
                 .record(applied.engine_insert.as_secs_f64());

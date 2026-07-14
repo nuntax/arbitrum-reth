@@ -49,8 +49,6 @@ These reth metrics describe the path arb-reth actually uses:
 - `reth_consensus_engine_beacon_backpressure_active` and `backpressure_stall_duration` show persistence-induced stalls.
 - `reth_consensus_engine_beacon_persistence_duration` and `reth_consensus_engine_persistence_save_blocks_*` show persistence batch latency and size.
 - `reth_consensus_engine_beacon_inserted_already_executed_blocks` and `forkchoice_updated_*` show engine-tree throughput and outcomes.
-- `reth_executor_worker_pool_job_{duration,queue_wait}_seconds{pool="state-ovly"}` shows parallel state-root worker saturation.
-- `reth_sync_block_validation_state_trie_overlay_overlay_cache_*` and `reth_trie_parallel_*` show overlay reuse and parallel root work.
 
 The standard reth pipeline and `newPayload` metrics are exported too, but they do not drive arb-reth's execute-then-persist loop.
 

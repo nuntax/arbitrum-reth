@@ -22,6 +22,7 @@ mod tests {
     };
     use reth_engine_tree::engine::{EngineApiKind, EngineApiRequest, EngineApiEvent, FromEngine};
     use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler};
+    use reth_chain_state::StateTrieOverlayManager;
     use reth_payload_builder::PayloadBuilderHandle;
     use reth_primitives_traits::SealedHeader;
     use reth_provider::providers::BlockchainProvider;
@@ -151,6 +152,8 @@ mod tests {
             Arc::new(reth_consensus::noop::NoopConsensus::default());
         let runtime = Runtime::test();
         let changeset_cache = ChangesetCache::new();
+        let state_trie_overlays =
+            StateTrieOverlayManager::new(runtime.state_trie_overlay_worker_pool());
         let tree_config = TreeConfig::default();
 
         let payload_validator = BasicEngineValidator::new(
@@ -161,6 +164,7 @@ mod tests {
             tree_config.clone(),
             Box::new(NoopInvalidBlockHook::default()),
             changeset_cache.clone(),
+            state_trie_overlays.clone(),
             runtime.clone(),
         );
 
@@ -175,6 +179,7 @@ mod tests {
             persistence,
             payload_builder,
             canonical_in_memory,
+            state_trie_overlays,
             tree_config,
             EngineApiKind::Ethereum,
             evm_config.clone(),

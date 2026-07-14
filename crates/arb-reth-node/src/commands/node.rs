@@ -20,34 +20,41 @@
 //! With `--chain <PATH>` an Arbitrum chain-config JSON is parsed to produce a real
 //! ArbOS genesis allocation instead of the MAINNET placeholder.
 
-use std::{fs, net::{IpAddr, SocketAddr}, path::PathBuf};
+use std::{
+    fs,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+};
 
+use crate::launcher::ArbLauncher;
+use crate::metrics::FeedLatencyTracker;
+use crate::{
+    ARB_ONE_CHAIN_ID, ArbNode, L1ResumeLog, arb_chain_spec, arbos_init_from_chain_config_json,
+    arbos_init_from_parsed,
+};
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
-use crate::{
-    arb_chain_spec, arbos_init_from_chain_config_json, arbos_init_from_parsed, ArbNode,
-    ARB_ONE_CHAIN_ID, L1ResumeLog,
-};
 use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
-use crate::launcher::ArbLauncher;
-use crate::metrics::FeedLatencyTracker;
-use reth_provider::BlockNumReader;
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use clap::Parser;
 use reth_chainspec::MAINNET;
 use reth_cli_runner::CliContext;
-use reth_db::{init_db, mdbx::DatabaseArguments, mdbx::SyncMode, ClientVersion};
+use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, mdbx::SyncMode};
 use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
 use reth_node_core::{
     args::{DatadirArgs, MetricArgs},
     dirs::{DataDirPath, MaybePlatformPath},
 };
+use reth_provider::BlockNumReader;
 use reth_tracing::tracing::info;
 
 /// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
 #[derive(Debug, Parser)]
-#[command(name = "arb-reth", about = "Standalone no-engine Arbitrum (ArbOS-on-reth) node")]
+#[command(
+    name = "arb-reth",
+    about = "Standalone no-engine Arbitrum (ArbOS-on-reth) node"
+)]
 pub struct NodeArgs {
     /// Data directory for the node's database and static files.
     /// Defaults to the platform-specific reth data directory for this chain.
@@ -83,18 +90,6 @@ pub struct NodeArgs {
     /// unpersisted (bounds memory; larger = production runs further ahead of the disk).
     #[arg(long = "persistence-backpressure", default_value_t = 16)]
     persistence_backpressure: u64,
-
-    /// Use the DEPRECATED legacy parent-state read path (`state_by_block_hash(parent)`) instead of
-    /// the ring overlay. The ring overlay is ON by default: it reads parent state from a driver-held
-    /// ring of just-executed blocks over the immune latest provider, eliminating the torn-read hazard
-    /// so deep buffers stay parity-safe. Only pass this to A/B or debug the legacy path.
-    #[arg(long = "no-ring-overlay", default_value_t = false)]
-    no_ring_overlay: bool,
-
-    /// DEPRECATED no-op: the ring overlay is now the default. Accepted for backward compatibility
-    /// (older invocations pass `--ring-overlay`); it has no effect. Use `--no-ring-overlay` to opt out.
-    #[arg(long = "ring-overlay", default_value_t = false, hide = true)]
-    ring_overlay_compat: bool,
 
     /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
     /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
@@ -274,7 +269,9 @@ fn resolve_rollup_deployment(args: &NodeArgs) -> eyre::Result<RollupDeployment> 
             deployed_at: args
                 .l1_inbox_deploy_block
                 .unwrap_or(arb_reth_l1::SEQUENCER_INBOX_DEPLOY_BLOCK_MAINNET),
-            l2_genesis_block: args.l2_genesis_block.unwrap_or(arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET),
+            l2_genesis_block: args
+                .l2_genesis_block
+                .unwrap_or(arb_reth_l1::NITRO_GENESIS_BLOCK_MAINNET),
         }),
         (Some(sequencer_inbox), Some(bridge)) => Ok(RollupDeployment {
             sequencer_inbox,
@@ -301,8 +298,11 @@ async fn derive_genesis_from_l1(
     from_block: u64,
     base_fee_override: Option<u128>,
 ) -> eyre::Result<(std::sync::Arc<reth_chainspec::ChainSpec>, u64)> {
-    let provider = ProviderBuilder::new()
-        .connect_http(l1_rpc.parse().map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?);
+    let provider = ProviderBuilder::new().connect_http(
+        l1_rpc
+            .parse()
+            .map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?,
+    );
     let head = provider
         .get_block_number()
         .await
@@ -312,10 +312,9 @@ async fn derive_genesis_from_l1(
         .fetch_delayed(from_block, head)
         .await
         .map_err(|e| eyre::eyre!("fetch delayed messages for L1 genesis: {e}"))?;
-    let init = msgs
-        .iter()
-        .find(|m| m.inbox_seq_num == 0)
-        .ok_or_else(|| eyre::eyre!("no delayed message 0 (Initialize) in L1 blocks {from_block}..={head}"))?;
+    let init = msgs.iter().find(|m| m.inbox_seq_num == 0).ok_or_else(|| {
+        eyre::eyre!("no delayed message 0 (Initialize) in L1 blocks {from_block}..={head}")
+    })?;
     let parsed = parse_init_message_from_body(init.kind, &init.data)
         .map_err(|e| eyre::eyre!("parse Initialize message: {e}"))?;
     let mut arbos_init = arbos_init_from_parsed(&parsed)?;
@@ -352,7 +351,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             Some((std::sync::Arc::new(spec), init, info))
         }
         (None, Some(_)) => {
-            return Err(eyre::eyre!("--genesis requires --chain-info (the rollup addresses live there)"))
+            return Err(eyre::eyre!(
+                "--genesis requires --chain-info (the rollup addresses live there)"
+            ));
         }
         (None, None) => None,
     };
@@ -400,7 +401,10 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 delayed_messages_read = snapshot_delayed.unwrap(),
                 "booting on snapshot head header",
             );
-            (crate::arb_chain_spec_with_header(args.chain_id, header, hash), args.chain_id)
+            (
+                crate::arb_chain_spec_with_header(args.chain_id, header, hash),
+                args.chain_id,
+            )
         }
         (None, None, Some(path)) => {
             let json = fs::read(path)
@@ -443,9 +447,10 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     };
 
     let datadir_args = match args.datadir {
-        Some(path) => {
-            DatadirArgs { datadir: MaybePlatformPath::<DataDirPath>::from(path), ..Default::default() }
-        }
+        Some(path) => DatadirArgs {
+            datadir: MaybePlatformPath::<DataDirPath>::from(path),
+            ..Default::default()
+        },
         None => DatadirArgs::default(),
     };
     let config = NodeConfig::new(chain_spec)
@@ -477,12 +482,6 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
     let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
 
-    if args.ring_overlay_compat {
-        tracing::warn!(
-            "--ring-overlay is deprecated and now a no-op: the ring overlay is on by default \
-             (pass --no-ring-overlay to use the deprecated legacy path)"
-        );
-    }
     let launcher = ArbLauncher {
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
         chain_id: effective_chain_id,
@@ -491,7 +490,6 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             persistence_threshold: args.persistence_threshold,
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
-            ring_overlay: !args.no_ring_overlay,
         },
         messages: feed_rx,
         feed_latency: feed_latency.clone(),
@@ -502,7 +500,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
     match handle.http_url() {
         Some(url) => info!(target: "arb-reth", %url, "arb-reth node started; eth_* RPC serving"),
-        None => info!(target: "arb-reth", "arb-reth node started (RPC disabled; pass --http to enable)"),
+        None => {
+            info!(target: "arb-reth", "arb-reth node started (RPC disabled; pass --http to enable)")
+        }
     }
 
     if let Some(feed_path) = args.replay_feed {
@@ -663,8 +663,12 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
         // The rollup addresses and genesis anchors, resolved as one set (Arbitrum One by default,
         // or a custom deployment when the addresses are supplied together).
-        let RollupDeployment { sequencer_inbox, bridge, deployed_at: inbox_deploy_block, l2_genesis_block } =
-            rollup;
+        let RollupDeployment {
+            sequencer_inbox,
+            bridge,
+            deployed_at: inbox_deploy_block,
+            l2_genesis_block,
+        } = rollup;
 
         // The resume log lives in the data directory and is updated as sync advances, so a restart
         // lifts off where it stopped instead of re-deriving from genesis.
@@ -722,7 +726,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             // Resolve batch 0's delivery block on-chain (anchored at the SequencerInbox deploy
             // block) rather than assuming a literal.
             let provider = ProviderBuilder::new().connect_http(
-                l1_rpc.parse().map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?,
+                l1_rpc
+                    .parse()
+                    .map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?,
             );
             let reader = SequencerInboxReader::new(provider, sequencer_inbox);
             let block = reader
@@ -733,7 +739,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 )
                 .await
                 .map_err(|e| eyre::eyre!("resolve batch 0 delivery block: {e}"))?
-                .ok_or_else(|| eyre::eyre!("batch 0 not found near the SequencerInbox deploy block"))?;
+                .ok_or_else(|| {
+                    eyre::eyre!("batch 0 not found near the SequencerInbox deploy block")
+                })?;
             // Genesis delayed cursor is 0; anchor L2 numbering at genesis so the skip threshold
             // (db_tip) lines up with the absolute block numbers derivation produces.
             let delayed = args.l1_start_delayed.unwrap_or(0);
