@@ -12,9 +12,9 @@ authors.workspace = true
 # arb-reth-derive (Stage F).
 
 [dependencies]
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21", default-features = false, features = ["reth"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", default-features = false, features = ["reth"] }
 arb-reth-evm = { path = "../arb-reth-evm", features = ["rpc"] }
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "156f3666fc54de115fb95bfd3aaba3bda9945caf" }
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "49eb9df91bc79cf9f261c8472587d2de64d9fb43" }
 
 alloy-primitives = { version = "1", default-features = false }
 alloy-consensus = { version = "2.0", default-features = false }
@@ -45,7 +45,7 @@ revm-database = "41.0.0"
 # D.2.3: driver (reth BlockBuilder + revm State<StateProviderDatabase>)
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af245c4d69c6c1df241df016c278ffb5d15df" }
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af245c4d69c6c1df241df016c278ffb5d15df" }
-arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21" }
+arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102" }
 
 # Stage F.3c: L1-derivation catch-up runtime (SequencerInbox + delayed inbox -> feed).
 arb-reth-l1 = { path = "../arb-reth-l1" }
@@ -98,8 +98,8 @@ reth-metrics = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af24
 
 # D.5: Arbitrum RPC converters (receipt/rpc converters), consumed by the canonical RpcAddOns wiring.
 arb-reth-rpc = { path = "../arb-reth-rpc" }
-arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21" }
-arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21", features = ["reth-compat"] }
+arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102" }
+arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", features = ["reth-compat"] }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af245c4d69c6c1df241df016c278ffb5d15df" }
 reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af245c4d69c6c1df241df016c278ffb5d15df" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af245c4d69c6c1df241df016c278ffb5d15df" }
@@ -126,7 +126,7 @@ reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af245c4d69c6c1df241df016c278ffb5d15df", features = ["test-utils"] }
 revm-state = "41.0.0"
 tempfile = "3"
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21", default-features = false, features = ["reth", "k256"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", default-features = false, features = ["reth", "k256"] }
 # Per-block replay-parity test: seed the real ArbOS genesis block into the test factory.
 reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "943af245c4d69c6c1df241df016c278ffb5d15df" }
 

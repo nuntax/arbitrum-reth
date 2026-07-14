@@ -9,7 +9,7 @@ authors.workspace = true
 # Nitro's `InitializeArbosInDatabase` (via arb_revm::arbos_init) and verifying the state root.
 
 [dependencies]
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "156f3666fc54de115fb95bfd3aaba3bda9945caf" }
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "49eb9df91bc79cf9f261c8472587d2de64d9fb43" }
 
 alloy-primitives = { version = "1", default-features = false }
 alloy-trie = { version = "0.9", default-features = false }
