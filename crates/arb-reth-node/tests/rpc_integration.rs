@@ -8,7 +8,6 @@ use alloy_primitives::{U256, address};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use jsonrpsee::core::client::ClientT as _;
 use reth_chainspec::MAINNET;
-use reth_evm::block::CommitChanges::No;
 use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
 use reth_tasks::Runtime;
 
