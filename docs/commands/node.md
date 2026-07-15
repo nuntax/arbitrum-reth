@@ -58,3 +58,21 @@ Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [ob
 - `--no-fsync`: bulk-sync durability tradeoff. A crash can lose a recently produced suffix, which derivation can reproduce.
 
 Start with the defaults unless a benchmark or recovery plan justifies changing them.
+
+## History pruning
+
+Without pruning flags, `arb-reth` is an archive node and retains all historical state and receipts.
+
+- `--full` uses reth's full-node profile. It prunes sender recovery completely and retains the
+  unwind-safe recent window for account history, storage history, and receipts.
+- `--minimal` is more aggressive and also prunes transaction lookups, receipts, and static-file
+  data according to reth's minimal-storage profile.
+- `--prune.block-interval N` sets how often the persistence service may prune.
+- `--prune.minimum-distance N` sets the minimum recent block window that pruning must retain.
+
+The root `arb-start-sync.sh` wrapper exposes the two profiles as `--full` and `--minimal`, plus the
+interval and minimum-distance options. For granular segment rules, invoke `arb-reth node --help`
+directly and use the corresponding `--prune.*` flags.
+
+Use pruning only after the chain has completed its initial import or catch-up. A pruned node cannot
+serve arbitrary historical state, receipts, or transaction lookups that were intentionally removed.

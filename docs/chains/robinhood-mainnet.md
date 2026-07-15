@@ -15,7 +15,7 @@ The copies currently under `crates/arb-reth-node/tests/fixtures` exist to exerci
 - A release build of `arb-reth`.
 - An archive-capable Ethereum mainnet execution RPC.
 - An Ethereum mainnet beacon API. Robinhood has blob batches, so the beacon endpoint is required for a complete sync.
-- Disk space for the full chain and a persistent datadir. Do not place the datadir in a temporary directory.
+- Sufficient disk for the retained history and a persistent datadir. Do not place the datadir in a temporary directory.
 
 Build the binary from the repository root:
 
@@ -54,8 +54,15 @@ The command below creates the datadir when absent and resumes from its stored L1
   --persistence-threshold 128 \
   --memory-buffer-target 0 \
   --persistence-backpressure 512 \
+  --full \
   --http --http.port 8547
 ```
+
+`--full` is the recommended local full-node profile: it retains the recent history and receipts
+needed for normal operation and safe unwinds, while removing older data that an archive node would
+keep indefinitely. Omit it to run an archive node. Do not use `--minimal` for a parity-monitoring
+or recovery-oriented node; it retains less data. See the [node command](../commands/node.md) for
+the retained windows and granular pruning controls.
 
 The feed and L1 derivation may run together. The feed improves time at the tip, while L1 remains the source of durable historical derivation. Feed messages ahead of the L1 cursor are reconciled by sequence number and applied when they become contiguous.
 
