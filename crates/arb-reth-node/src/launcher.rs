@@ -290,10 +290,8 @@ impl ArbLauncher {
         // particular, full sender recovery pruning stops new TransactionSenders writes. Feeding
         // the configuration only to `PrunerBuilder` would let the writer append to a segment the
         // pruner deletes, breaking its contiguous-block invariant on the next persistence batch.
-        let provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DB>> = ctx
-            .provider_factory()
-            .clone()
-            .with_prune_modes(
+        let provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DB>> =
+            ctx.provider_factory().clone().with_prune_modes(
                 prune_config
                     .as_ref()
                     .map(|config| config.segments.clone())
@@ -455,9 +453,12 @@ mod tests {
         }
         drop(tx);
 
-        let mut prune_config = PruningArgs { full: true, ..Default::default() }
-            .prune_config(MAINNET.as_ref())
-            .expect("--full must resolve to a prune config");
+        let mut prune_config = PruningArgs {
+            full: true,
+            ..Default::default()
+        }
+        .prune_config(MAINNET.as_ref())
+        .expect("--full must resolve to a prune config");
         prune_config.block_interval = 1;
         prune_config.minimum_pruning_distance = 0;
 
@@ -587,6 +588,7 @@ mod tests {
                 persistence_threshold: 128,
                 memory_block_buffer_target: 0,
                 persistence_backpressure_threshold: 512,
+                state_root_task: crate::DirectStateRootTaskMode::Off,
             },
             prune_config: None,
             messages: rx,

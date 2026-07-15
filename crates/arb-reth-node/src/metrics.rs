@@ -60,6 +60,8 @@ struct FeedLatencyMetrics {
     block_finish_hashed_state_seconds: Histogram,
     /// Computing the post-state root and trie updates.
     block_finish_state_root_seconds: Histogram,
+    /// Waiting for the sparse state-root task after ArbOS execution.
+    block_finish_state_root_task_wait_seconds: Histogram,
     /// Transaction/receipt roots, logs bloom, and Arbitrum header/block assembly.
     block_finish_assembly_seconds: Histogram,
     /// Generic finalization work not assigned to one of the named phases.
@@ -259,6 +261,11 @@ impl FeedLatencyTracker {
             metrics
                 .block_finish_state_root_seconds
                 .record(applied.block_finish_state_root.as_secs_f64());
+            if let Some(wait) = applied.block_finish_state_root_task_wait {
+                metrics
+                    .block_finish_state_root_task_wait_seconds
+                    .record(wait.as_secs_f64());
+            }
             metrics
                 .block_finish_assembly_seconds
                 .record(applied.block_finish_assembly.as_secs_f64());
