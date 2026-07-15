@@ -461,8 +461,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // Resolve the pruning configuration from the `--prune.*` / `--full` flags before `chain_spec` is
     // moved into the node config (the prune modes for `--full`/pre-merge presets are keyed off the
     // chain's hardfork activations). `prune_config` returns `None` when no pruning flag is set, which
-    // keeps the node a full archive; otherwise reth's `PrunerBuilder` turns the requested
-    // `PruneModes` into the real segment set that the engine-tree persistence service runs.
+    // keeps the node a full archive. The launcher passes the resulting config to both reth's
+    // provider factory and its pruner: the provider needs the modes while writing static files,
+    // while the pruner needs them when retiring old history.
     let prune_config = args.pruning.prune_config(chain_spec.as_ref());
     match &prune_config {
         Some(pc) => info!(
@@ -474,8 +475,6 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         ),
         None => info!(target: "arb-reth", "archive node (no pruning configured; keeping all history)"),
     }
-    let prune_builder = prune_config.map(reth_prune::PrunerBuilder::new);
-
     let datadir_args = match args.datadir {
         Some(path) => DatadirArgs {
             datadir: MaybePlatformPath::<DataDirPath>::from(path),
@@ -521,7 +520,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
         },
-        prune_builder,
+        prune_config,
         messages: feed_rx,
         feed_latency: feed_latency.clone(),
         rpc_addr,

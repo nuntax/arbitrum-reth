@@ -87,10 +87,10 @@ pub struct ArbLauncher {
     pub genesis_block: u64,
     /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
     pub tuning: ArbEngineTuning,
-    /// Optional pruner, pre-built from the `--prune.*` / `--full` CLI flags. `None` keeps the node
-    /// an archive node (noop pruner); `Some` prunes the configured segments as the engine-tree
-    /// persistence service commits. See `commands/node.rs`.
-    pub prune_builder: Option<reth_prune::PrunerBuilder>,
+    /// Optional history-pruning configuration from `--prune.*` / `--full`. `None` keeps the node
+    /// an archive node. A configured mode is applied to both the provider factory and the
+    /// engine-tree persistence pruner so static-file writes follow the same segment policy.
+    pub prune_config: Option<reth_config::PruneConfig>,
     /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
     /// tip, so no per-message version is carried.
     pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
@@ -197,7 +197,7 @@ impl ArbLauncher {
             chain_id,
             genesis_block,
             tuning,
-            prune_builder,
+            prune_config,
             messages,
             feed_latency,
             rpc_addr,
@@ -286,8 +286,19 @@ impl ArbLauncher {
 
         let provider: BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> =
             ctx.node_adapter().provider.clone();
-        let provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DB>> =
-            ctx.provider_factory().clone();
+        // Reth's provider factory consults `PruneModes` while it writes static-file segments. In
+        // particular, full sender recovery pruning stops new TransactionSenders writes. Feeding
+        // the configuration only to `PrunerBuilder` would let the writer append to a segment the
+        // pruner deletes, breaking its contiguous-block invariant on the next persistence batch.
+        let provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DB>> = ctx
+            .provider_factory()
+            .clone()
+            .with_prune_modes(
+                prune_config
+                    .as_ref()
+                    .map(|config| config.segments.clone())
+                    .unwrap_or_default(),
+            );
         let task_executor: TaskExecutor = ctx.task_executor().clone();
         let head = ctx.head();
 
@@ -315,7 +326,7 @@ impl ArbLauncher {
             canonical,
             task_executor.clone(),
             tuning,
-            prune_builder,
+            prune_config.map(reth_prune::PrunerBuilder::new),
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
@@ -413,16 +424,18 @@ mod tests {
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use reth_chainspec::MAINNET;
     use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
+    use reth_node_core::args::PruningArgs;
     use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
     use reth_storage_api::AccountReader;
     use reth_tasks::Runtime;
 
     use crate::ArbNode;
 
-    /// `ArbLauncher` boots over reth's `LaunchContext`, processes two deposit messages,
-    /// and persists blocks 1 & 2 with cumulative balance = 2 x 111_000_000_000_000_000.
+    /// `ArbLauncher` boots over reth's `LaunchContext` with full pruning, then persists two
+    /// consecutive batches. The first batch deletes transaction-sender static files; the second
+    /// must not recreate them, because the provider factory receives the same prune modes.
     #[tokio::test(flavor = "multi_thread")]
-    async fn launcher_boots_and_produces_blocks() {
+    async fn launcher_full_pruning_persists_successive_batches() {
         let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
             .expect("read fixture");
@@ -431,16 +444,22 @@ mod tests {
 
         let task_executor = Runtime::test();
 
-        // The driver dedups by sequence number, so the two messages must be sequential (a fresh
-        // genesis DB has genesis_block 0, so the first digested message is index 1).
+        // The driver dedups by sequence number, so messages must be sequential (a fresh genesis
+        // DB has genesis_block 0, so the first digested message is index 1). Four messages with a
+        // persistence threshold of two guarantee a second save after sender pruning has run.
         let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
-        let mut m1 = feed_msg.clone();
-        m1.sequence_number = 1;
-        let mut m2 = feed_msg.clone();
-        m2.sequence_number = 2;
-        tx.send(m1).await.unwrap();
-        tx.send(m2).await.unwrap();
+        for sequence_number in 1..=4 {
+            let mut message = feed_msg.clone();
+            message.sequence_number = sequence_number;
+            tx.send(message).await.unwrap();
+        }
         drop(tx);
+
+        let mut prune_config = PruningArgs { full: true, ..Default::default() }
+            .prune_config(MAINNET.as_ref())
+            .expect("--full must resolve to a prune config");
+        prune_config.block_interval = 1;
+        prune_config.minimum_pruning_distance = 0;
 
         let datadir = reth_db::test_utils::tempdir_path();
         let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
@@ -465,7 +484,7 @@ mod tests {
             chain_id: crate::ARB_ONE_CHAIN_ID,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
-            prune_builder: None,
+            prune_config: Some(prune_config),
             messages: rx,
             feed_latency: None,
             rpc_addr: None,
@@ -496,16 +515,16 @@ mod tests {
 
         assert_eq!(
             provider.best_block_number().unwrap(),
-            2,
-            "best block must be 2"
+            4,
+            "best block must be 4"
         );
         assert!(
             provider.header_by_number(1).unwrap().is_some(),
             "block 1 must exist"
         );
         assert!(
-            provider.header_by_number(2).unwrap().is_some(),
-            "block 2 must exist"
+            provider.header_by_number(4).unwrap().is_some(),
+            "block 4 must exist"
         );
 
         let deposit_to = address!("3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e");
@@ -517,8 +536,8 @@ mod tests {
             .expect("deposit recipient must exist");
         assert_eq!(
             acct.balance,
-            single_deposit * U256::from(2),
-            "cumulative balance must be 2× single deposit"
+            single_deposit * U256::from(4),
+            "cumulative balance must be 4× single deposit"
         );
     }
 
@@ -569,7 +588,7 @@ mod tests {
                 memory_block_buffer_target: 0,
                 persistence_backpressure_threshold: 512,
             },
-            prune_builder: None,
+            prune_config: None,
             messages: rx,
             feed_latency: None,
             rpc_addr: None,
