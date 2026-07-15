@@ -43,7 +43,7 @@ use reth_cli_runner::CliContext;
 use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, mdbx::SyncMode};
 use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
 use reth_node_core::{
-    args::{DatadirArgs, MetricArgs},
+    args::{DatadirArgs, MetricArgs, PruningArgs},
     dirs::{DataDirPath, MaybePlatformPath},
 };
 use reth_provider::BlockNumReader;
@@ -235,6 +235,18 @@ pub struct NodeArgs {
     /// Use with `--datadir <imported-dir>` (do not pass `--chain`).
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: Option<PathBuf>,
+
+    /// History-pruning / full-node configuration: reth's standard `--full` and granular
+    /// `--prune.*` flags (e.g. `--prune.account-history.distance <BLOCKS>`,
+    /// `--prune.storage-history.distance <BLOCKS>`, `--prune.receipts.distance <BLOCKS>`,
+    /// `--prune.transaction-lookup.full`, `--prune.sender-recovery.full`).
+    ///
+    /// With none of these set the node stays a full archive (keeps all state history). When any is
+    /// set, the engine-tree persistence service runs reth's pruner after each commit batch, dropping
+    /// the configured segments older than the requested window. `--full` applies reth's full-node
+    /// preset (keep only the most recent unwind-safe distance of account/storage history + receipts).
+    #[command(flatten)]
+    pruning: PruningArgs,
 }
 
 /// The L1 rollup deployment arb-reth reads from: the contract addresses plus the L1 block the
@@ -446,6 +458,24 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         },
     };
 
+    // Resolve the pruning configuration from the `--prune.*` / `--full` flags before `chain_spec` is
+    // moved into the node config (the prune modes for `--full`/pre-merge presets are keyed off the
+    // chain's hardfork activations). `prune_config` returns `None` when no pruning flag is set, which
+    // keeps the node a full archive; otherwise reth's `PrunerBuilder` turns the requested
+    // `PruneModes` into the real segment set that the engine-tree persistence service runs.
+    let prune_config = args.pruning.prune_config(chain_spec.as_ref());
+    match &prune_config {
+        Some(pc) => info!(
+            target: "arb-reth",
+            segments = ?pc.segments,
+            block_interval = pc.block_interval,
+            minimum_pruning_distance = pc.minimum_pruning_distance,
+            "history pruning enabled",
+        ),
+        None => info!(target: "arb-reth", "archive node (no pruning configured; keeping all history)"),
+    }
+    let prune_builder = prune_config.map(reth_prune::PrunerBuilder::new);
+
     let datadir_args = match args.datadir {
         Some(path) => DatadirArgs {
             datadir: MaybePlatformPath::<DataDirPath>::from(path),
@@ -491,6 +521,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
         },
+        prune_builder,
         messages: feed_rx,
         feed_latency: feed_latency.clone(),
         rpc_addr,

@@ -60,6 +60,7 @@
             chain_id: arb_reth_node::ARB_ONE_CHAIN_ID,
             genesis_block: 0,
             tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
+            prune_builder: None,
             messages: rx,
             feed_latency: None,
             rpc_addr: Some(rpc_addr),

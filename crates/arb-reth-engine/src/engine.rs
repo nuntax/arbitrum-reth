@@ -61,7 +61,7 @@ use reth_provider::{
     ProviderResult, StateProofProvider, StateProviderFactory, StateReader, StateRootProvider,
     StorageChangeSetReader, StorageRootProvider,
 };
-use reth_prune::Pruner;
+use reth_prune::{Pruner, PrunerBuilder};
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
@@ -912,6 +912,7 @@ where
         canonical: CanonicalInMemoryState<ArbPrimitives>,
         runtime: Runtime,
         tuning: ArbEngineTuning,
+        prune_builder: Option<PrunerBuilder>,
     ) -> eyre::Result<Self> {
         // The engine tree owns a separate cache for its validation/payload paths. The direct
         // feed driver does not execute through that path, so keep a dedicated sequential cache.
@@ -931,11 +932,24 @@ where
             execution_cache_enabled.then(CachedStateCacheMetrics::default);
         let execution_cache_tip = genesis_tip.hash();
 
-        // ---- persistence service (real MDBX writer, noop pruner) ----
+        // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
             tokio::sync::watch::channel(reth_exex_types::FinishedExExHeight::NoExExs);
-        let pruner =
-            Pruner::new_with_factory(factory.clone(), vec![], 5, 0, None, finished_exex_height_rx);
+        // With no `--prune.*` flags this stays an archive node: a noop pruner (empty segment set)
+        // that keeps all history. When pruning is configured, reth's `PrunerBuilder` turns the
+        // requested `PruneModes` into the real segment set; the engine-tree persistence service
+        // below runs it after each commit batch (at the configured block interval).
+        let pruner = match prune_builder {
+            Some(builder) => builder.build_with_provider_factory(factory.clone()),
+            None => Pruner::new_with_factory(
+                factory.clone(),
+                vec![],
+                5,
+                0,
+                None,
+                finished_exex_height_rx,
+            ),
+        };
         let (sync_metrics_tx, _sync_metrics_rx) =
             tokio::sync::mpsc::unbounded_channel::<reth_stages_api::MetricEvent>();
         let persistence = PersistenceHandle::<ArbPrimitives>::spawn_service::<N>(

@@ -87,6 +87,10 @@ pub struct ArbLauncher {
     pub genesis_block: u64,
     /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
     pub tuning: ArbEngineTuning,
+    /// Optional pruner, pre-built from the `--prune.*` / `--full` CLI flags. `None` keeps the node
+    /// an archive node (noop pruner); `Some` prunes the configured segments as the engine-tree
+    /// persistence service commits. See `commands/node.rs`.
+    pub prune_builder: Option<reth_prune::PrunerBuilder>,
     /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
     /// tip, so no per-message version is carried.
     pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
@@ -193,6 +197,7 @@ impl ArbLauncher {
             chain_id,
             genesis_block,
             tuning,
+            prune_builder,
             messages,
             feed_latency,
             rpc_addr,
@@ -310,6 +315,7 @@ impl ArbLauncher {
             canonical,
             task_executor.clone(),
             tuning,
+            prune_builder,
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
@@ -459,6 +465,7 @@ mod tests {
             chain_id: crate::ARB_ONE_CHAIN_ID,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
+            prune_builder: None,
             messages: rx,
             feed_latency: None,
             rpc_addr: None,
@@ -562,6 +569,7 @@ mod tests {
                 memory_block_buffer_target: 0,
                 persistence_backpressure_threshold: 512,
             },
+            prune_builder: None,
             messages: rx,
             feed_latency: None,
             rpc_addr: None,
