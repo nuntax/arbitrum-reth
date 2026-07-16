@@ -519,7 +519,6 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             persistence_threshold: args.persistence_threshold,
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
-            state_root_task: crate::DirectStateRootTaskMode::from_env(),
         },
         prune_config,
         messages: feed_rx,

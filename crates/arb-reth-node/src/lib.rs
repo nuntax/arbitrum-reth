@@ -71,7 +71,7 @@ pub use arb_reth_rpc::{ArbReceiptConverter, ArbRpcConverter};
 // `arb-reth-engine` crate; re-export for API stability.
 pub use arb_reth_engine::{
     ArbBuiltPayload, ArbEngineDriver, ArbEngineTuning, ArbExecutionData, ArbPayloadAttributes,
-    ArbPayloadTypes, ArbPayloadValidator, DirectStateRootTaskMode,
+    ArbPayloadTypes, ArbPayloadValidator,
 };
 
 use alloy_consensus::Header;

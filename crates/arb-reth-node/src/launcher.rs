@@ -434,6 +434,10 @@ mod tests {
     /// must not recreate them, because the provider factory receives the same prune modes.
     #[tokio::test(flavor = "multi_thread")]
     async fn launcher_full_pruning_persists_successive_batches() {
+        run_full_pruning_persistence().await;
+    }
+
+    async fn run_full_pruning_persistence() {
         let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
             .expect("read fixture");
@@ -588,7 +592,6 @@ mod tests {
                 persistence_threshold: 128,
                 memory_block_buffer_target: 0,
                 persistence_backpressure_threshold: 512,
-                state_root_task: crate::DirectStateRootTaskMode::Off,
             },
             prune_config: None,
             messages: rx,
