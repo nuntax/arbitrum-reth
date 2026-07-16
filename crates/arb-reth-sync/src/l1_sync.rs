@@ -21,7 +21,7 @@
 //! ## ArbOS version across upgrades
 //!
 //! This runtime does not carry an ArbOS version. The version advances per block downstream:
-//! `produce()` (engine.rs) derives the message-parse version from the parent header's encoded
+//! The native payload builder derives the message-parse version from the parent header's encoded
 //! ArbOS version, and the per-block start-block internal tx applies scheduled ArbOS state
 //! upgrades (`upgrade_arbos_version`, arb_revm `internal_tx.rs`) when due. So a catch-up across
 //! an upgrade boundary is wired, though not yet validated against a real mainnet upgrade crossing.

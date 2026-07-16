@@ -15,33 +15,46 @@ use alloc::sync::Arc;
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Bytes, U256};
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload as AlloyExecutionPayload, PayloadId};
-use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadAttributes, PayloadTypes};
-use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedBlock};
+use reth_payload_primitives::{
+    BuiltPayload, BuiltPayloadExecutedBlock, ExecutionPayload, PayloadAttributes, PayloadTypes,
+};
+use reth_primitives_traits::{NodePrimitives, SealedBlock};
 
-use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
+use arbitrum_alloy_consensus::reth::ArbPrimitives;
 
 pub mod engine;
 pub mod engine_spike;
+pub mod native_payload;
 
-pub use engine::{
-    produce, wait_for_head, ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning,
-    DirectStateRootTaskMode,
-};
+pub use engine::{ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, wait_for_head};
 pub use engine_spike::ArbPayloadValidator;
+pub use native_payload::ArbPayloadBuilder;
 
-/// A minimal built-payload stub for Arbitrum.
-///
-/// Exists solely to satisfy `NodeTypes::Payload`; the execute-once driver never builds engine payloads.
+/// An executed Arbitrum payload produced by the local payload builder.
 #[derive(Debug, Clone)]
 pub struct ArbBuiltPayload {
-    block: Arc<RecoveredBlock<ArbBlock>>,
+    executed: BuiltPayloadExecutedBlock<ArbPrimitives>,
     fees: U256,
+    production_timing: engine::ArbBlockProductionTiming,
 }
 
 impl ArbBuiltPayload {
-    /// Creates a new `ArbBuiltPayload`.
-    pub fn new(block: Arc<RecoveredBlock<ArbBlock>>, fees: U256) -> Self {
-        Self { block, fees }
+    /// Wraps a block that was executed during local payload construction.
+    pub(crate) fn from_executed(
+        executed: BuiltPayloadExecutedBlock<ArbPrimitives>,
+        fees: U256,
+        production_timing: engine::ArbBlockProductionTiming,
+    ) -> Self {
+        Self {
+            executed,
+            fees,
+            production_timing,
+        }
+    }
+
+    /// Returns the local build breakdown captured before the payload entered the engine tree.
+    pub(crate) const fn production_timing(&self) -> engine::ArbBlockProductionTiming {
+        self.production_timing
     }
 }
 
@@ -49,7 +62,7 @@ impl BuiltPayload for ArbBuiltPayload {
     type Primitives = ArbPrimitives;
 
     fn block(&self) -> &SealedBlock<<Self::Primitives as NodePrimitives>::Block> {
-        self.block.sealed_block()
+        self.executed.recovered_block.sealed_block()
     }
 
     fn fees(&self) -> U256 {
@@ -58,6 +71,10 @@ impl BuiltPayload for ArbBuiltPayload {
 
     fn requests(&self) -> Option<alloy_eips::eip7685::Requests> {
         None
+    }
+
+    fn executed_block(&self) -> Option<BuiltPayloadExecutedBlock<Self::Primitives>> {
+        Some(self.executed.clone())
     }
 }
 
@@ -70,8 +87,8 @@ pub struct ArbExecutionData(pub ExecutionData);
 
 impl From<ArbBuiltPayload> for ArbExecutionData {
     fn from(payload: ArbBuiltPayload) -> Self {
-        let block_hash = payload.block.hash();
-        let block = Arc::unwrap_or_clone(payload.block).into_block();
+        let block_hash = payload.executed.recovered_block.hash();
+        let block = Arc::unwrap_or_clone(payload.executed.recovered_block).into_block();
         let (execution_payload, sidecar) = AlloyExecutionPayload::from_block_unchecked_with_extras(
             block_hash, &block, None, // no block access list
         );
@@ -128,15 +145,19 @@ impl ExecutionPayload for ArbExecutionData {
     }
 }
 
-/// Minimal payload-attributes stub. Exists solely to satisfy `NodeTypes::Payload`.
+/// The ArbOS message and environment for one locally-derived L2 block.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ArbPayloadAttributes {
-    /// Timestamp (required by `PayloadAttributes`).
+    /// Arbitrum's next-block timestamp: `max(message L1 timestamp, parent timestamp)`.
     pub timestamp: u64,
+    /// Ordered sequencer/L1 message which ArbOS expands into the block's transactions.
+    pub message: arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage,
 }
 
 impl PayloadAttributes for ArbPayloadAttributes {
     fn payload_id(&self, parent: &alloy_primitives::B256) -> PayloadId {
+        // Payload IDs are local job identifiers. Include the message sequence number so two
+        // Arbitrum messages with an equal timestamp never alias the same build job.
         reth_payload_primitives::payload_id(
             parent,
             &alloy_rpc_types_engine::PayloadAttributes {
@@ -145,7 +166,7 @@ impl PayloadAttributes for ArbPayloadAttributes {
                 suggested_fee_recipient: Default::default(),
                 withdrawals: None,
                 parent_beacon_block_root: None,
-                slot_number: None,
+                slot_number: Some(self.message.sequence_number),
                 target_gas_limit: None,
             },
         )
@@ -193,5 +214,31 @@ impl PayloadTypes for ArbPayloadTypes {
             payload: execution_payload,
             sidecar,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_id_distinguishes_equal_timestamp_messages() {
+        let parent = alloy_primitives::B256::repeat_byte(0x11);
+        let mut first_message =
+            arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage::default();
+        first_message.sequence_number = 7;
+        let mut second_message = first_message.clone();
+        second_message.sequence_number = 8;
+
+        let first = ArbPayloadAttributes {
+            timestamp: 1_234,
+            message: first_message,
+        };
+        let second = ArbPayloadAttributes {
+            timestamp: 1_234,
+            message: second_message,
+        };
+
+        assert_ne!(first.payload_id(&parent), second.payload_id(&parent));
     }
 }
