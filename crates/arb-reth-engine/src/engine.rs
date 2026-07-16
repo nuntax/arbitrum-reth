@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use alloy_consensus::Header;
 use alloy_consensus::transaction::Recovered;
-use alloy_eips::eip2718::Typed2718;
+use alloy_eips::{BlockNumHash, eip2718::Typed2718};
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
@@ -38,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reth_chain_state::{CanonicalInMemoryState, StateTrieOverlayManager};
+use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, StateTrieOverlayManager};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
 };
@@ -86,6 +86,62 @@ use crate::{ArbPayloadTypes, ArbPayloadValidator};
 type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
 >;
+
+/// Supplies the direct state-root task with the same prune boundary that reth's engine tree uses.
+///
+/// The engine tree owns persistence and removes persisted blocks from
+/// [`CanonicalInMemoryState`] asynchronously. A direct producer cannot borrow its private
+/// `EngineApiTreeState`, but it can subscribe to the canonical state's persisted-block update and
+/// snapshot the exact parent chain visible to execution. `None` intentionally leaves the sparse
+/// trie untouched; `Some`, including an empty vector, asks the task to prune.
+#[derive(Debug)]
+struct SparseTriePruneCoordinator {
+    persisted_blocks: tokio::sync::watch::Receiver<Option<BlockNumHash>>,
+}
+
+impl SparseTriePruneCoordinator {
+    fn new(canonical: &CanonicalInMemoryState<ArbPrimitives>) -> Self {
+        Self {
+            persisted_blocks: canonical.subscribe_persisted_block(),
+        }
+    }
+
+    /// Returns the unpersisted canonical parent chain after a persistence transition.
+    ///
+    /// This deliberately filters by the observed persisted height as well as using the canonical
+    /// in-memory snapshot. `set_persisted` publishes its watch update just before the tree removes
+    /// the old blocks, so the filter makes this safe even if the producer observes that brief
+    /// interval. The resulting newest-to-oldest order matches `TreeState::blocks_by_hash`.
+    fn take_prune_blocks(
+        &mut self,
+        canonical: &CanonicalInMemoryState<ArbPrimitives>,
+        parent_hash: B256,
+    ) -> Option<Vec<ExecutedBlock<ArbPrimitives>>> {
+        if !matches!(self.persisted_blocks.has_changed(), Ok(true)) {
+            return None;
+        }
+
+        let persisted_number = self
+            .persisted_blocks
+            .borrow_and_update()
+            .as_ref()
+            .map(|block| block.number);
+
+        Some(
+            canonical
+                .state_by_hash(parent_hash)
+                .map_or_else(Vec::new, |state| {
+                    state
+                        .chain()
+                        .filter(|state| {
+                            persisted_number.is_none_or(|number| state.number() > number)
+                        })
+                        .map(|state| state.block())
+                        .collect()
+                }),
+        )
+    }
+}
 
 /// Produce one executed Arbitrum block from a feed message.
 ///
@@ -205,7 +261,34 @@ fn produce_with_timing<'a>(
     // independent) but reorders the block, diverging `transactionsRoot`/`receiptsRoot` and thus the
     // block hash from Nitro. That wrong hash is invisible to a state-root parity check until a later
     // L1-advancing block bakes the (wrong) parent hash into ArbOS state via `record_new_l1_block`.
-    let mut user_txs: VecDeque<ArbTxEnvelope> = input.message.txs.into_iter().collect();
+    // Sender recovery is pure per-tx work; recover the sequenced user txs in parallel up front
+    // instead of one ecrecover at a time inside the execution loop. Results (including failures)
+    // are carried per-tx so the loop reports the same first-in-order error it would have hit
+    // serially. Retries scheduled mid-block and the internal start-block tx carry their sender in
+    // the envelope and stay on the cheap inline path.
+    let mut user_txs: VecDeque<(
+        ArbTxEnvelope,
+        Result<Address, alloy_primitives::SignatureError>,
+    )> = {
+        let txs: Vec<ArbTxEnvelope> = input.message.txs.into_iter().collect();
+        if txs.len() > 1 {
+            use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
+            txs.into_par_iter()
+                .map(|tx| {
+                    let sender = tx.sender();
+                    (tx, sender)
+                })
+                .collect::<Vec<_>>()
+                .into()
+        } else {
+            txs.into_iter()
+                .map(|tx| {
+                    let sender = tx.sender();
+                    (tx, sender)
+                })
+                .collect()
+        }
+    };
     let mut redeems: VecDeque<ArbTxEnvelope> = VecDeque::new();
     // Set the block's L2 base fee. ArbOS stores `L2PricingState.BaseFeeWei` = the fee for the next
     // block (each block's start-block `update_pricing_model` computes and stores the successor's
@@ -237,19 +320,20 @@ fn produce_with_timing<'a>(
     let mut derived_transaction_execution = Duration::ZERO;
     let mut derived_retry_scheduling = Duration::ZERO;
     loop {
-        let (tx, is_internal) = if let Some(t) = first.take() {
-            (t, true)
+        let (tx, sender_result, is_internal) = if let Some(t) = first.take() {
+            let sender = t.sender();
+            (t, sender, true)
         } else if let Some(t) = redeems.pop_front() {
-            (t, false)
-        } else if let Some(t) = user_txs.pop_front() {
-            (t, false)
+            let sender = t.sender();
+            (t, sender, false)
+        } else if let Some((t, sender)) = user_txs.pop_front() {
+            (t, sender, false)
         } else {
             break;
         };
         let tx_ty = tx.ty();
-        let sender: Address = tx
-            .sender()
-            .map_err(|e| eyre!("failed to determine sender for tx {tx_ty}: {e}"))?;
+        let sender: Address =
+            sender_result.map_err(|e| eyre!("failed to determine sender for tx {tx_ty}: {e}"))?;
         let recovered = Recovered::new_unchecked(tx, sender);
         let mut tx_logs: Vec<Log> = Vec::new();
         let mut tx_success = false;
@@ -1011,6 +1095,7 @@ where
     state_root_strategy: DefaultStateRootStrategy,
     state_root_runtime: Runtime,
     state_trie_overlays: StateTrieOverlayManager<ArbPrimitives>,
+    sparse_trie_prune: SparseTriePruneCoordinator,
     changeset_cache: ChangesetCache,
     tree_config: TreeConfig,
     /// Sequence-reconciliation cursor (arb-reth's `TransactionStreamer` analogue). `next_seq` is the
@@ -1179,6 +1264,7 @@ where
         // Seed the dedup cursor from the resumed tip: the next message to apply is the one that
         // produces block tip+1, i.e. message index tip.number - genesis_block + 1.
         let next_seq = genesis_tip.number.saturating_sub(genesis_block) + 1;
+        let sparse_trie_prune = SparseTriePruneCoordinator::new(&canonical);
 
         Ok(Self {
             provider,
@@ -1196,6 +1282,7 @@ where
             state_root_strategy: DefaultStateRootStrategy::default(),
             state_root_runtime: runtime,
             state_trie_overlays,
+            sparse_trie_prune,
             changeset_cache,
             tree_config,
             next_seq,
@@ -1240,30 +1327,41 @@ where
             arbitrum_alloy_consensus::header::ArbHeaderInfo::decode_header(self.tip.header()).ok();
         // A decoded format version of zero is an ordinary Ethereum header's zeroed `mix_hash`,
         // not an initialized ArbOS header. ArbOS genesis itself always starts at version one.
-        let state_root_task = (self.state_root_task_mode.is_enabled()
-            && parent_arbos_version.is_some_and(|info| info.arbos_format_version != 0))
-        .then(|| {
-            self.state_root_strategy.spawn_payload_state_root_task(
-                PayloadStateRootTaskContext::new(
-                    &self.state_root_runtime,
-                    &self.state_trie_overlays,
-                    OverlayStateProviderFactory::new(
-                        self.provider.clone(),
-                        OverlayBuilder::<ArbPrimitives>::new(
-                            self.tip.hash(),
-                            self.changeset_cache.clone(),
-                        )
-                        .with_state_trie_overlay_manager(self.state_trie_overlays.clone()),
+        let direct_state_root_task_enabled = self.state_root_task_mode.is_enabled()
+            && parent_arbos_version.is_some_and(|info| info.arbos_format_version != 0)
+            // Keep a pending prune request until a task can actually consume it. These are the
+            // same gates checked by `spawn_payload_state_root_task`.
+            && !self.tree_config.skip_state_root()
+            && self.tree_config.has_enough_parallelism();
+        let pending_sparse_trie_prune_blocks = direct_state_root_task_enabled
+            .then(|| {
+                self.sparse_trie_prune
+                    .take_prune_blocks(&self.canonical, self.tip.hash())
+            })
+            .flatten();
+        let state_root_task = direct_state_root_task_enabled
+            .then(|| {
+                self.state_root_strategy.spawn_payload_state_root_task(
+                    PayloadStateRootTaskContext::new(
+                        &self.state_root_runtime,
+                        &self.state_trie_overlays,
+                        OverlayStateProviderFactory::new(
+                            self.provider.clone(),
+                            OverlayBuilder::<ArbPrimitives>::new(
+                                self.tip.hash(),
+                                self.changeset_cache.clone(),
+                            )
+                            .with_state_trie_overlay_manager(self.state_trie_overlays.clone()),
+                        ),
+                        self.tip.header().state_root,
+                        // ArbOS can discover retry transactions while executing the message.
+                        None,
+                        &self.tree_config,
+                        pending_sparse_trie_prune_blocks,
                     ),
-                    self.tip.header().state_root,
-                    // ArbOS can discover retry transactions while executing the message.
-                    None,
-                    &self.tree_config,
-                    None,
-                ),
-            )
-        })
-        .flatten();
+                )
+            })
+            .flatten();
         let exec_sp: Box<dyn StateProvider + '_> = match &cache_stats {
             Some(stats) => Box::new(CachedStateProvider::new_with_mode(
                 exec_sp,
@@ -1582,5 +1680,34 @@ where
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_trie_pruning_is_requested_once_per_persistence_update() {
+        let canonical = CanonicalInMemoryState::<ArbPrimitives>::empty();
+        let mut coordinator = SparseTriePruneCoordinator::new(&canonical);
+
+        assert_eq!(
+            coordinator.take_prune_blocks(&canonical, B256::ZERO),
+            None,
+            "a new coordinator must not prune before persistence advances"
+        );
+
+        canonical.set_persisted(BlockNumHash::new(1, B256::ZERO));
+        assert_eq!(
+            coordinator.take_prune_blocks(&canonical, B256::ZERO),
+            Some(Vec::new()),
+            "an observed persistence transition must request a prune, even without in-memory blocks"
+        );
+        assert_eq!(
+            coordinator.take_prune_blocks(&canonical, B256::ZERO),
+            None,
+            "the same persistence transition must not prune every subsequent block"
+        );
     }
 }
