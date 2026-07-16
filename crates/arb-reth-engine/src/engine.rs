@@ -38,7 +38,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, StateTrieOverlayManager};
+use reth_chain_state::{
+    BlockState, CanonicalInMemoryState, ExecutedBlock, StateTrieOverlayManager,
+};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
 };
@@ -62,9 +64,9 @@ use reth_provider::providers::{
 };
 use reth_provider::{
     AccountReader, BalProvider, BlockHashReader, BlockNumReader, BlockReader, BytecodeReader,
-    ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderFactory,
-    ProviderResult, StateProofProvider, StateProviderFactory, StateReader, StateRootProvider,
-    StorageChangeSetReader, StorageRootProvider,
+    ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderError,
+    ProviderFactory, ProviderResult, StateProofProvider, StateProviderFactory, StateReader,
+    StateRootProvider, StorageChangeSetReader, StorageRootProvider,
 };
 use reth_prune::{Pruner, PrunerBuilder};
 use reth_revm::State;
@@ -74,8 +76,9 @@ use reth_storage_api::{
 };
 use reth_tasks::Runtime;
 use reth_trie::{
-    AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput, updates::TrieUpdates,
+    AccountProof, ComputedTrieData, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    LazyTrieData, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+    updates::TrieUpdates,
 };
 use reth_trie_db::ChangesetCache;
 use revm::context_interface::ContextTr as _;
@@ -86,6 +89,10 @@ use crate::{ArbPayloadTypes, ArbPayloadValidator};
 type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
 >;
+
+/// Deferred forkchoice result (`ARB_OVERLAP_FCU`), spawned as a task so the driver stays `Sync`
+/// and the FCU response is polled as soon as the tree sends it.
+type PendingFcu = tokio::task::JoinHandle<eyre::Result<()>>;
 
 /// Supplies the direct state-root task with the same prune boundary that reth's engine tree uses.
 ///
@@ -112,10 +119,17 @@ impl SparseTriePruneCoordinator {
     /// in-memory snapshot. `set_persisted` publishes its watch update just before the tree removes
     /// the old blocks, so the filter makes this safe even if the producer observes that brief
     /// interval. The resulting newest-to-oldest order matches `TreeState::blocks_by_hash`.
+    ///
+    /// With deferred forkchoice (`ARB_OVERLAP_FCU`) the tip may not be canonical yet when the
+    /// producer asks; the driver passes the block it just built (`last_built`) so the snapshot can
+    /// still be assembled from the tip's parent. When no consistent snapshot exists the watch is
+    /// left un-consumed and the request stays pending: passing an empty list would prune the
+    /// retained sparse trie down to its hot caches.
     fn take_prune_blocks(
         &mut self,
         canonical: &CanonicalInMemoryState<ArbPrimitives>,
         parent_hash: B256,
+        last_built: Option<&BuiltPayloadExecutedBlock<ArbPrimitives>>,
     ) -> Option<Vec<ExecutedBlock<ArbPrimitives>>> {
         if !matches!(self.persisted_blocks.has_changed(), Ok(true)) {
             return None;
@@ -123,24 +137,65 @@ impl SparseTriePruneCoordinator {
 
         let persisted_number = self
             .persisted_blocks
-            .borrow_and_update()
+            .borrow()
             .as_ref()
             .map(|block| block.number);
+        let unpersisted_chain = |state: &BlockState<ArbPrimitives>| {
+            state
+                .chain()
+                .filter(|state| persisted_number.is_none_or(|number| state.number() > number))
+                .map(|state| state.block())
+                .collect::<Vec<_>>()
+        };
 
-        Some(
-            canonical
-                .state_by_hash(parent_hash)
-                .map_or_else(Vec::new, |state| {
-                    state
-                        .chain()
-                        .filter(|state| {
-                            persisted_number.is_none_or(|number| state.number() > number)
-                        })
-                        .map(|state| state.block())
-                        .collect()
-                }),
-        )
+        let blocks = if let Some(state) = canonical.state_by_hash(parent_hash) {
+            unpersisted_chain(&state)
+        } else {
+            // Tip not canonical yet (its FCU is still in flight); its unpersisted ancestors are
+            // visible from the parent instead. Without the built tip, keep the request pending.
+            let built =
+                last_built.filter(|built| built.recovered_block.hash() == parent_hash)?;
+            let mut blocks = vec![executed_block_from_built(built)];
+            let grandparent_hash = built.recovered_block.header().parent_hash;
+            match canonical.state_by_hash(grandparent_hash) {
+                Some(state) => blocks.extend(unpersisted_chain(&state)),
+                None => {
+                    let grandparent_number =
+                        built.recovered_block.header().number.saturating_sub(1);
+                    if persisted_number.is_none_or(|number| number < grandparent_number) {
+                        // Not persisted-and-removed, so this is a transient canonical-state gap.
+                        return None;
+                    }
+                    // Persistence caught up to the parent; only the tip is unpersisted.
+                }
+            }
+            blocks
+        };
+
+        // Consume the watch only once a consistent snapshot exists.
+        self.persisted_blocks.borrow_and_update();
+        Some(blocks)
     }
+}
+
+/// Adapts a producer-built block into the tree's in-memory block type for sparse-trie prune
+/// snapshots. Sorting is deferred to first access: the prune consumer runs on the state-root
+/// task's preserve step, off the production hot path.
+fn executed_block_from_built(
+    built: &BuiltPayloadExecutedBlock<ArbPrimitives>,
+) -> ExecutedBlock<ArbPrimitives> {
+    let hashed_state = Arc::clone(&built.hashed_state);
+    let trie_updates = Arc::clone(&built.trie_updates);
+    ExecutedBlock::with_deferred_trie_data(
+        Arc::clone(&built.recovered_block),
+        Arc::clone(&built.execution_output),
+        LazyTrieData::deferred(move || {
+            ComputedTrieData::new(
+                Arc::new(hashed_state.clone_into_sorted()),
+                Arc::new(trie_updates.clone_into_sorted()),
+            )
+        }),
+    )
 }
 
 /// Produce one executed Arbitrum block from a feed message.
@@ -705,6 +760,49 @@ where
     }
 }
 
+/// Waits until the tree has processed the insert of block `bn` (deferred-forkchoice mode).
+///
+/// The insert emits `CanonicalBlockAdded` after the payload validator populated the changeset
+/// cache and trie overlays and the block became the pending state, which is everything the next
+/// block's production needs. Event-driven: unlike [`wait_for_head`]'s poll loop, this await sits
+/// on the block-production critical path every block, so a fixed poll interval would gate
+/// throughput. The periodic fallback only covers events consumed before this call (restart) or a
+/// canonicalization that outran the event forward.
+async fn wait_for_inserted(
+    canonical: &CanonicalInMemoryState<ArbPrimitives>,
+    obs_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(u64, B256)>,
+    bn: u64,
+    expected_hash: B256,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        tokio::select! {
+            msg = obs_rx.recv() => match msg {
+                Some((number, hash)) => {
+                    if number == bn && hash == expected_hash {
+                        return true;
+                    }
+                }
+                None => return false,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if canonical.get_canonical_head().header().number >= bn {
+                    return true;
+                }
+                if canonical
+                    .pending_block_num_hash()
+                    .is_some_and(|p| p.number == bn && p.hash == expected_hash)
+                {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 /// Direct state-root task modes.
 ///
 /// `Shadow` keeps the serial root authoritative and stops production if the sparse task returns a
@@ -1098,6 +1196,16 @@ where
     sparse_trie_prune: SparseTriePruneCoordinator,
     changeset_cache: ChangesetCache,
     tree_config: TreeConfig,
+    /// Deferred-forkchoice mode (`ARB_OVERLAP_FCU`): after feeding the tree a block, wait only for
+    /// the insert to be processed (overlays and pending state populated) and let the FCU roundtrip
+    /// plus canonicalization overlap with the next block's production.
+    overlap_fcu: bool,
+    /// Outstanding deferred FCU (block number, result future). Settled before the next insert so
+    /// a forkchoice failure still stops production, one block late.
+    pending_fcu: Option<(u64, PendingFcu)>,
+    /// The most recently built block, retained so the sparse-trie prune coordinator can snapshot
+    /// the unpersisted chain while the tip's FCU is still in flight.
+    last_built: Option<BuiltPayloadExecutedBlock<ArbPrimitives>>,
     /// Sequence-reconciliation cursor (arb-reth's `TransactionStreamer` analogue). `next_seq` is the
     /// next message index to apply; a feed/derived message with `sequence_number` maps to L2 block
     /// `sequence_number + genesis_block`. Messages below `next_seq` are already-applied duplicates
@@ -1199,6 +1307,8 @@ where
         let state_trie_overlays =
             StateTrieOverlayManager::new(runtime.state_trie_overlay_worker_pool());
         let tree_config = tuning.to_tree_config();
+        let overlap_fcu = std::env::var("ARB_OVERLAP_FCU")
+            .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"));
         tracing::info!(
             target: "arb-reth::engine",
             persistence_threshold = tuning.persistence_threshold,
@@ -1207,6 +1317,7 @@ where
             execution_cache_enabled,
             execution_cache_mb,
             ?state_root_task_mode,
+            overlap_fcu,
             "engine-tree persistence and direct state-root configuration",
         );
 
@@ -1285,9 +1396,34 @@ where
             sparse_trie_prune,
             changeset_cache,
             tree_config,
+            overlap_fcu,
+            pending_fcu: None,
+            last_built: None,
             next_seq,
             pending: BTreeMap::new(),
         })
+    }
+
+    /// Returns a state provider for the current tip.
+    ///
+    /// With deferred forkchoice the tip flips from pending to canonical while this runs: the
+    /// canonical maps are updated before the pending slot is cleared, but the two lookups inside
+    /// `state_by_block_hash` take those locks separately, so a reader can miss both for a
+    /// sub-microsecond window. Retry instead of failing production.
+    fn parent_state_provider(&self) -> ProviderResult<reth_provider::StateProviderBox> {
+        let mut attempts = 0u32;
+        loop {
+            match self.provider.state_by_block_hash(self.tip.hash()) {
+                Err(ProviderError::StateForHashNotFound(hash))
+                    if self.overlap_fcu && attempts < 10_000 =>
+                {
+                    debug_assert_eq!(hash, self.tip.hash());
+                    attempts += 1;
+                    std::thread::yield_now();
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Build independent execution and trie providers for the current parent, then produce one block.
@@ -1313,12 +1449,10 @@ where
 
         let started_at = Instant::now();
         let exec_sp = self
-            .provider
-            .state_by_block_hash(self.tip.hash())
+            .parent_state_provider()
             .wrap_err("state_by_block_hash (exec) failed")?;
         let trie_sp = self
-            .provider
-            .state_by_block_hash(self.tip.hash())
+            .parent_state_provider()
             .wrap_err("state_by_block_hash (trie) failed")?;
         let cache_stats = self
             .execution_cache_enabled
@@ -1335,8 +1469,11 @@ where
             && self.tree_config.has_enough_parallelism();
         let pending_sparse_trie_prune_blocks = direct_state_root_task_enabled
             .then(|| {
-                self.sparse_trie_prune
-                    .take_prune_blocks(&self.canonical, self.tip.hash())
+                self.sparse_trie_prune.take_prune_blocks(
+                    &self.canonical,
+                    self.tip.hash(),
+                    self.last_built.as_ref(),
+                )
             })
             .flatten();
         let state_root_task = direct_state_root_task_enabled
@@ -1458,6 +1595,22 @@ where
         let execution_output = Arc::clone(&built.execution_output);
         let block_production = started_at.elapsed();
 
+        // Settle the previous block's deferred FCU before feeding the tree the next block. The
+        // tree processed it while this block was being produced, so this normally resolves
+        // instantly; a forkchoice failure still stops production here.
+        let phase_started_at = Instant::now();
+        if let Some((prev_number, pending)) = self.pending_fcu.take() {
+            pending
+                .await
+                .wrap_err("deferred FCU task panicked")?
+                .wrap_err_with(|| format!("deferred FCU for block {prev_number}"))?;
+        }
+        let deferred_forkchoice = phase_started_at.elapsed();
+
+        // Retained for the prune coordinator, which may need the tip's state while its FCU is
+        // still in flight (Arc clones only).
+        self.last_built = Some(built.clone());
+
         // Feed the executed block to the tree (no re-execution).
         let phase_started_at = Instant::now();
         self.to_tree
@@ -1484,29 +1637,62 @@ where
                 },
             )))
             .map_err(|e| eyre!("send ForkchoiceUpdated: {e}"))?;
-        let fcu_res = fcu_rx.await.wrap_err("FCU response channel")?;
-        let fcu_res = fcu_res.wrap_err("FCU RethResult")?;
-        fcu_res
-            .await
-            .map_err(|e| eyre!("block {new_number} FCU error: {e:?}"))?;
-        let engine_forkchoice = phase_started_at.elapsed();
 
-        // Wait for the tree to actually canonicalize the block (bounded).
-        let phase_started_at = Instant::now();
-        let canonicalized = wait_for_head(
-            &self.provider,
-            &self.provider.canonical_in_memory_state(),
-            &mut self.obs_rx,
-            new_number,
-            new_hash,
-        )
-        .await;
-        if !canonicalized {
-            return Err(eyre!(
-                "block {new_number} was NOT canonicalized within timeout (head hash {new_hash:#x})"
+        let (engine_forkchoice, canonicalization_wait) = if self.overlap_fcu {
+            // Defer the FCU result and wait only until the tree has processed the insert: that
+            // populates the changeset cache, trie overlays, and pending state - everything the
+            // next block's production reads. Canonicalization overlaps with that production.
+            self.pending_fcu = Some((
+                new_number,
+                tokio::spawn(async move {
+                    let fcu_res = fcu_rx.await.wrap_err("FCU response channel")?;
+                    let fcu_res = fcu_res.wrap_err("FCU RethResult")?;
+                    fcu_res
+                        .await
+                        .map_err(|e| eyre!("block {new_number} FCU error: {e:?}"))?;
+                    Ok(())
+                }),
             ));
-        }
-        let canonicalization_wait = phase_started_at.elapsed();
+
+            let phase_started_at = Instant::now();
+            let inserted = wait_for_inserted(
+                &self.canonical,
+                &mut self.obs_rx,
+                new_number,
+                new_hash,
+            )
+            .await;
+            if !inserted {
+                return Err(eyre!(
+                    "block {new_number} insert was NOT processed within timeout (hash {new_hash:#x})"
+                ));
+            }
+            (deferred_forkchoice, phase_started_at.elapsed())
+        } else {
+            let fcu_res = fcu_rx.await.wrap_err("FCU response channel")?;
+            let fcu_res = fcu_res.wrap_err("FCU RethResult")?;
+            fcu_res
+                .await
+                .map_err(|e| eyre!("block {new_number} FCU error: {e:?}"))?;
+            let engine_forkchoice = phase_started_at.elapsed();
+
+            // Wait for the tree to actually canonicalize the block (bounded).
+            let phase_started_at = Instant::now();
+            let canonicalized = wait_for_head(
+                &self.provider,
+                &self.provider.canonical_in_memory_state(),
+                &mut self.obs_rx,
+                new_number,
+                new_hash,
+            )
+            .await;
+            if !canonicalized {
+                return Err(eyre!(
+                    "block {new_number} was NOT canonicalized within timeout (head hash {new_hash:#x})"
+                ));
+            }
+            (engine_forkchoice, phase_started_at.elapsed())
+        };
         let total = started_at.elapsed();
 
         // Source-independent production timings. The feed-latency recorder only observes messages
@@ -1693,19 +1879,45 @@ mod tests {
         let mut coordinator = SparseTriePruneCoordinator::new(&canonical);
 
         assert_eq!(
-            coordinator.take_prune_blocks(&canonical, B256::ZERO),
+            coordinator.take_prune_blocks(&canonical, B256::ZERO, None),
             None,
             "a new coordinator must not prune before persistence advances"
         );
 
         canonical.set_persisted(BlockNumHash::new(1, B256::ZERO));
         assert_eq!(
-            coordinator.take_prune_blocks(&canonical, B256::ZERO),
-            Some(Vec::new()),
-            "an observed persistence transition must request a prune, even without in-memory blocks"
+            coordinator.take_prune_blocks(&canonical, B256::ZERO, None),
+            None,
+            "without a usable tip snapshot the request must stay pending, not over-prune"
+        );
+
+        // The deferred request is served once the producer supplies the built tip: its parent is
+        // covered by the persisted height, so the snapshot is just the tip itself.
+        let built = BuiltPayloadExecutedBlock::<ArbPrimitives> {
+            recovered_block: Arc::new(RecoveredBlock::default()),
+            execution_output: Arc::new(BlockExecutionOutput {
+                result: BlockExecutionResult {
+                    receipts: Vec::new(),
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+                state: Default::default(),
+            }),
+            hashed_state: Arc::new(HashedPostState::default()),
+            trie_updates: Arc::new(TrieUpdates::default()),
+            changed_paths: None,
+        };
+        let tip_hash = built.recovered_block.hash();
+        assert_eq!(
+            coordinator
+                .take_prune_blocks(&canonical, tip_hash, Some(&built))
+                .map(|blocks| blocks.len()),
+            Some(1),
+            "a deferred persistence transition must prune once the built tip is available"
         );
         assert_eq!(
-            coordinator.take_prune_blocks(&canonical, B256::ZERO),
+            coordinator.take_prune_blocks(&canonical, tip_hash, Some(&built)),
             None,
             "the same persistence transition must not prune every subsequent block"
         );
