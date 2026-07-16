@@ -516,6 +516,12 @@ pub struct ArbEngineTuning {
     pub memory_block_buffer_target: u64,
     /// Hard backpressure: stall block production once this many blocks are unpersisted.
     pub persistence_backpressure_threshold: u64,
+    /// Size in bytes of reth's cross-block execution cache.
+    ///
+    /// Reth's bare [`TreeConfig`] default is intentionally large for a general-purpose node. A
+    /// 256 MiB cache keeps the serial Arbitrum producer's fixed-cache tables dense and matches
+    /// the previously measured direct-driver configuration.
+    pub execution_cache_size: usize,
 }
 
 impl Default for ArbEngineTuning {
@@ -534,6 +540,7 @@ impl ArbEngineTuning {
             persistence_threshold: 2,
             memory_block_buffer_target: 0,
             persistence_backpressure_threshold: 16,
+            execution_cache_size: 256 * 1024 * 1024,
         }
     }
 
@@ -545,6 +552,7 @@ impl ArbEngineTuning {
             .with_persistence_backpressure_threshold(self.persistence_backpressure_threshold)
             .with_persistence_threshold(self.persistence_threshold)
             .with_memory_block_buffer_target(self.memory_block_buffer_target)
+            .with_cross_block_cache_size(self.execution_cache_size)
     }
 }
 

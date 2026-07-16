@@ -91,6 +91,13 @@ pub struct NodeArgs {
     #[arg(long = "persistence-backpressure", default_value_t = 16)]
     persistence_backpressure: u64,
 
+    /// Size in MiB of reth's cross-block account, storage, and bytecode cache.
+    ///
+    /// The Arbitrum default is 256 MiB. Reth's generic TreeConfig default is 4 GiB, which makes
+    /// its fixed-cache tables needlessly sparse for this serial producer.
+    #[arg(long = "engine.cross-block-cache-size", default_value_t = 256, value_name = "MiB")]
+    execution_cache_size_mb: usize,
+
     /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
     /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
     /// child), but the OS flushes lazily, cutting ~50ms fsync latency off every block. Stays
@@ -519,6 +526,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             persistence_threshold: args.persistence_threshold,
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
+            execution_cache_size: args.execution_cache_size_mb.saturating_mul(1024 * 1024),
         },
         prune_config,
         messages: feed_rx,
