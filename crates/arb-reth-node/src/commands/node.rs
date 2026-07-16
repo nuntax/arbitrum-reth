@@ -98,6 +98,22 @@ pub struct NodeArgs {
     #[arg(long = "engine.cross-block-cache-size", default_value_t = 256, value_name = "MiB")]
     execution_cache_size_mb: usize,
 
+    /// Share reth's cross-block execution cache with the serial native payload builder.
+    #[arg(
+        long = "share-execution-cache-with-payload-builder",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    share_execution_cache_with_payload_builder: bool,
+
+    /// Let the native payload builder use reth's sparse trie task to overlap state-root work
+    /// with ArbOS execution. Recommended for this serial Arbitrum producer on a multi-core host.
+    #[arg(
+        long = "share-sparse-trie-with-payload-builder",
+        default_value_t = false
+    )]
+    share_sparse_trie_with_payload_builder: bool,
+
     /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
     /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
     /// child), but the OS flushes lazily, cutting ~50ms fsync latency off every block. Stays
@@ -527,6 +543,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             memory_block_buffer_target: args.memory_buffer_target,
             persistence_backpressure_threshold: args.persistence_backpressure,
             execution_cache_size: args.execution_cache_size_mb.saturating_mul(1024 * 1024),
+            share_execution_cache_with_payload_builder: args
+                .share_execution_cache_with_payload_builder,
+            share_sparse_trie_with_payload_builder: args.share_sparse_trie_with_payload_builder,
         },
         prune_config,
         messages: feed_rx,

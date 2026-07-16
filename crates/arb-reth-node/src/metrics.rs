@@ -26,8 +26,20 @@ struct FeedLatencyMetrics {
     channel_wait_seconds: Histogram,
     /// Time after driver dequeue before this sequence becomes eligible for in-order application.
     sequencing_wait_seconds: Histogram,
+    /// Constructing native payload attributes from the ordered message and current parent.
+    payload_attributes_seconds: Histogram,
+    /// Full Reth payload-job lifecycle, including the builder execution nested within it.
+    payload_job_seconds: Histogram,
+    /// Payload-job launch through the attributes FCU response.
+    payload_job_launch_seconds: Histogram,
+    /// Waiting for the launched payload job after the attributes FCU response.
+    payload_job_resolve_seconds: Histogram,
+    /// Payload-job lifecycle time outside measured block production.
+    payload_job_overhead_seconds: Histogram,
     /// ArbOS execution, state-root calculation, and block/header construction.
     block_production_seconds: Histogram,
+    /// Block-production work outside the named production sub-phases.
+    block_production_unattributed_seconds: Histogram,
     /// Parent-state provider setup before block production.
     block_parent_state_seconds: Histogram,
     /// Feed-message digesting and next-block environment construction.
@@ -66,6 +78,8 @@ struct FeedLatencyMetrics {
     block_finish_assembly_seconds: Histogram,
     /// Generic finalization work not assigned to one of the named phases.
     block_finish_unattributed_seconds: Histogram,
+    /// Full engine-tree handoff until canonical state is observable.
+    engine_handoff_seconds: Histogram,
     /// Sending the executed block to reth's engine tree.
     engine_insert_seconds: Histogram,
     /// Forkchoice request and response through reth's engine tree.
@@ -74,6 +88,8 @@ struct FeedLatencyMetrics {
     canonicalization_wait_seconds: Histogram,
     /// In-order apply-path work not covered by the named engine phases.
     engine_apply_overhead_seconds: Histogram,
+    /// Total in-order apply path from payload attributes through canonical state.
+    engine_apply_total_seconds: Histogram,
     /// Samples that could not be tracked without blocking the feed or execution task.
     tracking_dropped_total: Counter,
 }
@@ -179,9 +195,12 @@ impl FeedLatencyTracker {
 
         if let Some(timing) = timing {
             let metrics = self.metrics();
-            metrics
-                .frame_to_canonical_seconds
-                .record(timing.frame_received_at.elapsed().as_secs_f64());
+            metrics.frame_to_canonical_seconds.record(
+                applied
+                    .completed_at
+                    .saturating_duration_since(timing.frame_received_at)
+                    .as_secs_f64(),
+            );
             if let Some(ready_at) = timing.ready_for_channel_at {
                 metrics.frame_decode_seconds.record(
                     ready_at
@@ -203,8 +222,26 @@ impl FeedLatencyTracker {
                 }
             }
             metrics
+                .payload_attributes_seconds
+                .record(applied.payload_attributes.as_secs_f64());
+            metrics
+                .payload_job_seconds
+                .record(applied.payload_job.as_secs_f64());
+            metrics
+                .payload_job_launch_seconds
+                .record(applied.payload_job_launch.as_secs_f64());
+            metrics
+                .payload_job_resolve_seconds
+                .record(applied.payload_job_resolve.as_secs_f64());
+            metrics
+                .payload_job_overhead_seconds
+                .record(applied.payload_job_overhead.as_secs_f64());
+            metrics
                 .block_production_seconds
                 .record(applied.block_production.as_secs_f64());
+            metrics
+                .block_production_unattributed_seconds
+                .record(applied.block_production_unattributed.as_secs_f64());
             metrics
                 .block_parent_state_seconds
                 .record(applied.block_parent_state.as_secs_f64());
@@ -273,6 +310,9 @@ impl FeedLatencyTracker {
                 .block_finish_unattributed_seconds
                 .record(applied.block_finish_unattributed.as_secs_f64());
             metrics
+                .engine_handoff_seconds
+                .record(applied.engine_handoff.as_secs_f64());
+            metrics
                 .engine_insert_seconds
                 .record(applied.engine_insert.as_secs_f64());
             metrics
@@ -281,13 +321,16 @@ impl FeedLatencyTracker {
             metrics
                 .canonicalization_wait_seconds
                 .record(applied.canonicalization_wait.as_secs_f64());
-            let named = applied.block_production
-                + applied.engine_insert
-                + applied.engine_forkchoice
-                + applied.canonicalization_wait;
+            // The builder execution is nested inside `payload_job`; forkchoice and canonical
+            // observation are nested inside `engine_handoff`. Only subtract the exclusive outer
+            // phases so this remainder stays additive with the end-to-end apply duration.
+            let named = applied.payload_attributes + applied.payload_job + applied.engine_handoff;
             metrics
                 .engine_apply_overhead_seconds
                 .record(applied.total.saturating_sub(named).as_secs_f64());
+            metrics
+                .engine_apply_total_seconds
+                .record(applied.total.as_secs_f64());
         }
     }
 

@@ -27,7 +27,7 @@ rayon = "1"
 serde = { version = "1", default-features = false, features = ["derive"] }
 tracing = "0.1"
 crossbeam-channel = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 revm = { workspace = true }
 revm-database = "41.0.0"
 

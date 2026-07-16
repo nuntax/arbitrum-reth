@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Bytes, U256};
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload as AlloyExecutionPayload, PayloadId};
+use reth_execution_cache::CacheStats;
 use reth_payload_primitives::{
     BuiltPayload, BuiltPayloadExecutedBlock, ExecutionPayload, PayloadAttributes, PayloadTypes,
 };
@@ -36,6 +37,7 @@ pub struct ArbBuiltPayload {
     executed: BuiltPayloadExecutedBlock<ArbPrimitives>,
     fees: U256,
     production_timing: engine::ArbBlockProductionTiming,
+    execution_cache_stats: Option<Arc<CacheStats>>,
 }
 
 impl ArbBuiltPayload {
@@ -44,17 +46,24 @@ impl ArbBuiltPayload {
         executed: BuiltPayloadExecutedBlock<ArbPrimitives>,
         fees: U256,
         production_timing: engine::ArbBlockProductionTiming,
+        execution_cache_stats: Option<Arc<CacheStats>>,
     ) -> Self {
         Self {
             executed,
             fees,
             production_timing,
+            execution_cache_stats,
         }
     }
 
     /// Returns the local build breakdown captured before the payload entered the engine tree.
     pub(crate) const fn production_timing(&self) -> engine::ArbBlockProductionTiming {
         self.production_timing
+    }
+
+    /// Returns cache statistics collected during this payload's execution.
+    pub(crate) fn execution_cache_stats(&self) -> Option<Arc<CacheStats>> {
+        self.execution_cache_stats.clone()
     }
 }
 
@@ -240,6 +249,15 @@ mod tests {
         };
 
         assert_ne!(first.payload_id(&parent), second.payload_id(&parent));
+    }
+
+    #[test]
+    fn arb_defaults_share_only_the_execution_cache() {
+        let config = ArbEngineTuning::reth_defaults().to_tree_config();
+
+        assert_eq!(config.cross_block_cache_size(), 256 * 1024 * 1024);
+        assert!(config.share_execution_cache_with_payload_builder());
+        assert!(!config.share_sparse_trie_with_payload_builder());
     }
 }
 

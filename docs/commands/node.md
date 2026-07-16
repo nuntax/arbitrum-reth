@@ -56,6 +56,16 @@ Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [ob
   bytecode cache. It defaults to 256 MiB for ArbOS's serial producer; Reth's generic 4 GiB
   `TreeConfig` default is unnecessarily sparse here.
 
+## Payload execution
+
+- `--share-execution-cache-with-payload-builder <true|false>` shares Reth's cross-block account,
+  storage, and bytecode cache with the serial Arbitrum payload builder. It defaults to `true`.
+- `--share-sparse-trie-with-payload-builder` lets Reth compute the state root concurrently with
+  ArbOS execution. It is opt-in and requires useful state-root worker parallelism.
+
+The node builds only one Arbitrum payload at a time. Do not reuse these settings in a node that can
+run concurrent payload jobs without first reviewing Reth's cache and sparse-trie ownership rules.
+
 ## Persistence controls
 
 - `--persistence-threshold`: number of canonical blocks before a persistence batch.
