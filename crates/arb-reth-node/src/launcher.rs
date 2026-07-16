@@ -592,6 +592,7 @@ mod tests {
                 persistence_threshold: 128,
                 memory_block_buffer_target: 0,
                 persistence_backpressure_threshold: 512,
+                execution_cache_size: 256 * 1024 * 1024,
             },
             prune_config: None,
             messages: rx,

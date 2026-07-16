@@ -50,6 +50,12 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [observability guide](../observability/README.md) for feed latency, engine-tree, persistence, and Prometheus scrape details.
 
+## Execution cache
+
+- `--engine.cross-block-cache-size <MiB>` controls Reth's cross-block account, storage, and
+  bytecode cache. It defaults to 256 MiB for ArbOS's serial producer; Reth's generic 4 GiB
+  `TreeConfig` default is unnecessarily sparse here.
+
 ## Persistence controls
 
 - `--persistence-threshold`: number of canonical blocks before a persistence batch.

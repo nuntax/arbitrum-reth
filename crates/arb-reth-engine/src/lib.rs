@@ -242,3 +242,18 @@ mod tests {
         assert_ne!(first.payload_id(&parent), second.payload_id(&parent));
     }
 }
+
+#[cfg(test)]
+mod engine_tuning_tests {
+    use super::ArbEngineTuning;
+
+    #[test]
+    fn arb_default_execution_cache_is_256_mib() {
+        assert_eq!(
+            ArbEngineTuning::reth_defaults()
+                .to_tree_config()
+                .cross_block_cache_size(),
+            256 * 1024 * 1024,
+        );
+    }
+}
