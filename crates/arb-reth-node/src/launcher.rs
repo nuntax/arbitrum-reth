@@ -339,41 +339,73 @@ impl ArbLauncher {
                 let mut bench_work_us: u128 = 0;
                 let mut bench_n: u64 = 0;
                 let mut bench_wall = std::time::Instant::now();
+                const MAX_MESSAGE_BATCH: usize = 64;
                 loop {
                     let __r = std::time::Instant::now();
-                    let Some(msg) = messages_rx.recv().await else {
+                    let Some(first) = messages_rx.recv().await else {
                         break;
                     };
                     bench_recv_us += __r.elapsed().as_micros();
-                    let driver_dequeued_at = std::time::Instant::now();
-                    if let Some(feed_latency) = feed_latency.as_ref() {
-                        feed_latency.record_driver_dequeue(msg.sequence_number, driver_dequeued_at);
-                    }
-                    let __w = std::time::Instant::now();
-                    driver
-                        .advance_with_applied(&msg, |sequence_number, applied| {
-                            if let Some(feed_latency) = feed_latency.as_ref() {
-                                feed_latency.record_canonical(sequence_number, applied);
+
+                    // A batch is a deterministic proof that another message is ready. It replaces
+                    // the receiver's racy `is_empty()` hint: historical catch-up can overlap the
+                    // final FCU of every non-tail message, while a one-message live-feed batch
+                    // remains fully settled before the next frame arrives.
+                    let mut batch = Vec::with_capacity(MAX_MESSAGE_BATCH);
+                    batch.push(first);
+                    let mut source_closed = false;
+                    while batch.len() < MAX_MESSAGE_BATCH {
+                        match messages_rx.try_recv() {
+                            Ok(msg) => batch.push(msg),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                source_closed = true;
+                                break;
                             }
-                        })
-                        .await?;
-                    bench_work_us += __w.elapsed().as_micros();
-                    bench_n += 1;
-                    if bench_n.is_multiple_of(1000) {
-                        let wall_ms = bench_wall.elapsed().as_millis().max(1);
-                        tracing::info!(
-                            target: "arb-reth::bench",
-                            blocks = bench_n,
-                            blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
-                            recv_ms = (bench_recv_us / 1000) as u64,
-                            work_ms = (bench_work_us / 1000) as u64,
-                            recv_pct = (100 * bench_recv_us
-                                / (bench_recv_us + bench_work_us).max(1)) as u64,
-                            "bench: 1000-block window",
-                        );
-                        bench_recv_us = 0;
-                        bench_work_us = 0;
-                        bench_wall = std::time::Instant::now();
+                        }
+                    }
+
+                    let batch_len = batch.len();
+                    for (index, msg) in batch.into_iter().enumerate() {
+                        let driver_dequeued_at = std::time::Instant::now();
+                        if let Some(feed_latency) = feed_latency.as_ref() {
+                            feed_latency
+                                .record_driver_dequeue(msg.sequence_number, driver_dequeued_at);
+                        }
+                        let __w = std::time::Instant::now();
+                        driver
+                            .advance_with_applied_overlap(
+                                &msg,
+                                index + 1 < batch_len,
+                                |sequence_number, applied| {
+                                    if let Some(feed_latency) = feed_latency.as_ref() {
+                                        feed_latency.record_canonical(sequence_number, applied);
+                                    }
+                                },
+                            )
+                            .await?;
+                        bench_work_us += __w.elapsed().as_micros();
+                        bench_n += 1;
+                        if bench_n.is_multiple_of(1000) {
+                            let wall_ms = bench_wall.elapsed().as_millis().max(1);
+                            tracing::info!(
+                                target: "arb-reth::bench",
+                                blocks = bench_n,
+                                blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
+                                recv_ms = (bench_recv_us / 1000) as u64,
+                                work_ms = (bench_work_us / 1000) as u64,
+                                recv_pct = (100 * bench_recv_us
+                                    / (bench_recv_us + bench_work_us).max(1)) as u64,
+                                "bench: 1000-block window",
+                            );
+                            bench_recv_us = 0;
+                            bench_work_us = 0;
+                            bench_wall = std::time::Instant::now();
+                        }
+                    }
+
+                    if source_closed {
+                        break;
                     }
                 }
                 driver.shutdown().await;
@@ -593,6 +625,8 @@ mod tests {
                 memory_block_buffer_target: 0,
                 persistence_backpressure_threshold: 512,
                 execution_cache_size: 256 * 1024 * 1024,
+                share_execution_cache_with_payload_builder: true,
+                share_sparse_trie_with_payload_builder: false,
             },
             prune_config: None,
             messages: rx,

@@ -10,6 +10,7 @@ use arb_reth_evm::ArbEvmConfig;
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
 };
+use reth_execution_cache::{CacheFillMode, CacheStats, CachedStateProvider};
 use reth_payload_builder::{
     BuildNewPayload, KeepPayloadJobAlive, PayloadBuilderError, PayloadJob, PayloadJobGenerator,
 };
@@ -21,10 +22,13 @@ use reth_tasks::Runtime;
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
+    time::Instant,
 };
 use tokio::sync::oneshot;
+
+use metrics::{Counter, Histogram};
 
 use crate::{ArbBuiltPayload, ArbPayloadAttributes, engine::produce_with_timing};
 
@@ -58,7 +62,30 @@ impl<P> ArbPayloadBuilder<P> {
     {
         let parent = args.config.parent_header;
         let parent_hash = parent.hash();
-        let execution_state = self
+        let supplied_cache = args.execution_cache;
+        if let Some(cache) = supplied_cache
+            .as_ref()
+            .filter(|cache| cache.executed_block_hash() != parent_hash)
+        {
+            tracing::warn!(
+                target: "arb-reth::engine",
+                cache_parent = %cache.executed_block_hash(),
+                %parent_hash,
+                "ignoring execution cache for a different parent",
+            );
+        }
+        let execution_cache =
+            supplied_cache.filter(|cache| cache.executed_block_hash() == parent_hash);
+        let cache_stats = execution_cache
+            .as_ref()
+            .map(|_| Arc::new(CacheStats::default()));
+        if cache_stats.is_some() {
+            // Resolve recorder handles before measured provider and execution work begins.
+            let _ = execution_cache_metric_handles();
+        }
+
+        let started_at = Instant::now();
+        let mut execution_state = self
             .provider
             .state_by_block_hash(parent_hash)
             .map_err(PayloadBuilderError::other)?;
@@ -66,8 +93,22 @@ impl<P> ArbPayloadBuilder<P> {
             .provider
             .state_by_block_hash(parent_hash)
             .map_err(PayloadBuilderError::other)?;
+        let parent_state = started_at.elapsed();
 
-        let (executed, timing) = produce_with_timing(
+        if let (Some(cache), Some(stats)) = (execution_cache, cache_stats.as_ref()) {
+            execution_state = Box::new(CachedStateProvider::new_with_mode(
+                execution_state,
+                cache.cache().clone(),
+                // Unlike Ethereum's builder, this serial ArbOS path has no separate prewarmer.
+                // Populate misses so unchanged ArbOS slots and bytecode remain useful across
+                // blocks; the tree updates the same parent-bound cache after every insertion.
+                CacheFillMode::FillOnMiss,
+                None,
+                Some(Arc::clone(stats)),
+            ));
+        }
+
+        let (executed, mut timing) = produce_with_timing(
             &self.evm_config,
             self.chain_id,
             &parent,
@@ -77,8 +118,15 @@ impl<P> ArbPayloadBuilder<P> {
             args.state_root_handle,
         )
         .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
+        timing.parent_state = parent_state;
+        timing.total = started_at.elapsed();
 
-        Ok(ArbBuiltPayload::from_executed(executed, U256::ZERO, timing))
+        Ok(ArbBuiltPayload::from_executed(
+            executed,
+            U256::ZERO,
+            timing,
+            cache_stats,
+        ))
     }
 }
 
@@ -240,6 +288,78 @@ impl Future for ArbPayloadResolve {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+struct CacheAccessMetricHandles {
+    hit_counter: Counter,
+    miss_counter: Counter,
+    hit_histogram: Histogram,
+    miss_histogram: Histogram,
+}
+
+impl CacheAccessMetricHandles {
+    fn new(kind: &'static str) -> Self {
+        Self {
+            hit_counter: metrics::counter!(
+                "arb_reth.execution_cache_access_total",
+                "kind" => kind,
+                "result" => "hit",
+            ),
+            miss_counter: metrics::counter!(
+                "arb_reth.execution_cache_access_total",
+                "kind" => kind,
+                "result" => "miss",
+            ),
+            hit_histogram: metrics::histogram!(
+                "arb_reth.execution_cache_accesses_per_block",
+                "kind" => kind,
+                "result" => "hit",
+            ),
+            miss_histogram: metrics::histogram!(
+                "arb_reth.execution_cache_accesses_per_block",
+                "kind" => kind,
+                "result" => "miss",
+            ),
+        }
+    }
+}
+
+struct ExecutionCacheMetricHandles {
+    account: CacheAccessMetricHandles,
+    storage: CacheAccessMetricHandles,
+    bytecode: CacheAccessMetricHandles,
+}
+
+fn execution_cache_metric_handles() -> &'static ExecutionCacheMetricHandles {
+    static HANDLES: OnceLock<ExecutionCacheMetricHandles> = OnceLock::new();
+    HANDLES.get_or_init(|| ExecutionCacheMetricHandles {
+        account: CacheAccessMetricHandles::new("account"),
+        storage: CacheAccessMetricHandles::new("storage"),
+        bytecode: CacheAccessMetricHandles::new("bytecode"),
+    })
+}
+
+/// Flush one block's cache statistics after the measured production interval has ended.
+pub(crate) fn record_execution_cache_stats(stats: &CacheStats) {
+    let handles = execution_cache_metric_handles();
+    for (handles, hits, misses) in [
+        (
+            &handles.account,
+            stats.account_hits(),
+            stats.account_misses(),
+        ),
+        (
+            &handles.storage,
+            stats.storage_hits(),
+            stats.storage_misses(),
+        ),
+        (&handles.bytecode, stats.code_hits(), stats.code_misses()),
+    ] {
+        handles.hit_counter.increment(hits as u64);
+        handles.miss_counter.increment(misses as u64);
+        handles.hit_histogram.record(hits as f64);
+        handles.miss_histogram.record(misses as f64);
     }
 }
 

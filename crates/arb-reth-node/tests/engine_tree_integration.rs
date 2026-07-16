@@ -110,16 +110,23 @@ mod tests {
         )
         .expect("spawn native payload driver");
 
-        for message in FEED
+        let messages = FEED
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str::<BroadcastFeedMessage>(line).expect("feed message"))
-        {
-            if message.sequence_number == 0 || message.sequence_number > TARGET {
-                continue;
-            }
+            .filter(|message| message.sequence_number > 0 && message.sequence_number <= TARGET)
+            .collect::<Vec<_>>();
+        let message_count = messages.len();
+        let mut canonicalized = Vec::with_capacity(message_count);
+        for (index, message) in messages.into_iter().enumerate() {
             let number = message.sequence_number;
-            let hash = driver.advance(&message).await.expect("native advance");
+            let defer_tail = index + 1 < message_count;
+            let hash = driver
+                .advance_with_applied_overlap(&message, defer_tail, |sequence_number, _| {
+                    canonicalized.push(sequence_number);
+                })
+                .await
+                .expect("native overlap advance");
             let header = driver.tip().header();
             let expected_block = &expected[number as usize];
             assert_eq!(
@@ -135,6 +142,7 @@ mod tests {
                 "block {number} state root"
             );
         }
+        assert_eq!(canonicalized, (1..=TARGET).collect::<Vec<_>>());
 
         driver.shutdown().await;
     }

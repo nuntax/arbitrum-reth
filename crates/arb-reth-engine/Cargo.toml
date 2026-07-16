@@ -27,7 +27,7 @@ rayon = "1"
 serde = { version = "1", default-features = false, features = ["derive"] }
 tracing = "0.1"
 crossbeam-channel = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 revm = { workspace = true }
 revm-database = "41.0.0"
 
@@ -37,6 +37,7 @@ reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171a
 reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-engine-tree = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-execution-cache = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-execution-types = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-exex-types = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-payload-builder = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
