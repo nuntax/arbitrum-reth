@@ -4,15 +4,32 @@
 //! that handle together with one ordered Arbitrum message, executes ArbOS exactly once over the
 //! requested parent, and returns the resulting executed block to the engine tree.
 
-use alloy_primitives::U256;
+use alloy_consensus::Header;
+use alloy_primitives::{B256, U256};
 use arb_reth_evm::ArbEvmConfig;
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
 };
-use reth_payload_builder::PayloadBuilderError;
+use reth_payload_builder::{
+    BuildNewPayload, KeepPayloadJobAlive, PayloadBuilderError, PayloadJob, PayloadJobGenerator,
+};
+use reth_payload_primitives::PayloadKind;
 use reth_provider::StateProviderFactory;
+use reth_revm::{cached::CachedReads, cancelled::CancelOnDrop};
+use reth_storage_api::BlockReaderIdExt;
+use reth_tasks::Runtime;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+use tokio::sync::oneshot;
 
 use crate::{ArbBuiltPayload, ArbPayloadAttributes, engine::produce_with_timing};
+
+/// Stable worker name for the serial ArbOS payload builder.
+const ARB_PAYLOAD_BUILDER_THREAD: &str = "arb-payload-builder";
 
 /// A serial payload builder for ordered ArbOS messages.
 #[derive(Debug, Clone)]
@@ -62,6 +79,167 @@ impl<P> ArbPayloadBuilder<P> {
         .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
 
         Ok(ArbBuiltPayload::from_executed(executed, U256::ZERO, timing))
+    }
+}
+
+/// A one-shot payload-job generator for ordered ArbOS messages.
+///
+/// Arbitrum has no mempool selection, replacement payloads, slots, or useful empty payload. A
+/// request therefore starts exactly one ArbOS execution and resolves only with that result. The
+/// engine still creates and owns the optional sparse state-root task; this generator merely passes
+/// its handle into [`ArbPayloadBuilder`].
+pub(crate) struct ArbPayloadJobGenerator<P> {
+    provider: P,
+    runtime: Runtime,
+    builder: ArbPayloadBuilder<P>,
+}
+
+impl<P> ArbPayloadJobGenerator<P> {
+    pub(crate) const fn new(provider: P, runtime: Runtime, builder: ArbPayloadBuilder<P>) -> Self {
+        Self {
+            provider,
+            runtime,
+            builder,
+        }
+    }
+}
+
+impl<P> PayloadJobGenerator for ArbPayloadJobGenerator<P>
+where
+    P: StateProviderFactory
+        + BlockReaderIdExt<Header = Header>
+        + Clone
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
+    type Job = ArbPayloadJob;
+
+    fn new_payload_job(
+        &self,
+        input: BuildNewPayload<ArbPayloadAttributes>,
+        id: alloy_rpc_types_engine::PayloadId,
+    ) -> Result<Self::Job, PayloadBuilderError> {
+        let parent_header = if input.parent_hash.is_zero() {
+            self.provider
+                .latest_header()?
+                .ok_or(PayloadBuilderError::MissingParentHeader(B256::ZERO))?
+        } else {
+            self.provider
+                .sealed_header_by_hash(input.parent_hash)?
+                .ok_or(PayloadBuilderError::MissingParentHeader(input.parent_hash))?
+        };
+        let attributes = input.attributes;
+        let config = PayloadConfig::new(Arc::new(parent_header), attributes.clone(), id);
+        let (tx, rx) = oneshot::channel();
+        let cancel = CancelOnDrop::default();
+        let pending_cancel = cancel.clone();
+        let builder = self.builder.clone();
+
+        // `spawn_blocking_named_or_tokio` schedules the CPU work immediately on the stable worker
+        // when it is available. This removes the generic builder's async permit, interval, and
+        // deadline machinery without forcing this serial producer to wait for an unrelated job.
+        self.runtime
+            .spawn_blocking_named_or_tokio(ARB_PAYLOAD_BUILDER_THREAD, move || {
+                let args = BuildArguments {
+                    cached_reads: CachedReads::default(),
+                    execution_cache: input.cache,
+                    state_root_handle: input.state_root_handle,
+                    config,
+                    cancel,
+                    best_payload: None,
+                };
+                let _ = tx.send(builder.build(args));
+            });
+
+        Ok(ArbPayloadJob {
+            attributes,
+            pending: Some(ArbPendingPayload {
+                // Keep the cancellation signal alive until resolve transfers it to the caller's
+                // future. Dropping that future correctly cancels unfinished builder work.
+                _cancel: pending_cancel,
+                payload: rx,
+            }),
+        })
+    }
+}
+
+/// The single build started for an ArbOS payload request.
+struct ArbPendingPayload {
+    _cancel: CancelOnDrop,
+    payload: oneshot::Receiver<Result<ArbBuiltPayload, PayloadBuilderError>>,
+}
+
+/// A deterministic payload job. It deliberately remains pending until the driver resolves it.
+pub(crate) struct ArbPayloadJob {
+    attributes: ArbPayloadAttributes,
+    pending: Option<ArbPendingPayload>,
+}
+
+impl Future for ArbPayloadJob {
+    type Output = Result<(), PayloadBuilderError>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // The driver resolves every job immediately after its attributes FCU. Keeping the job in
+        // the service until then preserves its cancellation guard and avoids generic rebuilds.
+        Poll::Pending
+    }
+}
+
+impl PayloadJob for ArbPayloadJob {
+    type PayloadAttributes = ArbPayloadAttributes;
+    type ResolvePayloadFuture = ArbPayloadResolve;
+    type BuiltPayload = ArbBuiltPayload;
+
+    fn best_payload(&self) -> Result<Self::BuiltPayload, PayloadBuilderError> {
+        // There is no valid ArbOS empty payload. Consumers must wait for the deterministic build.
+        Err(PayloadBuilderError::MissingPayload)
+    }
+
+    fn payload_attributes(&self) -> Result<Self::PayloadAttributes, PayloadBuilderError> {
+        Ok(self.attributes.clone())
+    }
+
+    fn payload_timestamp(&self) -> Result<u64, PayloadBuilderError> {
+        Ok(self.attributes.timestamp)
+    }
+
+    fn resolve_kind(
+        &mut self,
+        _kind: PayloadKind,
+    ) -> (Self::ResolvePayloadFuture, KeepPayloadJobAlive) {
+        // `Earliest` and `WaitForPending` are equivalent for an ArbOS message: returning before
+        // the one required execution finishes would create an invalid block.
+        (
+            ArbPayloadResolve {
+                pending: self.pending.take(),
+            },
+            KeepPayloadJobAlive::No,
+        )
+    }
+}
+
+/// Future returned when the driver asks for the one valid ArbOS payload.
+pub(crate) struct ArbPayloadResolve {
+    pending: Option<ArbPendingPayload>,
+}
+
+impl Future for ArbPayloadResolve {
+    type Output = Result<ArbBuiltPayload, PayloadBuilderError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Poll::Ready(Err(PayloadBuilderError::MissingPayload));
+        };
+
+        match Pin::new(&mut pending.payload).poll(cx) {
+            Poll::Ready(result) => {
+                self.pending = None;
+                Poll::Ready(result.map_err(Into::into).and_then(|result| result))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

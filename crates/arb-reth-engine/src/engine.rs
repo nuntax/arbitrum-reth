@@ -37,7 +37,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState, StateTrieOverlayManager};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
@@ -74,6 +73,7 @@ use reth_trie_db::ChangesetCache;
 use revm::context_interface::ContextTr as _;
 
 use crate::{ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator};
+use crate::native_payload::ArbPayloadJobGenerator;
 
 /// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
 type ToTree = crossbeam_channel::Sender<
@@ -955,18 +955,7 @@ where
         );
 
         let builder = ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id);
-        // ArbOS has one deterministic payload per ordered message. The generic builder's cached
-        // reads are unused by `ArbPayloadBuilder`, so avoid cloning state changes into that cache
-        // and retain only one job permit.
-        let payload_job_config = BasicPayloadJobGeneratorConfig::default()
-            .pre_cache_state(false)
-            .max_payload_tasks(1);
-        let generator = BasicPayloadJobGenerator::with_builder(
-            provider.clone(),
-            runtime.clone(),
-            payload_job_config,
-            builder,
-        );
+        let generator = ArbPayloadJobGenerator::new(provider.clone(), runtime.clone(), builder);
         let (service, payload_builder) = PayloadBuilderService::<_, _, ArbPayloadTypes>::new(
             generator,
             provider.canonical_state_stream(),
