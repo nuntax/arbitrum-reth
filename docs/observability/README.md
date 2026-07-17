@@ -15,8 +15,14 @@ The endpoint includes reth engine-tree, persistence, state-root, and RPC metrics
 Use the phase metrics to locate the delay:
 
 - `reth_arb_reth_feed_frame_decode_seconds`, `channel_wait_seconds`, and `sequencing_wait_seconds` cover ingress and ordering.
+- `reth_arb_reth_feed_payload_attributes_seconds`, `payload_job_seconds`,
+  `engine_handoff_seconds`, and `engine_apply_overhead_seconds` are exclusive outer phases. Their
+  means add up to `engine_apply_total_seconds`.
+- `reth_arb_reth_feed_payload_job_{launch,resolve}_seconds` splits the payload job's wall time.
+  `payload_job_overhead_seconds` subtracts the builder's measured production from that outer job.
 - `reth_arb_reth_feed_block_*_seconds` separates parent-state setup, message preparation, ArbOS execution, and state-root finalisation.
-- `reth_arb_reth_feed_engine_{insert,forkchoice}_seconds` and `canonicalization_wait_seconds` cover the reth handoff.
+- `reth_arb_reth_feed_engine_{insert,forkchoice}_seconds` and `canonicalization_wait_seconds` are
+  nested diagnostics inside `engine_handoff_seconds`. Do not add them to the outer phases.
 - `reth_arb_reth_feed_tracking_dropped_total` should remain zero during normal operation.
 
 ## ArbOS transaction execution
@@ -43,7 +49,7 @@ Detailed transaction and handler histograms can be sampled with
 `ARB_EXECUTION_METRICS_SAMPLE_RATE`. The default is `1`, which records every transaction. A value
 of `16` records one transaction of each type per 16-transaction window and is the recommended
 throughput setting. `0` disables only these detailed histograms. Block production, MGas/s,
-execution-cache, persistence, and feed-to-canonical metrics are never sampled by this setting.
+persistence, state-root, and feed-to-canonical metrics are never sampled by this setting.
 
 Samples collected while catching up from a feed backlog include that backlog in the end-to-end measurement. Use a node at the live tip to judge MEV-facing latency.
 
@@ -58,11 +64,21 @@ These reth metrics describe the path arb-reth actually uses:
 
 The standard reth pipeline and `newPayload` metrics are exported too, but they do not drive arb-reth's execute-then-persist loop.
 
-The direct execution cache exports cumulative access counters at
-`reth_arb_reth_execution_cache_access_total{kind,result}`. Reth's
-`reth_sync_caching_{account,storage,code}_cache_{size,capacity,collisions}` gauges show whether the
-configured cache is under pressure. Increase `ARB_EXECUTION_CACHE_MB` only when occupancy or
-collisions justify it.
+The `reth_arb_reth_engine_block_*` family records the same payload, production, execution,
+finalisation, and handoff phases for every produced block, including historical L1 catch-up. Use
+that family instead of `feed_*` when benchmarking sync throughput.
+
+During catch-up, the driver may queue block N+1's attributes FCU behind block N's final FCU before
+awaiting N. The engine still processes them in order. Each block's `engine_handoff_seconds`, total,
+and completion timestamp end at that block's actual final FCU response, not when the next driver
+iteration happens to collect it.
+
+For native payload construction, inspect
+`reth_arb_reth_engine_block_finish_state_root_task_wait_seconds` together with Reth's sparse-trie
+and persistence metrics to distinguish root work from commit stalls. When execution-cache sharing
+is enabled, `reth_arb_reth_execution_cache_access_total{kind,result}` and
+`reth_arb_reth_execution_cache_accesses_per_block{kind,result}` show block-local builder cache
+hits and misses without putting Prometheus recording inside the measured production interval.
 
 ## Prometheus scrape
 

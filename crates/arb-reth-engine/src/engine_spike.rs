@@ -1,34 +1,21 @@
-//! Engine-tree adoption spike.
+//! Engine-tree compatibility glue for native Arbitrum payload construction.
 //!
-//! Checks that reth's [`EngineApiTreeHandler`] can be stood up for [`ArbNode`] and fed
-//! already-executed Arbitrum blocks via the `InsertExecutedBlock` seam (no re-execution),
-//! with the tree providing in-memory canonical state, overlay, and async persistence.
-//!
-//! # What this exercises
-//!
-//! For each of the testnode-replay feed messages we:
-//!   1. produce a block with an execute-once producer that reads state from the tree overlay
-//!      (`provider.state_by_block_hash(parent_hash)`, which auto-overlays pending in-memory blocks),
-//!   2. wrap the result in a [`BuiltPayloadExecutedBlock`],
-//!   3. send `InsertExecutedBlock` + a `ForkchoiceUpdated` (head = new block) to the tree,
-//!   4. wait for the tree to canonicalize the block, then assert its `state_root`/hash equal
-//!      the testnode's captured values (same fixtures as `driver::replay_feed_matches_testnode_per_block`).
-//!
-//! Reaching the gate shows the reth generics line up for ArbNode, the seam canonicalizes and
-//! persists without re-exec, and production against the overlay yields correct roots.
+//! The engine tree owns the in-memory canonical state, overlay, sparse-trie work, and asynchronous
+//! persistence. Locally derived ArbOS blocks are built by [`crate::ArbPayloadBuilder`] and returned
+//! as executed payloads, so they do not enter Reth's external `newPayload` re-execution path.
 
 use reth_evm::{ConfigureEngineEvm, EvmEnvFor};
 
-use arb_reth_evm::ArbEvmConfig;
 use crate::ArbExecutionData;
+use arb_reth_evm::ArbEvmConfig;
 
 // -----------------------------------------------------------------------------------------------
 // ConfigureEngineEvm for ArbEvmConfig.
 //
 // `BasicEngineValidator<P, ArbEvmConfig, ArbPayloadValidator>` only satisfies `EngineValidator<T>`
 // when `ArbEvmConfig: ConfigureEngineEvm<ArbExecutionData>`. These methods are only invoked on the
-// newPayload / execute-the-payload path; on the `InsertExecutedBlock` path (which this spike uses)
-// they are never called, so we provide trivial bodies. `ConfigureEvm::Error` is `Infallible`
+// external newPayload / execute-the-payload path. Locally derived payloads are already executed,
+// so these methods are never called. `ConfigureEvm::Error` is `Infallible`
 // for ArbEvmConfig, so the `evm_env`/`context` methods cannot return an `Err`; they `unreachable!()`.
 // `tx_iterator_for_payload` returns an empty (never-yielding) iterator of the right concrete type.
 //
@@ -42,14 +29,14 @@ impl ConfigureEngineEvm<ArbExecutionData> for ArbEvmConfig {
         &self,
         _payload: &ArbExecutionData,
     ) -> Result<EvmEnvFor<Self>, Self::Error> {
-        unreachable!("ConfigureEngineEvm::evm_env_for_payload is unused on the InsertExecutedBlock path")
+        unreachable!("ConfigureEngineEvm::evm_env_for_payload is unsupported for external payloads")
     }
 
     fn context_for_payload<'a>(
         &self,
         _payload: &'a ArbExecutionData,
     ) -> Result<reth_evm::ExecutionCtxFor<'a, Self>, Self::Error> {
-        unreachable!("ConfigureEngineEvm::context_for_payload is unused on the InsertExecutedBlock path")
+        unreachable!("ConfigureEngineEvm::context_for_payload is unsupported for external payloads")
     }
 
     fn tx_iterator_for_payload(
@@ -74,17 +61,16 @@ impl ConfigureEngineEvm<ArbExecutionData> for ArbEvmConfig {
 // ArbPayloadValidator: the minimal PayloadValidator for ArbNode.
 //
 // Only `type Block` and `convert_payload_to_block` are required (the other members are defaulted;
-// Ethereum's validator implements only these two). `convert_payload_to_block` is on the newPayload
-// path and is never called on the InsertExecutedBlock path, so it returns an error.
+// Ethereum's validator implements only these two). `convert_payload_to_block` is only on the
+// external newPayload path and is deliberately unsupported.
 // -----------------------------------------------------------------------------------------------
 
 use arbitrum_alloy_consensus::reth::ArbBlock;
 use reth_engine_primitives::PayloadValidator;
 use reth_payload_primitives::NewPayloadError;
-use reth_primitives_traits::SealedBlock;
+use reth_primitives_traits::{Block, SealedBlock};
 
-/// Minimal [`PayloadValidator`] for `ArbNode`. Used only to satisfy the engine-tree
-/// generic bounds; `convert_payload_to_block` is never invoked on the `InsertExecutedBlock` path.
+/// Minimal [`PayloadValidator`] for `ArbNode`.
 #[derive(Clone, Debug, Default)]
 pub struct ArbPayloadValidator;
 
@@ -96,8 +82,21 @@ impl PayloadValidator<crate::ArbPayloadTypes> for ArbPayloadValidator {
         _payload: ArbExecutionData,
     ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
         Err(NewPayloadError::other(std::io::Error::other(
-            "ArbPayloadValidator::convert_payload_to_block is unused on the InsertExecutedBlock path",
+            "ArbPayloadValidator::convert_payload_to_block is unsupported for external payloads",
         )))
+    }
+
+    fn validate_payload_attributes_against_header(
+        &self,
+        attributes: &crate::ArbPayloadAttributes,
+        header: &<Self::Block as Block>::Header,
+    ) -> Result<(), reth_payload_primitives::InvalidPayloadAttributesError> {
+        // ArbOS derives the next L2 timestamp as max(message L1 timestamp, parent timestamp),
+        // so equal timestamps are valid and common. The stock Engine API rule is strictly greater.
+        if attributes.timestamp < header.timestamp {
+            return Err(reth_payload_primitives::InvalidPayloadAttributesError::InvalidTimestamp);
+        }
+        Ok(())
     }
 }
 

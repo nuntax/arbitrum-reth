@@ -1,12 +1,11 @@
 //! Engine-tree driver: the production block-production code, shared with the `engine_spike` gate.
 //!
 //! [`ArbEngineDriver`] stands up reth's [`EngineApiTreeHandler`] for `ArbNode` and drives
-//! `feed message -> executed block -> InsertExecutedBlock + ForkchoiceUpdated -> canonicalize` with
+//! `feed message -> payload attributes -> native payload builder -> InsertExecutedBlock + ForkchoiceUpdated -> canonicalize` with
 //! async persistence: production waits only for fast in-memory canonicalization while the tree's
 //! persistence service flushes to MDBX in the background.
 //!
-//! [`produce`] and [`wait_for_head`] are the single source of truth for the block-production and
-//! head-observation logic; the `engine_spike` test imports them from here.
+//! [`wait_for_head`] is shared by the engine integration tests.
 
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
@@ -16,7 +15,7 @@ use alloc::vec::Vec;
 
 use alloy_consensus::Header;
 use alloy_consensus::transaction::Recovered;
-use alloy_eips::{BlockNumHash, eip2718::Typed2718};
+use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
@@ -38,28 +37,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, StateTrieOverlayManager};
+use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState, StateTrieOverlayManager};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
 };
 use reth_engine_tree::engine::{EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine};
 use reth_engine_tree::persistence::PersistenceHandle;
-use reth_engine_tree::tree::state_root_strategy::{
-    DefaultStateRootStrategy, PayloadStateRootHandle, PayloadStateRootTaskContext,
-};
+use reth_engine_tree::tree::state_root_strategy::PayloadStateRootHandle;
 use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler};
 use reth_evm::execute::BlockBuilder as _;
 use reth_evm::{ConfigureEvm as _, Evm as _};
-use reth_execution_cache::{
-    CacheFillMode, CacheStats, CachedStateCacheMetrics, CachedStateProvider, ExecutionCache,
-};
+use reth_execution_cache::CacheStats;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
-use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::BuiltPayloadExecutedBlock;
+use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
+use reth_payload_primitives::{BuiltPayload as _, BuiltPayloadExecutedBlock, PayloadKind};
 use reth_primitives_traits::{Account, Bytecode, RecoveredBlock, SealedHeader};
-use reth_provider::providers::{
-    BlockchainProvider, OverlayBuilder, OverlayStateProviderFactory, ProviderNodeTypes,
-};
+use reth_provider::providers::{BlockchainProvider, ProviderNodeTypes};
 use reth_provider::{
     AccountReader, BalProvider, BlockHashReader, BlockNumReader, BlockReader, BytecodeReader,
     ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderFactory,
@@ -80,101 +73,16 @@ use reth_trie::{
 use reth_trie_db::ChangesetCache;
 use revm::context_interface::ContextTr as _;
 
-use crate::{ArbPayloadTypes, ArbPayloadValidator};
+use crate::native_payload::ArbPayloadJobGenerator;
+use crate::{ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator};
 
 /// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
 type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
 >;
 
-/// Supplies the direct state-root task with the same prune boundary that reth's engine tree uses.
-///
-/// The engine tree owns persistence and removes persisted blocks from
-/// [`CanonicalInMemoryState`] asynchronously. A direct producer cannot borrow its private
-/// `EngineApiTreeState`, but it can subscribe to the canonical state's persisted-block update and
-/// snapshot the exact parent chain visible to execution. `None` intentionally leaves the sparse
-/// trie untouched; `Some`, including an empty vector, asks the task to prune.
-#[derive(Debug)]
-struct SparseTriePruneCoordinator {
-    persisted_blocks: tokio::sync::watch::Receiver<Option<BlockNumHash>>,
-}
-
-impl SparseTriePruneCoordinator {
-    fn new(canonical: &CanonicalInMemoryState<ArbPrimitives>) -> Self {
-        Self {
-            persisted_blocks: canonical.subscribe_persisted_block(),
-        }
-    }
-
-    /// Returns the unpersisted canonical parent chain after a persistence transition.
-    ///
-    /// This deliberately filters by the observed persisted height as well as using the canonical
-    /// in-memory snapshot. `set_persisted` publishes its watch update just before the tree removes
-    /// the old blocks, so the filter makes this safe even if the producer observes that brief
-    /// interval. The resulting newest-to-oldest order matches `TreeState::blocks_by_hash`.
-    fn take_prune_blocks(
-        &mut self,
-        canonical: &CanonicalInMemoryState<ArbPrimitives>,
-        parent_hash: B256,
-    ) -> Option<Vec<ExecutedBlock<ArbPrimitives>>> {
-        if !matches!(self.persisted_blocks.has_changed(), Ok(true)) {
-            return None;
-        }
-
-        let persisted_number = self
-            .persisted_blocks
-            .borrow_and_update()
-            .as_ref()
-            .map(|block| block.number);
-
-        Some(
-            canonical
-                .state_by_hash(parent_hash)
-                .map_or_else(Vec::new, |state| {
-                    state
-                        .chain()
-                        .filter(|state| {
-                            persisted_number.is_none_or(|number| state.number() > number)
-                        })
-                        .map(|state| state.block())
-                        .collect()
-                }),
-        )
-    }
-}
-
-/// Produce one executed Arbitrum block from a feed message.
-///
-/// The caller supplies the two parent-state providers (`exec_state_provider` for execution reads,
-/// `trie_state_provider` for the state-root `finish`); they must be independent instances. The
-/// driver ([`ArbEngineDriver::build_block`]) constructs them for the current parent. Returns a
-/// [`BuiltPayloadExecutedBlock`] (unsorted hashed/trie) ready to feed the tree via
-/// `InsertExecutedBlock`; it does not persist.
-pub fn produce<'a>(
-    evm_config: &ArbEvmConfig,
-    chain_id: u64,
-    parent: &SealedHeader<Header>,
-    feed_msg: &BroadcastFeedMessage,
-    exec_state_provider: Box<dyn StateProvider + 'a>,
-    trie_state_provider: Box<dyn StateProvider + 'a>,
-) -> eyre::Result<BuiltPayloadExecutedBlock<ArbPrimitives>> {
-    Ok(produce_with_timing(
-        evm_config,
-        chain_id,
-        parent,
-        feed_msg,
-        exec_state_provider,
-        trie_state_provider,
-        None,
-        DirectStateRootTaskMode::Off,
-    )?
-    .0)
-}
-
 /// Produce one block and retain a breakdown of the local block-production work.
-///
-/// Kept private so the public [`produce`] helper remains the small, stable test-facing API.
-fn produce_with_timing<'a>(
+pub(crate) fn produce_with_timing<'a>(
     evm_config: &ArbEvmConfig,
     chain_id: u64,
     parent: &SealedHeader<Header>,
@@ -182,7 +90,6 @@ fn produce_with_timing<'a>(
     exec_state_provider: Box<dyn StateProvider + 'a>,
     trie_state_provider: Box<dyn StateProvider + 'a>,
     mut state_root_task: Option<PayloadStateRootHandle>,
-    state_root_task_mode: DirectStateRootTaskMode,
 ) -> eyre::Result<(
     BuiltPayloadExecutedBlock<ArbPrimitives>,
     ArbBlockProductionTiming,
@@ -411,68 +318,42 @@ fn produce_with_timing<'a>(
     let phase_started_at = Instant::now();
 
     let finish_state_timings = Arc::new(FinishStateTimings::default());
-    let (
-        state_root_precomputed,
-        state_root_shadow,
-        changed_paths,
-        state_root_task_wait,
-        state_root_task_succeeded,
-    ) = if let Some(mut task) = state_root_task {
-        // Dropping the hook signals that the task has received every ArbOS state transition,
-        // including the EIP-2935 prelude and start-block transaction.
-        builder.evm_mut().db_mut().set_state_hook(None);
-        let wait_started_at = Instant::now();
-        match task.state_root() {
-            Ok(outcome) => match state_root_task_mode {
-                DirectStateRootTaskMode::Drive => (
+    let (state_root_precomputed, changed_paths, state_root_task_wait, state_root_task_succeeded) =
+        if let Some(mut task) = state_root_task {
+            // Dropping the hook signals that the task has received every ArbOS state transition,
+            // including the EIP-2935 prelude and start-block transaction.
+            builder.evm_mut().db_mut().set_state_hook(None);
+            let wait_started_at = Instant::now();
+            match task.state_root() {
+                Ok(outcome) => (
                     Some((
                         outcome.state_root,
                         Arc::unwrap_or_clone(outcome.trie_updates),
                     )),
-                    None,
                     outcome.changed_paths,
                     Some(wait_started_at.elapsed()),
                     true,
                 ),
-                DirectStateRootTaskMode::Shadow => (
-                    None,
-                    Some(outcome.state_root),
-                    None,
-                    Some(wait_started_at.elapsed()),
-                    true,
-                ),
-                DirectStateRootTaskMode::Off => unreachable!("state-root task started while off"),
-            },
-            Err(err) => {
-                tracing::warn!(
-                    target: "arb-reth::engine",
-                    block = parent_header.number + 1,
-                    job = task.name(),
-                    %err,
-                    "state-root task failed; falling back to synchronous state root",
-                );
-                (None, None, None, Some(wait_started_at.elapsed()), false)
+                Err(err) => {
+                    tracing::warn!(
+                        target: "arb-reth::engine",
+                        block = parent_header.number + 1,
+                        job = task.name(),
+                        %err,
+                        "state-root task failed; falling back to synchronous state root",
+                    );
+                    (None, None, Some(wait_started_at.elapsed()), false)
+                }
             }
-        }
-    } else {
-        (None, None, None, None, false)
-    };
+        } else {
+            (None, None, None, false)
+        };
     let outcome = builder
         .finish(
             FinishTimingStateProvider::new(trie_state_provider, Arc::clone(&finish_state_timings)),
             state_root_precomputed,
         )
         .wrap_err("BlockBuilder::finish failed")?;
-
-    if let Some(task_root) = state_root_shadow {
-        let serial_root = outcome.block.header().state_root;
-        if task_root != serial_root {
-            return Err(eyre!(
-                "direct sparse state-root shadow mismatch at block {}: task_root={task_root} serial_root={serial_root}",
-                parent_header.number + 1,
-            ));
-        }
-    }
 
     let finish = phase_started_at.elapsed();
     let finish_state_root = finish_state_timings.state_root();
@@ -513,6 +394,7 @@ fn produce_with_timing<'a>(
             changed_paths,
         },
         ArbBlockProductionTiming {
+            total: started_at.elapsed(),
             parent_state: Duration::ZERO,
             message_preparation,
             state_setup,
@@ -530,7 +412,6 @@ fn produce_with_timing<'a>(
             finish_hashed_state,
             finish_state_root,
             finish_state_root_task_wait: state_root_task_wait,
-            state_root_task_mode,
             state_root_task_succeeded,
             finish_assembly: finish_timing.block_assembly,
             finish_unattributed,
@@ -538,105 +419,88 @@ fn produce_with_timing<'a>(
     ))
 }
 
-struct CacheAccessMetricHandles {
-    hit_counter: Counter,
-    miss_counter: Counter,
-    hit_histogram: Histogram,
-    miss_histogram: Histogram,
-}
-
-impl CacheAccessMetricHandles {
-    fn new(kind: &'static str) -> Self {
-        Self {
-            hit_counter: metrics::counter!(
-                "arb_reth.execution_cache_access_total",
-                "kind" => kind,
-                "result" => "hit",
-            ),
-            miss_counter: metrics::counter!(
-                "arb_reth.execution_cache_access_total",
-                "kind" => kind,
-                "result" => "miss",
-            ),
-            hit_histogram: metrics::histogram!(
-                "arb_reth.execution_cache_accesses_per_block",
-                "kind" => kind,
-                "result" => "hit",
-            ),
-            miss_histogram: metrics::histogram!(
-                "arb_reth.execution_cache_accesses_per_block",
-                "kind" => kind,
-                "result" => "miss",
-            ),
-        }
-    }
-}
-
-struct ExecutionCacheMetricHandles {
-    account: CacheAccessMetricHandles,
-    storage: CacheAccessMetricHandles,
-    bytecode: CacheAccessMetricHandles,
-}
-
-fn execution_cache_metric_handles() -> &'static ExecutionCacheMetricHandles {
-    static HANDLES: OnceLock<ExecutionCacheMetricHandles> = OnceLock::new();
-    HANDLES.get_or_init(|| ExecutionCacheMetricHandles {
-        account: CacheAccessMetricHandles::new("account"),
-        storage: CacheAccessMetricHandles::new("storage"),
-        bytecode: CacheAccessMetricHandles::new("bytecode"),
-    })
-}
-
-/// Flush one block's cross-block execution-cache statistics after the provider has dropped.
-/// Keeping these counters block-local avoids a metrics operation on every cache access, and the
-/// recorder handles are registered once instead of once per block.
-fn record_execution_cache_stats(stats: &CacheStats) {
-    let handles = execution_cache_metric_handles();
-    for (handles, hits, misses) in [
-        (
-            &handles.account,
-            stats.account_hits(),
-            stats.account_misses(),
-        ),
-        (
-            &handles.storage,
-            stats.storage_hits(),
-            stats.storage_misses(),
-        ),
-        (&handles.bytecode, stats.code_hits(), stats.code_misses()),
-    ] {
-        handles.hit_counter.increment(hits as u64);
-        handles.miss_counter.increment(misses as u64);
-        handles.hit_histogram.record(hits as f64);
-        handles.miss_histogram.record(misses as f64);
-    }
-}
-
 struct EngineBlockMetricHandles {
+    payload_attributes: Histogram,
+    payload_job: Histogram,
+    payload_job_launch: Histogram,
+    payload_job_resolve: Histogram,
+    payload_job_overhead: Histogram,
     production: Histogram,
+    production_unattributed: Histogram,
     parent_state: Histogram,
+    message_preparation: Histogram,
+    state_setup: Histogram,
     execution: Histogram,
+    execution_setup: Histogram,
+    start_block_transaction_construction: Histogram,
+    start_block_transaction: Histogram,
+    derived_transactions: Histogram,
+    derived_transaction_execution: Histogram,
+    derived_retry_scheduling: Histogram,
+    derived_transactions_unattributed: Histogram,
+    execution_unattributed: Histogram,
     finish: Histogram,
     finish_executor: Histogram,
     finish_hashed_state: Histogram,
     finish_state_root: Histogram,
     finish_state_root_task_wait: Histogram,
-    state_root_task_drive_success: Counter,
-    state_root_task_shadow_match: Counter,
+    state_root_task_native_success: Counter,
     state_root_task_fallback: Counter,
     finish_assembly: Histogram,
     finish_unattributed: Histogram,
+    engine_handoff: Histogram,
+    engine_insert: Histogram,
+    engine_forkchoice: Histogram,
+    canonicalization_wait: Histogram,
+    apply_overhead: Histogram,
     total: Histogram,
     mgas_per_second: Histogram,
-    execution_cache_update: Histogram,
 }
 
 fn engine_block_metric_handles() -> &'static EngineBlockMetricHandles {
     static HANDLES: OnceLock<EngineBlockMetricHandles> = OnceLock::new();
     HANDLES.get_or_init(|| EngineBlockMetricHandles {
+        payload_attributes: metrics::histogram!("arb_reth.engine_block_payload_attributes_seconds"),
+        payload_job: metrics::histogram!("arb_reth.engine_block_payload_job_seconds"),
+        payload_job_launch: metrics::histogram!("arb_reth.engine_block_payload_job_launch_seconds"),
+        payload_job_resolve: metrics::histogram!(
+            "arb_reth.engine_block_payload_job_resolve_seconds"
+        ),
+        payload_job_overhead: metrics::histogram!(
+            "arb_reth.engine_block_payload_job_overhead_seconds"
+        ),
         production: metrics::histogram!("arb_reth.engine_block_production_seconds"),
+        production_unattributed: metrics::histogram!(
+            "arb_reth.engine_block_production_unattributed_seconds"
+        ),
         parent_state: metrics::histogram!("arb_reth.engine_block_parent_state_seconds"),
+        message_preparation: metrics::histogram!(
+            "arb_reth.engine_block_message_preparation_seconds"
+        ),
+        state_setup: metrics::histogram!("arb_reth.engine_block_state_setup_seconds"),
         execution: metrics::histogram!("arb_reth.engine_block_execution_seconds"),
+        execution_setup: metrics::histogram!("arb_reth.engine_block_execution_setup_seconds"),
+        start_block_transaction_construction: metrics::histogram!(
+            "arb_reth.engine_block_start_block_transaction_construction_seconds"
+        ),
+        start_block_transaction: metrics::histogram!(
+            "arb_reth.engine_block_start_block_transaction_seconds"
+        ),
+        derived_transactions: metrics::histogram!(
+            "arb_reth.engine_block_derived_transactions_seconds"
+        ),
+        derived_transaction_execution: metrics::histogram!(
+            "arb_reth.engine_block_derived_transaction_execution_seconds"
+        ),
+        derived_retry_scheduling: metrics::histogram!(
+            "arb_reth.engine_block_derived_retry_scheduling_seconds"
+        ),
+        derived_transactions_unattributed: metrics::histogram!(
+            "arb_reth.engine_block_derived_transactions_unattributed_seconds"
+        ),
+        execution_unattributed: metrics::histogram!(
+            "arb_reth.engine_block_execution_unattributed_seconds"
+        ),
         finish: metrics::histogram!("arb_reth.engine_block_finish_seconds"),
         finish_executor: metrics::histogram!("arb_reth.engine_block_finish_executor_seconds"),
         finish_hashed_state: metrics::histogram!(
@@ -646,27 +510,29 @@ fn engine_block_metric_handles() -> &'static EngineBlockMetricHandles {
         finish_state_root_task_wait: metrics::histogram!(
             "arb_reth.engine_block_finish_state_root_task_wait_seconds"
         ),
-        state_root_task_drive_success: metrics::counter!(
+        state_root_task_native_success: metrics::counter!(
             "arb_reth.engine_block_state_root_task_total",
-            "mode" => "drive",
+            "mode" => "native_payload_builder",
             "result" => "success",
-        ),
-        state_root_task_shadow_match: metrics::counter!(
-            "arb_reth.engine_block_state_root_task_total",
-            "mode" => "shadow",
-            "result" => "match",
         ),
         state_root_task_fallback: metrics::counter!(
             "arb_reth.engine_block_state_root_task_total",
+            "mode" => "native_payload_builder",
             "result" => "fallback",
         ),
         finish_assembly: metrics::histogram!("arb_reth.engine_block_finish_assembly_seconds"),
         finish_unattributed: metrics::histogram!(
             "arb_reth.engine_block_finish_unattributed_seconds"
         ),
+        engine_handoff: metrics::histogram!("arb_reth.engine_block_engine_handoff_seconds"),
+        engine_insert: metrics::histogram!("arb_reth.engine_block_engine_insert_seconds"),
+        engine_forkchoice: metrics::histogram!("arb_reth.engine_block_engine_forkchoice_seconds"),
+        canonicalization_wait: metrics::histogram!(
+            "arb_reth.engine_block_canonicalization_wait_seconds"
+        ),
+        apply_overhead: metrics::histogram!("arb_reth.engine_block_apply_overhead_seconds"),
         total: metrics::histogram!("arb_reth.engine_block_total_seconds"),
         mgas_per_second: metrics::histogram!("arb_reth.engine_block_mgas_per_second"),
-        execution_cache_update: metrics::histogram!("arb_reth.execution_cache_update_seconds"),
     })
 }
 
@@ -680,17 +546,15 @@ pub async fn wait_for_head<P>(
     expected_hash: B256,
 ) -> bool
 where
-    P: BlockNumReader,
+    P: BlockHashReader + BlockNumReader,
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(best) = provider.best_block_number()
-            && best >= bn
-        {
+        if matches!(provider.block_hash(bn), Ok(Some(hash)) if hash == expected_hash) {
             return true;
         }
         let head = canonical.get_canonical_head();
-        if head.header().number >= bn && head.hash() == expected_hash {
+        if head.header().number == bn && head.hash() == expected_hash {
             return true;
         }
         while let Ok((number, hash)) = obs_rx.try_recv() {
@@ -698,44 +562,15 @@ where
                 return true;
             }
         }
-        if std::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return false;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
-
-/// Direct state-root task modes.
-///
-/// `Shadow` keeps the serial root authoritative and stops production if the sparse task returns a
-/// different root. `Drive` uses the sparse task result after a representative shadow range has
-/// passed.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum DirectStateRootTaskMode {
-    /// Use the synchronous `StateRootProvider::state_root_with_updates` path.
-    #[default]
-    Off,
-    /// Compute both roots and require that they match.
-    Shadow,
-    /// Use the sparse task result, falling back to the synchronous path on task failure.
-    Drive,
-}
-
-impl DirectStateRootTaskMode {
-    /// Parses the opt-in operator gate. Unknown values leave the task disabled.
-    pub fn from_env() -> Self {
-        match std::env::var("ARB_STATE_ROOT_TASK") {
-            Ok(value) => match value.to_ascii_lowercase().as_str() {
-                "shadow" => Self::Shadow,
-                "1" | "true" | "on" | "yes" | "drive" => Self::Drive,
-                _ => Self::Off,
-            },
-            Err(_) => Self::Off,
+        match tokio::time::timeout(remaining, obs_rx.recv()).await {
+            Ok(Some((number, hash))) if number == bn && hash == expected_hash => return true,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return false,
         }
-    }
-
-    const fn is_enabled(self) -> bool {
-        !matches!(self, Self::Off)
     }
 }
 
@@ -753,8 +588,23 @@ pub struct ArbEngineTuning {
     pub memory_block_buffer_target: u64,
     /// Hard backpressure: stall block production once this many blocks are unpersisted.
     pub persistence_backpressure_threshold: u64,
-    /// Whether this direct producer starts reth's sparse state-root task.
-    pub state_root_task: DirectStateRootTaskMode,
+    /// Size in bytes of reth's cross-block execution cache.
+    ///
+    /// Reth's bare [`TreeConfig`] default is intentionally large for a general-purpose node. A
+    /// 256 MiB cache keeps the serial Arbitrum producer's fixed-cache tables dense and matches
+    /// the previously measured direct-driver configuration.
+    pub execution_cache_size: usize,
+    /// Share Reth's cross-block execution cache with the native payload builder.
+    ///
+    /// The Arbitrum driver builds one payload at a time, so the shared cache cannot race a
+    /// concurrent payload job and can safely serve repeated account, storage, and bytecode reads.
+    pub share_execution_cache_with_payload_builder: bool,
+    /// Share reth's sparse trie task with the native payload builder.
+    ///
+    /// This overlaps state-root computation with ArbOS execution. It is disabled by default to
+    /// retain reth's conservative payload-builder behavior on hosts that may build payloads in
+    /// parallel.
+    pub share_sparse_trie_with_payload_builder: bool,
 }
 
 impl Default for ArbEngineTuning {
@@ -773,7 +623,9 @@ impl ArbEngineTuning {
             persistence_threshold: 2,
             memory_block_buffer_target: 0,
             persistence_backpressure_threshold: 16,
-            state_root_task: DirectStateRootTaskMode::Off,
+            execution_cache_size: 256 * 1024 * 1024,
+            share_execution_cache_with_payload_builder: true,
+            share_sparse_trie_with_payload_builder: false,
         }
     }
 
@@ -785,6 +637,13 @@ impl ArbEngineTuning {
             .with_persistence_backpressure_threshold(self.persistence_backpressure_threshold)
             .with_persistence_threshold(self.persistence_threshold)
             .with_memory_block_buffer_target(self.memory_block_buffer_target)
+            .with_cross_block_cache_size(self.execution_cache_size)
+            .with_share_execution_cache_with_payload_builder(
+                self.share_execution_cache_with_payload_builder,
+            )
+            .with_share_sparse_trie_with_payload_builder(
+                self.share_sparse_trie_with_payload_builder,
+            )
     }
 }
 
@@ -795,10 +654,25 @@ impl ArbEngineTuning {
 /// to MDBX remains asynchronous and is intentionally outside this critical-path measurement.
 #[derive(Debug, Clone, Copy)]
 pub struct ArbAppliedMessageTiming {
-    /// Instant immediately before block production begins.
+    /// Instant immediately before native payload attributes are constructed.
     pub started_at: Instant,
+    /// Instant at which the produced block became canonical, before metric emission.
+    pub completed_at: Instant,
+    /// Constructing Arbitrum payload attributes from the ordered message and current parent.
+    pub payload_attributes: Duration,
+    /// Full Reth payload-job lifecycle, from attributes FCU send until the built payload resolves.
+    pub payload_job: Duration,
+    /// Payload-job launch through the attributes FCU response.
+    pub payload_job_launch: Duration,
+    /// Waiting for the launched payload job to resolve after the attributes FCU response.
+    pub payload_job_resolve: Duration,
+    /// Payload-job lifecycle time outside the builder's measured block production.
+    pub payload_job_overhead: Duration,
     /// Execution, state-root computation, and block/header construction.
     pub block_production: Duration,
+    /// Block-production work outside parent state, message preparation, state setup, execution,
+    /// and finalisation.
+    pub block_production_unattributed: Duration,
     /// Parent-state provider setup before `produce` begins.
     pub block_parent_state: Duration,
     /// Feed-message digesting and next-block environment construction.
@@ -839,11 +713,14 @@ pub struct ArbAppliedMessageTiming {
     pub block_finish_assembly: Duration,
     /// Generic finalization work not assigned to one of the named phases.
     pub block_finish_unattributed: Duration,
+    /// Full engine-tree handoff, from executed-block insertion until canonical state is observable.
+    pub engine_handoff: Duration,
     /// Sending the executed block to the engine tree.
     pub engine_insert: Duration,
-    /// Forkchoice request and response from the engine tree.
+    /// Forkchoice request and response from the engine tree, nested inside `engine_handoff`.
     pub engine_forkchoice: Duration,
-    /// Waiting for the shared canonical in-memory state to observe the new head.
+    /// Waiting for canonical state, concurrently with `engine_forkchoice` and nested inside
+    /// `engine_handoff`.
     pub canonicalization_wait: Duration,
     /// Total time in the in-order apply path.
     pub total: Duration,
@@ -851,28 +728,63 @@ pub struct ArbAppliedMessageTiming {
 
 /// Breakdown of local work performed while producing an Arbitrum block.
 #[derive(Debug, Clone, Copy)]
-struct ArbBlockProductionTiming {
-    parent_state: Duration,
-    message_preparation: Duration,
-    state_setup: Duration,
-    execution: Duration,
-    execution_setup: Duration,
-    start_block_transaction_construction: Duration,
-    start_block_transaction: Duration,
-    derived_transactions: Duration,
-    derived_transaction_execution: Duration,
-    derived_retry_scheduling: Duration,
-    derived_transactions_unattributed: Duration,
-    execution_unattributed: Duration,
-    finish: Duration,
-    finish_executor: Duration,
-    finish_hashed_state: Duration,
-    finish_state_root: Duration,
-    finish_state_root_task_wait: Option<Duration>,
-    state_root_task_mode: DirectStateRootTaskMode,
-    state_root_task_succeeded: bool,
-    finish_assembly: Duration,
-    finish_unattributed: Duration,
+pub(crate) struct ArbBlockProductionTiming {
+    pub(crate) total: Duration,
+    pub(crate) parent_state: Duration,
+    pub(crate) message_preparation: Duration,
+    pub(crate) state_setup: Duration,
+    pub(crate) execution: Duration,
+    pub(crate) execution_setup: Duration,
+    pub(crate) start_block_transaction_construction: Duration,
+    pub(crate) start_block_transaction: Duration,
+    pub(crate) derived_transactions: Duration,
+    pub(crate) derived_transaction_execution: Duration,
+    pub(crate) derived_retry_scheduling: Duration,
+    pub(crate) derived_transactions_unattributed: Duration,
+    pub(crate) execution_unattributed: Duration,
+    pub(crate) finish: Duration,
+    pub(crate) finish_executor: Duration,
+    pub(crate) finish_hashed_state: Duration,
+    pub(crate) finish_state_root: Duration,
+    pub(crate) finish_state_root_task_wait: Option<Duration>,
+    pub(crate) state_root_task_succeeded: bool,
+    pub(crate) finish_assembly: Duration,
+    pub(crate) finish_unattributed: Duration,
+}
+
+/// Driver-side timing around Reth's native payload-job lifecycle.
+#[derive(Debug, Clone, Copy)]
+struct ArbPayloadJobTiming {
+    attributes: Duration,
+    job: Duration,
+    launch: Duration,
+    resolve: Duration,
+}
+
+/// Completion of a final forkchoice request queued behind an inserted local block.
+struct ArbForkchoiceCompletion {
+    completed_at: Instant,
+    elapsed: Duration,
+}
+
+/// A produced block whose final forkchoice request is still in flight.
+///
+/// Keeping this in the driver lets the next payload-attributes request enter the engine queue
+/// before we await this response. The engine processes those requests in order, so the next
+/// payload job can only start after this block is canonical, without requiring the producer to
+/// round-trip through the final FCU first.
+struct PendingAppliedBlock {
+    sequence_number: u64,
+    new_hash: B256,
+    new_header: Header,
+    production_timing: ArbBlockProductionTiming,
+    execution_cache_stats: Option<Arc<CacheStats>>,
+    payload_timing: ArbPayloadJobTiming,
+    started_at: Instant,
+    engine_handoff_started_at: Instant,
+    canonicalization_started_at: Instant,
+    engine_insert: Duration,
+    forkchoice: Option<tokio::task::JoinHandle<eyre::Result<ArbForkchoiceCompletion>>>,
 }
 
 /// The generic reth block builder owns post-state hashing and state-root calculation. Wrap its
@@ -1078,26 +990,15 @@ where
         + DBProvider,
 {
     provider: BlockchainProvider<N>,
-    evm_config: ArbEvmConfig,
-    chain_id: u64,
     tip: SealedHeader<Header>,
     to_tree: ToTree,
+    /// Reth's local payload-builder service for deterministic ArbOS message payloads.
+    payload_builder: PayloadBuilderHandle<ArbPayloadTypes>,
     canonical: CanonicalInMemoryState<ArbPrimitives>,
     obs_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, B256)>,
-    /// Cross-block account/storage/bytecode cache used by the execution provider. This is updated
-    /// from each canonical block's final `BundleState`, so it always represents `execution_cache_tip`.
-    execution_cache: ExecutionCache,
-    /// Reth-native cache occupancy and collision gauges. Updated after every canonical block.
-    execution_cache_metrics: Option<CachedStateCacheMetrics>,
-    execution_cache_tip: B256,
-    execution_cache_enabled: bool,
-    state_root_task_mode: DirectStateRootTaskMode,
-    state_root_strategy: DefaultStateRootStrategy,
-    state_root_runtime: Runtime,
-    state_trie_overlays: StateTrieOverlayManager<ArbPrimitives>,
-    sparse_trie_prune: SparseTriePruneCoordinator,
-    changeset_cache: ChangesetCache,
-    tree_config: TreeConfig,
+    /// The final FCU for the most recently produced block. Historical catch-up may leave this in
+    /// flight until the next payload-attributes request has been queued behind it.
+    pending_applied: Option<PendingAppliedBlock>,
     /// Sequence-reconciliation cursor (arb-reth's `TransactionStreamer` analogue). `next_seq` is the
     /// next message index to apply; a feed/derived message with `sequence_number` maps to L2 block
     /// `sequence_number + genesis_block`. Messages below `next_seq` are already-applied duplicates
@@ -1147,25 +1048,6 @@ where
         tuning: ArbEngineTuning,
         prune_builder: Option<PrunerBuilder>,
     ) -> eyre::Result<Self> {
-        // The engine tree owns a separate cache for its validation/payload paths. The direct
-        // feed driver does not execute through that path, so keep a dedicated sequential cache.
-        // 256 MiB holds roughly 1.8 million storage entries and avoids duplicating reth's 4 GiB
-        // default allocation. Operators can tune it without changing consensus behavior.
-        let execution_cache_enabled = std::env::var("ARB_EXECUTION_CACHE")
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
-            .unwrap_or(true);
-        let execution_cache_mb = std::env::var("ARB_EXECUTION_CACHE_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(256);
-        let execution_cache_bytes = execution_cache_mb.saturating_mul(1024 * 1024);
-        let execution_cache = ExecutionCache::new(execution_cache_bytes);
-        let execution_cache_metrics =
-            execution_cache_enabled.then(CachedStateCacheMetrics::default);
-        let execution_cache_tip = genesis_tip.hash();
-        let state_root_task_mode = tuning.state_root_task;
-
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
             tokio::sync::watch::channel(reth_exex_types::FinishedExExHeight::NoExExs);
@@ -1204,10 +1086,9 @@ where
             persistence_threshold = tuning.persistence_threshold,
             memory_block_buffer_target = tuning.memory_block_buffer_target,
             persistence_backpressure_threshold = tuning.persistence_backpressure_threshold,
-            execution_cache_enabled,
-            execution_cache_mb,
-            ?state_root_task_mode,
-            "engine-tree persistence and direct state-root configuration",
+            share_execution_cache = tuning.share_execution_cache_with_payload_builder,
+            share_sparse_trie = tuning.share_sparse_trie_with_payload_builder,
+            "engine-tree payload and persistence configuration",
         );
 
         let payload_validator = BasicEngineValidator::new(
@@ -1222,16 +1103,24 @@ where
             runtime.clone(),
         );
 
-        let (to_payload_service, _payload_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let payload_builder: PayloadBuilderHandle<ArbPayloadTypes> =
-            PayloadBuilderHandle::new(to_payload_service);
+        let builder = ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id);
+        let generator = ArbPayloadJobGenerator::new(provider.clone(), runtime.clone(), builder);
+        let (service, payload_builder) = PayloadBuilderService::<_, _, ArbPayloadTypes>::new(
+            generator,
+            provider.canonical_state_stream(),
+        );
+        runtime.spawn_critical_os_thread(
+            "arb-payload-service",
+            "arb native payload builder service",
+            service,
+        );
 
         let (to_tree, mut from_tree) = EngineApiTreeHandler::spawn_new(
             provider.clone(),
             consensus,
             payload_validator,
             persistence,
-            payload_builder,
+            payload_builder.clone(),
             canonical.clone(),
             state_trie_overlays.clone(),
             tree_config.clone(),
@@ -1241,22 +1130,17 @@ where
             runtime.clone(),
         );
 
-        // Drain events on a background task so the tree channel never blocks; forward every
-        // canonicalized block (number -> hash) to an mpsc the driver polls in `wait_for_head`.
+        // Drain events on a background task so the tree channel never blocks. Only forward
+        // committed-chain events: `CanonicalBlockAdded` is emitted when an executed block is
+        // inserted as pending and is not proof that RPC-visible canonical state has advanced.
         let (obs_tx, obs_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, B256)>();
         tokio::spawn(async move {
             while let Some(ev) = from_tree.recv().await {
-                if let EngineApiEvent::BeaconConsensus(ce) = ev {
-                    match ce {
-                        ConsensusEngineEvent::CanonicalChainCommitted(header, _) => {
-                            let _ = obs_tx.send((header.number, header.hash()));
-                        }
-                        ConsensusEngineEvent::CanonicalBlockAdded(block, _) => {
-                            let rb = block.recovered_block();
-                            let _ = obs_tx.send((rb.header().number, rb.hash()));
-                        }
-                        _ => {}
-                    }
+                if let EngineApiEvent::BeaconConsensus(
+                    ConsensusEngineEvent::CanonicalChainCommitted(header, _),
+                ) = ev
+                {
+                    let _ = obs_tx.send((header.number, header.hash()));
                 }
             }
         });
@@ -1264,131 +1148,17 @@ where
         // Seed the dedup cursor from the resumed tip: the next message to apply is the one that
         // produces block tip+1, i.e. message index tip.number - genesis_block + 1.
         let next_seq = genesis_tip.number.saturating_sub(genesis_block) + 1;
-        let sparse_trie_prune = SparseTriePruneCoordinator::new(&canonical);
-
         Ok(Self {
             provider,
-            evm_config,
-            chain_id,
             tip: genesis_tip,
             to_tree,
+            payload_builder,
             canonical,
             obs_rx,
-            execution_cache,
-            execution_cache_metrics,
-            execution_cache_tip,
-            execution_cache_enabled,
-            state_root_task_mode,
-            state_root_strategy: DefaultStateRootStrategy::default(),
-            state_root_runtime: runtime,
-            state_trie_overlays,
-            sparse_trie_prune,
-            changeset_cache,
-            tree_config,
+            pending_applied: None,
             next_seq,
             pending: BTreeMap::new(),
         })
-    }
-
-    /// Build independent execution and trie providers for the current parent, then produce one block.
-    fn build_block(
-        &mut self,
-        msg: &BroadcastFeedMessage,
-    ) -> eyre::Result<(
-        BuiltPayloadExecutedBlock<ArbPrimitives>,
-        ArbBlockProductionTiming,
-    )> {
-        // A discontinuity can only happen on restart/reorg today, but the hash guard makes stale
-        // cached values impossible if another caller changes the driver's tip in the future.
-        if self.execution_cache_enabled && self.execution_cache_tip != self.tip.hash() {
-            tracing::warn!(
-                target: "arb-reth::engine",
-                cache_tip = %self.execution_cache_tip,
-                parent = %self.tip.hash(),
-                "execution cache tip mismatch; clearing cache",
-            );
-            self.execution_cache.clear();
-            self.execution_cache_tip = self.tip.hash();
-        }
-
-        let started_at = Instant::now();
-        let exec_sp = self
-            .provider
-            .state_by_block_hash(self.tip.hash())
-            .wrap_err("state_by_block_hash (exec) failed")?;
-        let trie_sp = self
-            .provider
-            .state_by_block_hash(self.tip.hash())
-            .wrap_err("state_by_block_hash (trie) failed")?;
-        let cache_stats = self
-            .execution_cache_enabled
-            .then(|| Arc::new(CacheStats::default()));
-        let parent_arbos_version =
-            arbitrum_alloy_consensus::header::ArbHeaderInfo::decode_header(self.tip.header()).ok();
-        // A decoded format version of zero is an ordinary Ethereum header's zeroed `mix_hash`,
-        // not an initialized ArbOS header. ArbOS genesis itself always starts at version one.
-        let direct_state_root_task_enabled = self.state_root_task_mode.is_enabled()
-            && parent_arbos_version.is_some_and(|info| info.arbos_format_version != 0)
-            // Keep a pending prune request until a task can actually consume it. These are the
-            // same gates checked by `spawn_payload_state_root_task`.
-            && !self.tree_config.skip_state_root()
-            && self.tree_config.has_enough_parallelism();
-        let pending_sparse_trie_prune_blocks = direct_state_root_task_enabled
-            .then(|| {
-                self.sparse_trie_prune
-                    .take_prune_blocks(&self.canonical, self.tip.hash())
-            })
-            .flatten();
-        let state_root_task = direct_state_root_task_enabled
-            .then(|| {
-                self.state_root_strategy.spawn_payload_state_root_task(
-                    PayloadStateRootTaskContext::new(
-                        &self.state_root_runtime,
-                        &self.state_trie_overlays,
-                        OverlayStateProviderFactory::new(
-                            self.provider.clone(),
-                            OverlayBuilder::<ArbPrimitives>::new(
-                                self.tip.hash(),
-                                self.changeset_cache.clone(),
-                            )
-                            .with_state_trie_overlay_manager(self.state_trie_overlays.clone()),
-                        ),
-                        self.tip.header().state_root,
-                        // ArbOS can discover retry transactions while executing the message.
-                        None,
-                        &self.tree_config,
-                        pending_sparse_trie_prune_blocks,
-                    ),
-                )
-            })
-            .flatten();
-        let exec_sp: Box<dyn StateProvider + '_> = match &cache_stats {
-            Some(stats) => Box::new(CachedStateProvider::new_with_mode(
-                exec_sp,
-                self.execution_cache.clone(),
-                CacheFillMode::FillOnMiss,
-                None,
-                Some(Arc::clone(stats)),
-            )),
-            None => exec_sp,
-        };
-        let (built, mut timing) = produce_with_timing(
-            &self.evm_config,
-            self.chain_id,
-            &self.tip,
-            msg,
-            exec_sp,
-            trie_sp,
-            state_root_task,
-            self.state_root_task_mode,
-        )?;
-        if let Some(stats) = cache_stats {
-            record_execution_cache_stats(&stats);
-        }
-        timing.parent_state = started_at.elapsed().saturating_sub(
-            timing.message_preparation + timing.state_setup + timing.execution + timing.finish,
-        );
-        Ok((built, timing))
     }
 
     /// Produce, insert, and canonicalize one block from a feed message.
@@ -1414,10 +1184,43 @@ where
     where
         F: FnMut(u64, ArbAppliedMessageTiming),
     {
+        self.advance_with_applied_inner(msg, false, &mut on_applied)
+            .await
+    }
+
+    /// Like [`Self::advance_with_applied`], but allows the final block's forkchoice response to
+    /// remain in flight when the caller already has another message ready. The next call queues
+    /// its payload-attributes FCU first, then settles this block, preserving engine request order
+    /// while overlapping the two driver round trips.
+    pub async fn advance_with_applied_overlap<F>(
+        &mut self,
+        msg: &BroadcastFeedMessage,
+        defer_tail: bool,
+        mut on_applied: F,
+    ) -> eyre::Result<B256>
+    where
+        F: FnMut(u64, ArbAppliedMessageTiming),
+    {
+        self.advance_with_applied_inner(msg, defer_tail, &mut on_applied)
+            .await
+    }
+
+    async fn advance_with_applied_inner<F>(
+        &mut self,
+        msg: &BroadcastFeedMessage,
+        defer_tail: bool,
+        on_applied: &mut F,
+    ) -> eyre::Result<B256>
+    where
+        F: FnMut(u64, ArbAppliedMessageTiming),
+    {
         const MAX_PENDING: usize = 50_000;
         let seq = msg.sequence_number;
         if seq < self.next_seq {
             // Already applied by the other producer (feed/L1 overlap). Idempotent drop.
+            if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
+                on_applied(sequence_number, timing);
+            }
             return Ok(self.tip.hash());
         }
         if seq > self.next_seq {
@@ -1425,40 +1228,156 @@ where
             if self.pending.len() < MAX_PENDING {
                 self.pending.insert(seq, msg.clone());
             }
+            if let Some((sequence_number, timing)) = self.settle_pending_applied().await? {
+                on_applied(sequence_number, timing);
+            }
             return Ok(self.tip.hash());
         }
-        // seq == next_seq: this is the next block. Apply it, then drain the buffer forward.
-        let (mut hash, timing) = self.apply_one(msg).await?;
-        on_applied(seq, timing);
+
+        // seq == next_seq: queue this block, then drain the contiguous feed-ahead buffer. Each
+        // subsequent payload-attributes request is queued before the previous final FCU is
+        // awaited, which restores the native engine overlap without reading pending state.
+        let (mut hash, completed) = self.apply_one_native(seq, msg, Instant::now()).await?;
+        if let Some((sequence_number, timing)) = completed {
+            on_applied(sequence_number, timing);
+        }
         self.next_seq += 1;
         while let Some(buffered) = self.pending.remove(&self.next_seq) {
-            let (new_hash, timing) = self.apply_one(&buffered).await?;
+            let sequence_number = self.next_seq;
+            let (new_hash, completed) = self
+                .apply_one_native(sequence_number, &buffered, Instant::now())
+                .await?;
             hash = new_hash;
-            on_applied(self.next_seq, timing);
+            if let Some((completed_sequence, timing)) = completed {
+                on_applied(completed_sequence, timing);
+            }
             self.next_seq += 1;
         }
+
+        if !defer_tail
+            && let Some((sequence_number, timing)) = self.settle_pending_applied().await?
+        {
+            on_applied(sequence_number, timing);
+        }
+
         // Discard any stragglers now below the cursor (a feed dup that lost the race to L1).
         self.pending.retain(|k, _| *k >= self.next_seq);
         Ok(hash)
     }
 
-    /// Apply exactly one in-order message: build the next block from `self.tip`, insert it into the
-    /// engine tree, canonicalize, and advance `self.tip`. [`Self::advance`]'s sequence guard ensures
-    /// this is only called for the message that produces `tip + 1`.
-    async fn apply_one(
+    /// Drive Reth's local payload lifecycle for one already-ordered Arbitrum message.
+    async fn apply_one_native(
         &mut self,
+        sequence_number: u64,
         msg: &BroadcastFeedMessage,
-    ) -> eyre::Result<(B256, ArbAppliedMessageTiming)> {
-        let started_at = Instant::now();
+        started_at: Instant,
+    ) -> eyre::Result<(B256, Option<(u64, ArbAppliedMessageTiming)>)> {
+        let payload_builder = self.payload_builder.clone();
+        let parent = self.tip.hash();
+        let phase_started_at = Instant::now();
+        let attributes = self.native_payload_attributes(msg);
+        let payload_attributes = phase_started_at.elapsed();
 
-        let (built, production_timing) = self.build_block(msg)?;
+        // This is Reth's standard local-builder entry point. The engine tree validates the
+        // attributes, creates the sparse state-root task, and passes its handle to the builder.
+        let payload_job_started_at = Instant::now();
+        let (fcu_tx, fcu_rx) = tokio::sync::oneshot::channel();
+        self.to_tree
+            .send(FromEngine::Request(EngineApiRequest::Beacon(
+                BeaconEngineMessage::ForkchoiceUpdated {
+                    state: alloy_rpc_types_engine::ForkchoiceState {
+                        head_block_hash: parent,
+                        safe_block_hash: parent,
+                        finalized_block_hash: B256::ZERO,
+                    },
+                    payload_attrs: Some(attributes),
+                    tx: fcu_tx,
+                },
+            )))
+            .map_err(|e| eyre!("send native payload FCU: {e}"))?;
+
+        // The preceding block's final FCU was enqueued before this attributes FCU. Settle it now:
+        // Reth can process this request and launch the next payload job as soon as canonicalization
+        // completes, instead of waiting for another producer-to-engine round trip.
+        let completed_previous = self.settle_pending_applied().await?;
+
+        let build_fcu = fcu_rx
+            .await
+            .wrap_err("native payload FCU response channel")?;
+        let build_fcu = build_fcu.wrap_err("native payload FCU RethResult")?;
+        let build_fcu = build_fcu
+            .await
+            .map_err(|e| eyre!("native payload FCU error: {e:?}"))?;
+        let payload_id = build_fcu
+            .payload_id
+            .ok_or_else(|| eyre!("native payload FCU returned no payload id"))?;
+        let payload_job_launch = payload_job_started_at.elapsed();
+
+        // Arbitrum has no competitive transaction-pool selection: resolve the deterministic
+        // one-message build immediately, then hand its executed result back to the tree exactly
+        // as Reth's regular engine launcher does for a locally built payload.
+        let payload_resolve_started_at = Instant::now();
+        let payload = payload_builder
+            .resolve_kind(payload_id, PayloadKind::Earliest)
+            .await
+            .ok_or_else(|| eyre!("native payload job {payload_id:?} disappeared"))?
+            .map_err(|e| eyre!("native payload job {payload_id:?} failed: {e}"))?;
+        let payload_job_resolve = payload_resolve_started_at.elapsed();
+        let payload_job = payload_job_started_at.elapsed();
+        let production_timing = payload.production_timing();
+        let execution_cache_stats = payload.execution_cache_stats();
+        let built = payload
+            .executed_block()
+            .ok_or_else(|| eyre!("native payload {payload_id:?} omitted execution output"))?;
+
+        let new_hash = self.queue_applied_block(
+            sequence_number,
+            built,
+            production_timing,
+            execution_cache_stats,
+            ArbPayloadJobTiming {
+                attributes: payload_attributes,
+                job: payload_job,
+                launch: payload_job_launch,
+                resolve: payload_job_resolve,
+            },
+            started_at,
+        )?;
+
+        Ok((new_hash, completed_previous))
+    }
+
+    fn native_payload_attributes(&self, msg: &BroadcastFeedMessage) -> ArbPayloadAttributes {
+        let parent = self.tip.header();
+        let l1_timestamp = msg
+            .message_with_meta_data
+            .l1_incoming_message
+            .header
+            .timestamp;
+
+        ArbPayloadAttributes {
+            timestamp: l1_timestamp.max(parent.timestamp),
+            message: msg.clone(),
+        }
+    }
+
+    /// Insert one locally executed block and queue the FCU that makes it canonical.
+    fn queue_applied_block(
+        &mut self,
+        sequence_number: u64,
+        built: BuiltPayloadExecutedBlock<ArbPrimitives>,
+        production_timing: ArbBlockProductionTiming,
+        execution_cache_stats: Option<Arc<CacheStats>>,
+        payload_timing: ArbPayloadJobTiming,
+        started_at: Instant,
+    ) -> eyre::Result<B256> {
+        debug_assert!(self.pending_applied.is_none());
         let new_hash = built.recovered_block.hash();
         let new_header = built.recovered_block.header().clone();
         let new_number = new_header.number;
-        let execution_output = Arc::clone(&built.execution_output);
-        let block_production = started_at.elapsed();
 
         // Feed the executed block to the tree (no re-execution).
+        let engine_handoff_started_at = Instant::now();
         let phase_started_at = Instant::now();
         self.to_tree
             .send(FromEngine::Request(EngineApiRequest::InsertExecutedBlock(
@@ -1484,45 +1403,204 @@ where
                 },
             )))
             .map_err(|e| eyre!("send ForkchoiceUpdated: {e}"))?;
-        let fcu_res = fcu_rx.await.wrap_err("FCU response channel")?;
-        let fcu_res = fcu_res.wrap_err("FCU RethResult")?;
-        fcu_res
-            .await
-            .map_err(|e| eyre!("block {new_number} FCU error: {e:?}"))?;
-        let engine_forkchoice = phase_started_at.elapsed();
 
-        // Wait for the tree to actually canonicalize the block (bounded).
-        let phase_started_at = Instant::now();
-        let canonicalized = wait_for_head(
-            &self.provider,
-            &self.provider.canonical_in_memory_state(),
-            &mut self.obs_rx,
-            new_number,
+        // Poll the response independently of the producer. If another message is already queued,
+        // its attributes FCU can be sent behind this request before the driver joins this task.
+        let canonicalization_started_at = Instant::now();
+        let forkchoice = tokio::spawn(async move {
+            let fcu_res = fcu_rx.await.wrap_err("FCU response channel")?;
+            let fcu_res = fcu_res.wrap_err("FCU RethResult")?;
+            fcu_res
+                .await
+                .map_err(|e| eyre!("block {new_number} FCU error: {e:?}"))?;
+            Ok(ArbForkchoiceCompletion {
+                completed_at: Instant::now(),
+                elapsed: phase_started_at.elapsed(),
+            })
+        });
+
+        self.tip = SealedHeader::new(new_header.clone(), new_hash);
+        self.pending_applied = Some(PendingAppliedBlock {
+            sequence_number,
             new_hash,
-        )
-        .await;
-        if !canonicalized {
-            return Err(eyre!(
-                "block {new_number} was NOT canonicalized within timeout (head hash {new_hash:#x})"
-            ));
+            new_header,
+            production_timing,
+            execution_cache_stats,
+            payload_timing,
+            started_at,
+            engine_handoff_started_at,
+            canonicalization_started_at,
+            engine_insert,
+            forkchoice: Some(forkchoice),
+        });
+        Ok(new_hash)
+    }
+
+    /// Settle and account for the queued final FCU, if any.
+    async fn settle_pending_applied(
+        &mut self,
+    ) -> eyre::Result<Option<(u64, ArbAppliedMessageTiming)>> {
+        let Some(mut pending) = self.pending_applied.take() else {
+            return Ok(None);
+        };
+        let forkchoice = pending
+            .forkchoice
+            .take()
+            .expect("queued block must retain its final FCU task")
+            .await
+            .wrap_err("final FCU task panicked")??;
+
+        // A successful FCU response should already imply this, but retain an exact hash check so
+        // a future engine-tree behavior change cannot turn the overlap into an early callback.
+        let was_observable_at_response = matches!(self.provider.block_hash(pending.new_header.number), Ok(Some(hash)) if hash == pending.new_hash)
+            || {
+                let head = self
+                    .provider
+                    .canonical_in_memory_state()
+                    .get_canonical_head();
+                head.header().number == pending.new_header.number && head.hash() == pending.new_hash
+            };
+        if was_observable_at_response {
+            // The exact provider check is authoritative. Drain the redundant committed events so
+            // the observation channel cannot grow throughout a long historical sync.
+            while self.obs_rx.try_recv().is_ok() {}
+        } else {
+            let canonicalized = wait_for_head(
+                &self.provider,
+                &self.provider.canonical_in_memory_state(),
+                &mut self.obs_rx,
+                pending.new_header.number,
+                pending.new_hash,
+            )
+            .await;
+            if !canonicalized {
+                return Err(eyre!(
+                    "block {} was NOT canonicalized within timeout (head hash {:#x})",
+                    pending.new_header.number,
+                    pending.new_hash,
+                ));
+            }
         }
-        let canonicalization_wait = phase_started_at.elapsed();
-        let total = started_at.elapsed();
+
+        let completed_at = if was_observable_at_response {
+            forkchoice.completed_at
+        } else {
+            Instant::now()
+        };
+        let engine_handoff =
+            completed_at.saturating_duration_since(pending.engine_handoff_started_at);
+        let canonicalization_wait =
+            completed_at.saturating_duration_since(pending.canonicalization_started_at);
+        let sequence_number = pending.sequence_number;
+        let timing = Self::record_completed_block(
+            pending,
+            forkchoice.elapsed,
+            canonicalization_wait,
+            engine_handoff,
+            completed_at,
+        );
+        Ok(Some((sequence_number, timing)))
+    }
+
+    fn record_completed_block(
+        pending: PendingAppliedBlock,
+        engine_forkchoice: Duration,
+        canonicalization_wait: Duration,
+        engine_handoff: Duration,
+        completed_at: Instant,
+    ) -> ArbAppliedMessageTiming {
+        let PendingAppliedBlock {
+            new_hash,
+            new_header,
+            production_timing,
+            execution_cache_stats,
+            payload_timing,
+            started_at,
+            engine_insert,
+            ..
+        } = pending;
+        let new_number = new_header.number;
+        let block_production = production_timing.total;
+        let named_production = production_timing.parent_state
+            + production_timing.message_preparation
+            + production_timing.state_setup
+            + production_timing.execution
+            + production_timing.finish;
+        let block_production_unattributed = block_production.saturating_sub(named_production);
+        let payload_job_overhead = payload_timing.job.saturating_sub(block_production);
+        let total = completed_at.saturating_duration_since(started_at);
 
         // Source-independent production timings. The feed-latency recorder only observes messages
         // seen on the websocket and therefore intentionally omits L1-derived catch-up blocks.
         // These histograms cover every canonical block and are the stable benchmark surface for
         // execution/cache/state-root work.
+        if let Some(stats) = execution_cache_stats {
+            crate::native_payload::record_execution_cache_stats(&stats);
+        }
         let block_metrics = engine_block_metric_handles();
+        block_metrics
+            .payload_attributes
+            .record(payload_timing.attributes.as_secs_f64());
+        block_metrics
+            .payload_job
+            .record(payload_timing.job.as_secs_f64());
+        block_metrics
+            .payload_job_launch
+            .record(payload_timing.launch.as_secs_f64());
+        block_metrics
+            .payload_job_resolve
+            .record(payload_timing.resolve.as_secs_f64());
+        block_metrics
+            .payload_job_overhead
+            .record(payload_job_overhead.as_secs_f64());
         block_metrics
             .production
             .record(block_production.as_secs_f64());
         block_metrics
+            .production_unattributed
+            .record(block_production_unattributed.as_secs_f64());
+        block_metrics
             .parent_state
             .record(production_timing.parent_state.as_secs_f64());
         block_metrics
+            .message_preparation
+            .record(production_timing.message_preparation.as_secs_f64());
+        block_metrics
+            .state_setup
+            .record(production_timing.state_setup.as_secs_f64());
+        block_metrics
             .execution
             .record(production_timing.execution.as_secs_f64());
+        block_metrics
+            .execution_setup
+            .record(production_timing.execution_setup.as_secs_f64());
+        block_metrics.start_block_transaction_construction.record(
+            production_timing
+                .start_block_transaction_construction
+                .as_secs_f64(),
+        );
+        block_metrics
+            .start_block_transaction
+            .record(production_timing.start_block_transaction.as_secs_f64());
+        block_metrics
+            .derived_transactions
+            .record(production_timing.derived_transactions.as_secs_f64());
+        block_metrics.derived_transaction_execution.record(
+            production_timing
+                .derived_transaction_execution
+                .as_secs_f64(),
+        );
+        block_metrics
+            .derived_retry_scheduling
+            .record(production_timing.derived_retry_scheduling.as_secs_f64());
+        block_metrics.derived_transactions_unattributed.record(
+            production_timing
+                .derived_transactions_unattributed
+                .as_secs_f64(),
+        );
+        block_metrics
+            .execution_unattributed
+            .record(production_timing.execution_unattributed.as_secs_f64());
         block_metrics
             .finish
             .record(production_timing.finish.as_secs_f64());
@@ -1539,20 +1617,10 @@ where
             block_metrics
                 .finish_state_root_task_wait
                 .record(wait.as_secs_f64());
-            match (
-                production_timing.state_root_task_mode,
-                production_timing.state_root_task_succeeded,
-            ) {
-                (DirectStateRootTaskMode::Drive, true) => {
-                    block_metrics.state_root_task_drive_success.increment(1);
-                }
-                (DirectStateRootTaskMode::Shadow, true) => {
-                    block_metrics.state_root_task_shadow_match.increment(1);
-                }
-                (_, false) => block_metrics.state_root_task_fallback.increment(1),
-                (DirectStateRootTaskMode::Off, true) => {
-                    unreachable!("off state-root task mode recorded a result")
-                }
+            if production_timing.state_root_task_succeeded {
+                block_metrics.state_root_task_native_success.increment(1);
+            } else {
+                block_metrics.state_root_task_fallback.increment(1);
             }
         }
         block_metrics
@@ -1561,6 +1629,22 @@ where
         block_metrics
             .finish_unattributed
             .record(production_timing.finish_unattributed.as_secs_f64());
+        block_metrics
+            .engine_handoff
+            .record(engine_handoff.as_secs_f64());
+        block_metrics
+            .engine_insert
+            .record(engine_insert.as_secs_f64());
+        block_metrics
+            .engine_forkchoice
+            .record(engine_forkchoice.as_secs_f64());
+        block_metrics
+            .canonicalization_wait
+            .record(canonicalization_wait.as_secs_f64());
+        let named_apply = payload_timing.attributes + payload_timing.job + engine_handoff;
+        block_metrics
+            .apply_overhead
+            .record(total.saturating_sub(named_apply).as_secs_f64());
         block_metrics.total.record(total.as_secs_f64());
         let production_seconds = block_production.as_secs_f64();
         let mgas_per_second = if production_seconds > 0.0 {
@@ -1582,7 +1666,11 @@ where
         tracing::debug!(
             target: "arb-reth::engine::timing",
             number = new_number,
+            us_attributes = payload_timing.attributes.as_micros(),
+            us_payload_job = payload_timing.job.as_micros(),
+            us_payload_overhead = payload_job_overhead.as_micros(),
             us_produce = block_production.as_micros(),
+            us_handoff = engine_handoff.as_micros(),
             us_insert = engine_insert.as_micros(),
             us_fcu = engine_forkchoice.as_micros(),
             us_wait = canonicalization_wait.as_micros(),
@@ -1590,66 +1678,46 @@ where
             "advance timing",
         );
 
-        self.tip = SealedHeader::new(new_header, new_hash);
-        if self.execution_cache_enabled {
-            let cache_update_started_at = Instant::now();
-            if self
-                .execution_cache
-                .insert_state(&execution_output.state)
-                .is_err()
-            {
-                tracing::warn!(
-                    target: "arb-reth::engine",
-                    number = new_number,
-                    "inconsistent execution-cache update; clearing cache",
-                );
-                self.execution_cache.clear();
-            }
-            if let Some(metrics) = &self.execution_cache_metrics {
-                self.execution_cache.update_metrics(metrics);
-            }
-            self.execution_cache_tip = new_hash;
-            let cache_update_seconds = cache_update_started_at.elapsed().as_secs_f64();
-            block_metrics
-                .execution_cache_update
-                .record(cache_update_seconds);
+        ArbAppliedMessageTiming {
+            started_at,
+            completed_at,
+            payload_attributes: payload_timing.attributes,
+            payload_job: payload_timing.job,
+            payload_job_launch: payload_timing.launch,
+            payload_job_resolve: payload_timing.resolve,
+            payload_job_overhead,
+            block_production,
+            block_production_unattributed,
+            block_parent_state: production_timing.parent_state,
+            block_message_preparation: production_timing.message_preparation,
+            block_state_setup: production_timing.state_setup,
+            block_execution: production_timing.execution,
+            block_execution_setup: production_timing.execution_setup,
+            block_start_block_transaction_construction: production_timing
+                .start_block_transaction_construction,
+            block_start_block_transaction: production_timing.start_block_transaction,
+            block_derived_transactions: production_timing.derived_transactions,
+            block_derived_transaction_execution: production_timing.derived_transaction_execution,
+            block_derived_retry_scheduling: production_timing.derived_retry_scheduling,
+            block_derived_transactions_unattributed: production_timing
+                .derived_transactions_unattributed,
+            block_execution_unattributed: production_timing.execution_unattributed,
+            block_finish: production_timing.finish,
+            block_finish_executor: production_timing.finish_executor,
+            block_finish_hashed_state: production_timing.finish_hashed_state,
+            block_finish_state_root: production_timing.finish_state_root,
+            block_finish_state_root_task_wait: production_timing.finish_state_root_task_wait,
+            block_finish_state_root_task_succeeded: production_timing
+                .finish_state_root_task_wait
+                .map(|_| production_timing.state_root_task_succeeded),
+            block_finish_assembly: production_timing.finish_assembly,
+            block_finish_unattributed: production_timing.finish_unattributed,
+            engine_handoff,
+            engine_insert,
+            engine_forkchoice,
+            canonicalization_wait,
+            total,
         }
-        Ok((
-            new_hash,
-            ArbAppliedMessageTiming {
-                started_at,
-                block_production,
-                block_parent_state: production_timing.parent_state,
-                block_message_preparation: production_timing.message_preparation,
-                block_state_setup: production_timing.state_setup,
-                block_execution: production_timing.execution,
-                block_execution_setup: production_timing.execution_setup,
-                block_start_block_transaction_construction: production_timing
-                    .start_block_transaction_construction,
-                block_start_block_transaction: production_timing.start_block_transaction,
-                block_derived_transactions: production_timing.derived_transactions,
-                block_derived_transaction_execution: production_timing
-                    .derived_transaction_execution,
-                block_derived_retry_scheduling: production_timing.derived_retry_scheduling,
-                block_derived_transactions_unattributed: production_timing
-                    .derived_transactions_unattributed,
-                block_execution_unattributed: production_timing.execution_unattributed,
-                block_finish: production_timing.finish,
-                block_finish_executor: production_timing.finish_executor,
-                block_finish_hashed_state: production_timing.finish_hashed_state,
-                block_finish_state_root: production_timing.finish_state_root,
-                block_finish_state_root_task_wait: production_timing.finish_state_root_task_wait,
-                block_finish_state_root_task_succeeded: production_timing
-                    .finish_state_root_task_wait
-                    .map(|_| production_timing.state_root_task_succeeded),
-                block_finish_assembly: production_timing.finish_assembly,
-                block_finish_unattributed: production_timing.finish_unattributed,
-                engine_insert,
-                engine_forkchoice,
-                canonicalization_wait,
-                total,
-            },
-        ))
     }
 
     /// Returns the current chain tip (the parent for the next block).
@@ -1680,34 +1748,5 @@ where
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sparse_trie_pruning_is_requested_once_per_persistence_update() {
-        let canonical = CanonicalInMemoryState::<ArbPrimitives>::empty();
-        let mut coordinator = SparseTriePruneCoordinator::new(&canonical);
-
-        assert_eq!(
-            coordinator.take_prune_blocks(&canonical, B256::ZERO),
-            None,
-            "a new coordinator must not prune before persistence advances"
-        );
-
-        canonical.set_persisted(BlockNumHash::new(1, B256::ZERO));
-        assert_eq!(
-            coordinator.take_prune_blocks(&canonical, B256::ZERO),
-            Some(Vec::new()),
-            "an observed persistence transition must request a prune, even without in-memory blocks"
-        );
-        assert_eq!(
-            coordinator.take_prune_blocks(&canonical, B256::ZERO),
-            None,
-            "the same persistence transition must not prune every subsequent block"
-        );
     }
 }
