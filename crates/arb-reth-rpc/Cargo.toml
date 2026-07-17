@@ -20,21 +20,21 @@ alloy-primitives = { version = "1", default-features = false }
 alloy-rpc-types-eth = { version = "2.0", default-features = false }
 eyre = "0.6.12"
 
-reth-chain-state = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-node-api = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-primitives-traits = { version = "0.5.0", default-features = false }
-reth-rpc = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-rpc-builder = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-rpc-convert = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-rpc-eth-types = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-rpc-server-types = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f", features = ["db-api"] }
-reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-tokio-util = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-transaction-pool = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-network-api = { git = "https://github.com/nuntax/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f", features = ["db-api"] }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-tokio-util = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-network-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
