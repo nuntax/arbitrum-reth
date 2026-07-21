@@ -284,7 +284,9 @@ pub fn verify_export(args: GenesisVerifyExportArgs) -> eyre::Result<()> {
             }
             Some("C") => n_code += 1,
             Some("H") | Some("B") | Some("R") | None => {}
-            Some(other) => eyre::bail!("unknown record type {other:?}"),
+            Some(other) => {
+                eyre::bail!("unknown record type {other:?}");
+            }
         }
     }
     flush_storage(cur_addr_hash, cur_storage_root, &mut cur_slots, &mut storage_checked);
