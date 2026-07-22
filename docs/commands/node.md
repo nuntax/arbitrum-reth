@@ -1,6 +1,12 @@
 # `arb-reth node`
 
-Runs the node, opens the database, derives L2 messages from L1, and optionally serves HTTP JSON-RPC.
+Runs the node, opens the database, derives L2 messages from L1, and optionally serves JSON-RPC.
+It uses Reth's native node command, so datadir, database, metrics, RPC, pruning, engine-tree,
+static-file, and storage arguments use their upstream Reth names.
+
+The command intentionally rejects native P2P, txpool, generic payload-builder, dev, ERA, debug-node,
+and JIT options. Those components do not exist in the standalone L1/feed-derived architecture, so
+accepting their settings would be misleading.
 
 ## Inputs
 
@@ -10,7 +16,10 @@ Runs the node, opens the database, derives L2 messages from L1, and optionally s
 - One boot mode:
   - `--snapshot-head <blocks.stream>` for a datadir created by `snapshot import --blocks`.
   - `--chain-info <chaininfo.json> --genesis <genesis.json>` for an Orbit chain booted from genesis.
-  - `--chain <chain-config.json>` for a chain-config boot.
+  - `--arb-chain-config <chain-config.json>` for a chain-config boot.
+
+`--chain` is now Reth's chain-spec option and currently accepts only the `arb-one` placeholder.
+It is not a substitute for an ArbOS bootstrap input.
 
 For a snapshot-seeded database:
 
@@ -20,7 +29,8 @@ arb-reth node \
   --snapshot-head /data/head.stream \
   --l1-rpc https://your-archive-rpc.example \
   --l1-beacon https://your-beacon-api.example \
-  --http --http.port 8545
+  --http --http.port 8545 \
+  --ws --ws.port 8546
 ```
 
 For an Orbit chain:
@@ -50,6 +60,11 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [observability guide](../observability/README.md) for feed latency, engine-tree, persistence, and Prometheus scrape details.
 
+HTTP and WebSocket are separate native Reth servers. Enable each explicitly with `--http` and
+`--ws`; configure methods with `--http.api` and `--ws.api`. The authenticated Engine API is always
+disabled because ArbOS derives blocks locally rather than accepting beacon-client engine commands.
+Reth's local IPC server follows its normal native default; pass `--ipcdisable` when it is not wanted.
+
 ## Execution cache
 
 - `--engine.cross-block-cache-size <MiB>` controls Reth's cross-block account, storage, and
@@ -58,9 +73,9 @@ Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [ob
 
 ## Payload execution
 
-- `--share-execution-cache-with-payload-builder <true|false>` shares Reth's cross-block account,
+- `--engine.share-execution-cache-with-payload-builder <true|false>` shares Reth's cross-block account,
   storage, and bytecode cache with the serial Arbitrum payload builder. It defaults to `true`.
-- `--share-sparse-trie-with-payload-builder` lets Reth compute the state root concurrently with
+- `--engine.share-sparse-trie-with-payload-builder` lets Reth compute the state root concurrently with
   ArbOS execution. It is opt-in and requires useful state-root worker parallelism.
 
 The node builds only one Arbitrum payload at a time. Do not reuse these settings in a node that can
@@ -68,10 +83,10 @@ run concurrent payload jobs without first reviewing Reth's cache and sparse-trie
 
 ## Persistence controls
 
-- `--persistence-threshold`: number of canonical blocks before a persistence batch.
-- `--memory-buffer-target`: recent blocks retained in memory before flushing.
-- `--persistence-backpressure`: maximum unpersisted gap before block production stalls.
-- `--no-fsync`: bulk-sync durability tradeoff. A crash can lose a recently produced suffix, which derivation can reproduce.
+- `--engine.persistence-threshold`: number of canonical blocks before a persistence batch.
+- `--engine.memory-block-buffer-target`: recent blocks retained in memory before flushing.
+- `--engine.persistence-backpressure-threshold`: maximum unpersisted gap before block production stalls.
+- `--db.sync-mode safe-no-sync`: bulk-sync durability tradeoff. A crash can lose a recently produced suffix, which derivation can reproduce. `--no-fsync` remains a compatibility alias.
 
 Start with the defaults unless a benchmark or recovery plan justifies changing them.
 
