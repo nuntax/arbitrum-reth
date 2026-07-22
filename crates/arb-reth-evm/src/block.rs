@@ -301,7 +301,9 @@ fn sample_transaction_metrics(tx_type: u8) -> bool {
     match sample_rate {
         0 => false,
         1 => true,
-        rate => COUNTERS[tx_type_metric_index(tx_type)].fetch_add(1, Ordering::Relaxed) % rate == 0,
+        rate => COUNTERS[tx_type_metric_index(tx_type)]
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(rate),
     }
 }
 
