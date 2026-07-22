@@ -2,7 +2,7 @@
 //! layer was split into the `arb-reth-rpc` crate. Exercises `ArbLauncher` + RPC end-to-end,
 //! so it lives with the node crate (which owns the launcher/node types), not with the RPC crate.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 
 use alloy_primitives::{U256, address};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -45,17 +45,21 @@ async fn rpc_serves_eth_queries() {
         reth_node_core::dirs::MaybePlatformPath::<reth_node_core::dirs::DataDirPath>::from(
             datadir.clone(),
         );
-    let config = NodeConfig::test()
+    let mut config = NodeConfig::test()
         .with_chain(MAINNET.clone())
         .with_datadir_args(reth_node_core::args::DatadirArgs {
             datadir: maybe_path.clone(),
             ..Default::default()
         });
+    config.rpc.http = true;
+    config.rpc.http_addr = Ipv4Addr::LOCALHOST.into();
+    config.rpc.http_port = 0;
+    config.rpc.http_api = Some(reth_rpc_server_types::RpcModuleSelection::All);
+    config.rpc.disable_auth_server = true;
     let data_dir = maybe_path.unwrap_or_chain_default(MAINNET.chain(), config.datadir.clone());
 
     let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
-    let rpc_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
     let tx_log_stream = ArbTxLogBroadcaster::new();
     let mut tx_events = tx_log_stream.subscribe();
     let launcher = ArbLauncher {
@@ -67,7 +71,6 @@ async fn rpc_serves_eth_queries() {
         feed_messages: feed_rx,
         l1_messages: l1_rx,
         feed_latency: None,
-        rpc_addr: Some(rpc_addr),
         tx_log_stream: Some(tx_log_stream),
     };
 
