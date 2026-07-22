@@ -39,7 +39,8 @@ reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab2
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-revm = { workspace = true }
+# Keep the optimized precompile implementations aligned with reth-node-ethereum.
+revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_limit", "p256-aws-lc-rs"] }
 revm-database = "41.0.0"
 
 # D.2.3: driver (reth BlockBuilder + revm State<StateProviderDatabase>)
@@ -119,6 +120,19 @@ reth-config = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f17
 reth-exex-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-stages-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 crossbeam-channel = "0.5"
+
+[features]
+default = ["asm-keccak", "keccak-cache-global", "gmp"]
+asm-keccak = [
+    "alloy-primitives/asm-keccak",
+    "reth-node-core/asm-keccak",
+    "revm/asm-keccak",
+]
+keccak-cache-global = [
+    "alloy-primitives/keccak-cache-global",
+    "reth-node-core/keccak-cache-global",
+]
+gmp = ["reth-revm/gmp", "revm/gmp"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
