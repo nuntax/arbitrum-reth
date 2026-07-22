@@ -274,13 +274,13 @@ pub(crate) fn produce_with_timing<'a>(
             if is_internal {
                 return Err(e).wrap_err("internal start-block tx failed");
             }
-            tracing::warn!(
+            tracing::debug!(
                 target: "arb-reth::engine",
                 block = parent_header.number + 1,
                 tx_type = tx_ty,
                 %sender,
                 error = %e,
-                "dropping invalid derived transaction (Nitro drop-and-continue)",
+                "dropping invalid derived transaction",
             );
             continue;
         }
