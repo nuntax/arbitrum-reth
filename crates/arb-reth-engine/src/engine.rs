@@ -580,31 +580,9 @@ where
 /// `persistence_backpressure_threshold=16`) suit a live validator: persist promptly, hold almost
 /// nothing in memory.
 ///
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ArbEngineTuning {
-    /// Persist once the canonical tip is this many blocks ahead of the last persisted block.
-    pub persistence_threshold: u64,
-    /// Keep this many of the most-recent blocks in memory (target size of the unpersisted buffer).
-    pub memory_block_buffer_target: u64,
-    /// Hard backpressure: stall block production once this many blocks are unpersisted.
-    pub persistence_backpressure_threshold: u64,
-    /// Size in bytes of reth's cross-block execution cache.
-    ///
-    /// Reth's bare [`TreeConfig`] default is intentionally large for a general-purpose node. A
-    /// 256 MiB cache keeps the serial Arbitrum producer's fixed-cache tables dense and matches
-    /// the previously measured direct-driver configuration.
-    pub execution_cache_size: usize,
-    /// Share Reth's cross-block execution cache with the native payload builder.
-    ///
-    /// The Arbitrum driver builds one payload at a time, so the shared cache cannot race a
-    /// concurrent payload job and can safely serve repeated account, storage, and bytecode reads.
-    pub share_execution_cache_with_payload_builder: bool,
-    /// Share reth's sparse trie task with the native payload builder.
-    ///
-    /// This overlaps state-root computation with ArbOS execution. It is disabled by default to
-    /// retain reth's conservative payload-builder behavior on hosts that may build payloads in
-    /// parallel.
-    pub share_sparse_trie_with_payload_builder: bool,
+    tree_config: TreeConfig,
 }
 
 impl Default for ArbEngineTuning {
@@ -619,31 +597,30 @@ impl ArbEngineTuning {
     /// / small runs (and tests that assert a produced block is durably persisted immediately);
     /// use [`Default`] for bulk historical sync throughput.
     pub fn reth_defaults() -> Self {
-        Self {
-            persistence_threshold: 2,
-            memory_block_buffer_target: 0,
-            persistence_backpressure_threshold: 16,
-            execution_cache_size: 256 * 1024 * 1024,
-            share_execution_cache_with_payload_builder: true,
-            share_sparse_trie_with_payload_builder: false,
-        }
+        Self::from_tree_config(
+            TreeConfig::default()
+                // TreeConfig validates its invariants after every builder call. Set the upper
+                // bound first so deep configurations are valid in debug builds too.
+                .with_persistence_backpressure_threshold(16)
+                .with_persistence_threshold(2)
+                .with_memory_block_buffer_target(0)
+                .with_cross_block_cache_size(256 * 1024 * 1024)
+                .with_share_execution_cache_with_payload_builder(true)
+                .with_share_sparse_trie_with_payload_builder(false),
+        )
     }
 
-    /// Build a reth [`TreeConfig`] from these knobs (all other fields keep reth defaults).
-    pub fn to_tree_config(self) -> TreeConfig {
-        TreeConfig::default()
-            // TreeConfig validates its invariants after every builder call. Set the upper bound
-            // first so deep configurations are valid in debug builds too.
-            .with_persistence_backpressure_threshold(self.persistence_backpressure_threshold)
-            .with_persistence_threshold(self.persistence_threshold)
-            .with_memory_block_buffer_target(self.memory_block_buffer_target)
-            .with_cross_block_cache_size(self.execution_cache_size)
-            .with_share_execution_cache_with_payload_builder(
-                self.share_execution_cache_with_payload_builder,
-            )
-            .with_share_sparse_trie_with_payload_builder(
-                self.share_sparse_trie_with_payload_builder,
-            )
+    /// Retain the complete reth engine-tree configuration instead of selecting a local subset.
+    ///
+    /// This lets native CLI and TOML settings such as state-root fallback, sparse-trie pruning,
+    /// prewarming, and provider metrics reach the engine tree unchanged.
+    pub const fn from_tree_config(tree_config: TreeConfig) -> Self {
+        Self { tree_config }
+    }
+
+    /// Return the reth engine-tree configuration used by the driver.
+    pub fn to_tree_config(&self) -> TreeConfig {
+        self.tree_config.clone()
     }
 }
 
@@ -1083,11 +1060,11 @@ where
         let tree_config = tuning.to_tree_config();
         tracing::info!(
             target: "arb-reth::engine",
-            persistence_threshold = tuning.persistence_threshold,
-            memory_block_buffer_target = tuning.memory_block_buffer_target,
-            persistence_backpressure_threshold = tuning.persistence_backpressure_threshold,
-            share_execution_cache = tuning.share_execution_cache_with_payload_builder,
-            share_sparse_trie = tuning.share_sparse_trie_with_payload_builder,
+            persistence_threshold = tree_config.persistence_threshold(),
+            memory_block_buffer_target = tree_config.memory_block_buffer_target(),
+            persistence_backpressure_threshold = tree_config.persistence_backpressure_threshold(),
+            share_execution_cache = tree_config.share_execution_cache_with_payload_builder(),
+            share_sparse_trie = tree_config.share_sparse_trie_with_payload_builder(),
             "engine-tree payload and persistence configuration",
         );
 

@@ -109,7 +109,7 @@ pub type ArbNetworkPrimitives =
 // except the executor (Arbitrum has no tx gossip, p2p, or fork-choice engine).
 // `ArbLauncher` reuses reth's `LaunchContext` for DB/provider/tasks but skips the sync
 // pipeline and consensus-engine orchestrator, spawning `ArbEngineDriver` to drive reth's
-// engine tree directly; AddOns = () (no engine-coupled RpcAddOns).
+// engine tree directly. Its RPC add-ons remain native Reth add-ons, with a noop Engine API.
 
 use reth_node_builder::components::{
     ComponentsBuilder, NoopConsensusBuilder, NoopNetworkBuilder, NoopPayloadBuilder,
@@ -130,7 +130,7 @@ where
         NoopConsensusBuilder,
     >;
 
-    type AddOns = ();
+    type AddOns = addons::ArbAddOns<reth_node_builder::NodeAdapter<N>>;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
         ComponentsBuilder::<(), (), (), (), (), ()>::default()
@@ -142,7 +142,9 @@ where
             .noop_consensus()
     }
 
-    fn add_ons(&self) -> Self::AddOns {}
+    fn add_ons(&self) -> Self::AddOns {
+        addons::arb_add_ons()
+    }
 }
 
 #[cfg(test)]

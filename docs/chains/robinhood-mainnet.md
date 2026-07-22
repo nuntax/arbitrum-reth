@@ -51,11 +51,12 @@ The command below creates the datadir when absent and resumes from its stored L1
   --l1-getlogs-range 500 \
   --l1-prefetch 32 \
   --feed-url "$FEED_URL" \
-  --persistence-threshold 128 \
-  --memory-buffer-target 0 \
-  --persistence-backpressure 512 \
+  --engine.persistence-threshold 128 \
+  --engine.memory-block-buffer-target 0 \
+  --engine.persistence-backpressure-threshold 512 \
   --full \
-  --http --http.port 8547
+  --http --http.port 8547 \
+  --ws --ws.port 8548
 ```
 
 `--full` is the recommended local full-node profile: it retains the recent history and receipts

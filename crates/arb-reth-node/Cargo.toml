@@ -90,11 +90,14 @@ futures-util = "0.3"
 # aws-lc-rs provider once at startup (see bin/arb-reth.rs). Direct dep only for that install call.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
-# D.3b.4: bin/arb-reth (clap CLI, reth runtime/ctrl-c harness, tracing, node-core)
+# D.3b.4: bin/arb-reth (native Reth CLI, runtime/ctrl-c harness, tracing, node-core)
 clap = { version = "4", features = ["derive"] }
+reth-cli = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f", features = ["otlp"] }
+reth-node-metrics = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-metrics = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 
 # D.5: Arbitrum RPC converters (receipt/rpc converters), consumed by the canonical RpcAddOns wiring.

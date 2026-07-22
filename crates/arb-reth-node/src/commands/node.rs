@@ -17,13 +17,13 @@
 //! node alive until SIGTERM. This lets a user run a finite replay and then inspect
 //! the produced blocks via JSON-RPC.
 //!
-//! With `--chain <PATH>` an Arbitrum chain-config JSON is parsed to produce a real
+//! With `--arb-chain-config <PATH>` an Arbitrum chain-config JSON is parsed to produce a real
 //! ArbOS genesis allocation instead of the MAINNET placeholder.
 
 use std::{
     fs,
-    net::{IpAddr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
 };
 
 use crate::launcher::ArbLauncher;
@@ -37,101 +37,67 @@ use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
 use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
-use clap::Parser;
-use reth_chainspec::MAINNET;
+use clap::Args;
+use reth_chainspec::{ChainSpec, MAINNET};
+use reth_cli::chainspec::ChainSpecParser;
+use reth_cli_commands::{launcher::FnLauncher, node::NodeCommand};
 use reth_cli_runner::CliContext;
-use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, mdbx::SyncMode};
-use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
-use reth_node_core::{
-    args::{DatadirArgs, MetricArgs, PruningArgs},
-    dirs::{DataDirPath, MaybePlatformPath},
-};
+use reth_db::{DatabaseEnv, mdbx::SyncMode};
+use reth_node_builder::{LaunchContext, NodeBuilder, WithLaunchContext};
 use reth_provider::BlockNumReader;
 use reth_tracing::tracing::info;
 
-/// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
-#[derive(Debug, Parser)]
-#[command(
-    name = "arb-reth",
-    about = "Standalone no-engine Arbitrum (ArbOS-on-reth) node"
-)]
-pub struct NodeArgs {
-    /// Data directory for the node's database and static files.
-    /// Defaults to the platform-specific reth data directory for this chain.
-    #[arg(long, value_name = "PATH")]
-    datadir: Option<PathBuf>,
+/// Reth chain-spec parser for the standalone Arbitrum node.
+///
+/// `arb-one` is the placeholder specification used until an Arbitrum bootstrap source resolves
+/// the actual chain state. ArbOS genesis must come from `--arb-chain-config`, an Orbit
+/// `--chain-info`/`--genesis` pair, or `--snapshot-head`; a generic Ethereum genesis does not
+/// contain the ArbOS system state this node requires.
+#[derive(Debug, Clone, Default)]
+pub struct ArbChainSpecParser;
 
-    /// Enable the `eth_*` JSON-RPC HTTP server.
-    #[arg(long = "http")]
-    http: bool,
+impl ChainSpecParser for ArbChainSpecParser {
+    type ChainSpec = ChainSpec;
 
-    /// HTTP-RPC server bind address.
-    #[arg(long = "http.addr", default_value = "127.0.0.1")]
-    http_addr: IpAddr,
+    const SUPPORTED_CHAINS: &'static [&'static str] = &["arb-one"];
 
-    /// HTTP-RPC server port.
-    #[arg(long = "http.port", default_value_t = 8545)]
-    http_port: u16,
+    fn parse(value: &str) -> eyre::Result<Arc<Self::ChainSpec>> {
+        match value {
+            "arb-one" => Ok(MAINNET.clone()),
+            _ => Err(eyre::eyre!(
+                "unsupported Arbitrum chain spec; use --arb-chain-config, --chain-info with --genesis, or --snapshot-head"
+            )),
+        }
+    }
 
-    /// Enable the reth Prometheus endpoint at this address.
-    #[arg(long = "metrics", alias = "metrics.prometheus", value_name = "ADDR")]
-    metrics: Option<SocketAddr>,
+    fn help_message() -> String {
+        "Reth chain-spec identity for this standalone Arbitrum node.\n\
+         \n\
+         `arb-one` is the only built-in placeholder. Supply ArbOS state separately with \
+         `--arb-chain-config`, `--chain-info` plus `--genesis`, or `--snapshot-head`.\n\
+         \n\
+         Built-in chains:\n    arb-one"
+            .to_owned()
+    }
+}
 
-    /// Engine-tree persistence threshold: persist once the canonical tip is this many blocks
-    /// ahead of the last persisted block (larger = bigger, less frequent commit batches).
-    #[arg(long, default_value_t = 2)]
-    persistence_threshold: u64,
-
-    /// Engine-tree memory buffer target: keep this many recent blocks in memory before flushing.
-    #[arg(long = "memory-buffer-target", default_value_t = 0)]
-    memory_buffer_target: u64,
-
-    /// Engine-tree backpressure threshold: stall block production once this many blocks are
-    /// unpersisted (bounds memory; larger = production runs further ahead of the disk).
-    #[arg(long = "persistence-backpressure", default_value_t = 16)]
-    persistence_backpressure: u64,
-
-    /// Size in MiB of reth's cross-block account, storage, and bytecode cache.
+/// Arbitrum-specific arguments appended to Reth's native [`NodeCommand`].
+///
+/// Generic node concerns such as the datadir, RPC, metrics, database durability, pruning, and
+/// engine-tree tuning deliberately live in Reth's command. This type only describes the inputs
+/// that cannot exist on an L1 node.
+#[derive(Debug, Args)]
+pub struct ArbNodeArgs {
+    /// Compatibility alias for `--db.sync-mode safe-no-sync`.
     ///
-    /// The Arbitrum default is 256 MiB. Reth's generic TreeConfig default is 4 GiB, which makes
-    /// its fixed-cache tables needlessly sparse for this serial producer.
-    #[arg(long = "engine.cross-block-cache-size", default_value_t = 256, value_name = "MiB")]
-    execution_cache_size_mb: usize,
-
-    /// Share reth's cross-block execution cache with the serial native payload builder.
-    #[arg(
-        long = "share-execution-cache-with-payload-builder",
-        default_value_t = true,
-        action = clap::ArgAction::Set,
-    )]
-    share_execution_cache_with_payload_builder: bool,
-
-    /// Let the native payload builder use reth's sparse trie task to overlap state-root work
-    /// with ArbOS execution. Recommended for this serial Arbitrum producer on a multi-core host.
-    #[arg(
-        long = "share-sparse-trie-with-payload-builder",
-        default_value_t = false
-    )]
-    share_sparse_trie_with_payload_builder: bool,
-
-    /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
-    /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
-    /// child), but the OS flushes lazily, cutting ~50ms fsync latency off every block. Stays
-    /// crash-consistent (MDBX rolls back to the last synced meta page on restart); the only loss
-    /// on a crash is a suffix of recently-produced blocks, which the L1 derivation re-produces.
-    /// Not for a node expected to be durable across power loss without re-sync.
+    /// New invocations should use Reth's database flag directly. Keeping this temporarily avoids
+    /// breaking existing operator scripts while the CLI migrates.
     #[arg(long = "no-fsync", default_value_t = false)]
     no_fsync: bool,
 
     /// Arbitrum execution chain id used by the block driver.
     #[arg(long, default_value_t = ARB_ONE_CHAIN_ID)]
     chain_id: u64,
-
-    /// Path to an Arbitrum chain-config JSON file (the `ChainConfig` Go format:
-    /// `{"chainId":..., "arbitrum":{...}}`). When provided, the node boots with a
-    /// real ArbOS genesis allocation instead of the mainnet placeholder.
-    #[arg(long = "chain", value_name = "PATH")]
-    chain_config: Option<PathBuf>,
 
     /// Path to a Nitro `chaininfo.json` (array of chains: chain-id, parent-chain-id, chain-config,
     /// and the rollup deployment addresses). With `--genesis`, boots an Orbit chain end to end: the
@@ -147,7 +113,15 @@ pub struct NodeArgs {
     #[arg(long = "genesis", value_name = "PATH")]
     genesis_json: Option<PathBuf>,
 
-    /// Initial L1 base fee (wei) baked into the ArbOS genesis when booting from --chain.
+    /// Path to an Arbitrum chain-config JSON file (the Go `ChainConfig` format).
+    ///
+    /// This replaced the old `--chain` meaning. `--chain` is now the native Reth chain-spec
+    /// argument, while this flag specifically requests ArbOS genesis construction.
+    #[arg(long = "arb-chain-config", alias = "chain-config", value_name = "PATH")]
+    chain_config: Option<PathBuf>,
+
+    /// Initial L1 base fee (wei) baked into the ArbOS genesis when booting from
+    /// `--arb-chain-config`.
     /// Defaults to Nitro's `DefaultInitialL1BaseFee` of 50 GWei. This value is part of the
     /// genesis state, so a chain created with a different initial base fee (a nitro-testnode
     /// commonly uses a tiny value) needs this set to reproduce its genesis root.
@@ -255,21 +229,10 @@ pub struct NodeArgs {
     /// Boot on a snapshot-imported datadir: path to the `reth-export --mode blocks` head stream
     /// (`H <num> <hash> <headerRLP>`). The node builds its chain spec from that head header so the
     /// genesis-hash check accepts the imported DB, and resumes from the snapshot's head block.
-    /// Use with `--datadir <imported-dir>` (do not pass `--chain`).
+    /// Use with `--datadir <imported-dir>`; no separate Reth chain spec is needed.
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: Option<PathBuf>,
 
-    /// History-pruning / full-node configuration: reth's standard `--full` and granular
-    /// `--prune.*` flags (e.g. `--prune.account-history.distance <BLOCKS>`,
-    /// `--prune.storage-history.distance <BLOCKS>`, `--prune.receipts.distance <BLOCKS>`,
-    /// `--prune.transaction-lookup.full`, `--prune.sender-recovery.full`).
-    ///
-    /// With none of these set the node stays a full archive (keeps all state history). When any is
-    /// set, the engine-tree persistence service runs reth's pruner after each commit batch, dropping
-    /// the configured segments older than the requested window. `--full` applies reth's full-node
-    /// preset (keep only the most recent unwind-safe distance of account/storage history + receipts).
-    #[command(flatten)]
-    pruning: PruningArgs,
 }
 
 /// The L1 rollup deployment arb-reth reads from: the contract addresses plus the L1 block the
@@ -296,7 +259,7 @@ struct RollupDeployment {
 ///   genesis default to a fresh chain (block 0), not Arbitrum One's heights. Either can still be
 ///   overridden explicitly.
 /// - Exactly one set: rejected, rather than pairing a custom address with an Arbitrum One one.
-fn resolve_rollup_deployment(args: &NodeArgs) -> eyre::Result<RollupDeployment> {
+fn resolve_rollup_deployment(args: &ArbNodeArgs) -> eyre::Result<RollupDeployment> {
     match (args.l1_sequencer_inbox, args.l1_bridge) {
         (None, None) => Ok(RollupDeployment {
             sequencer_inbox: arb_reth_l1::SEQUENCER_INBOX_MAINNET,
@@ -362,8 +325,22 @@ async fn derive_genesis_from_l1(
     Ok((spec, chain_id))
 }
 
-pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
-    let task_executor = ctx.task_executor;
+struct NodeBootstrap {
+    chain_spec: Arc<ChainSpec>,
+    chain_id: u64,
+    rollup: RollupDeployment,
+    snapshot_delayed: Option<u64>,
+}
+
+/// Resolve Arbitrum's state-derived chain specification before Reth opens the database.
+///
+/// Reth's native node command owns generic configuration and database setup. Arbitrum's chain
+/// specification is different: a snapshot header, Nitro genesis, or the L1 Initialize message
+/// can be the source of truth, so it has to be resolved before handing the command to Reth.
+async fn resolve_bootstrap(
+    args: &ArbNodeArgs,
+    fallback_chain_spec: Arc<ChainSpec>,
+) -> eyre::Result<NodeBootstrap> {
 
     // --chain-info boots an Orbit chain. Highest precedence; supplies BOTH the chain spec and the
     // rollup deployment (L1 addresses). With --genesis the chain spec + prealloc come from the
@@ -403,13 +380,12 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             deployed_at: info.rollup.deployed_at,
             l2_genesis_block: init.genesis_block_number,
         },
-        None => resolve_rollup_deployment(&args)?,
+        None => resolve_rollup_deployment(args)?,
     };
 
     // --snapshot-head: boot on an imported snapshot DB by building the chain spec from its head
-    // header (so reth's genesis-hash check accepts the DB). Takes precedence over --chain.
-    // When --chain is provided the chain id is derived from the JSON so eth_chainId and the
-    // driver agree. When not provided, the mainnet placeholder is used with --chain-id.
+    // header (so reth's genesis-hash check accepts the DB). It takes precedence over the
+    // `arb-one` placeholder spec. The header anchors both eth_chainId and the driver.
     // `snapshot_delayed` carries the L2 tip's `delayedMessagesRead` (the header nonce) so the
     // L1-sync delayed cursor defaults to it without a manual flag.
     let mut snapshot_delayed: Option<u64> = None;
@@ -477,17 +453,122 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 );
                 (spec, cid)
             }
-            None => (MAINNET.clone(), args.chain_id),
+            None => (fallback_chain_spec, args.chain_id),
         },
     };
 
-    // Resolve the pruning configuration from the `--prune.*` / `--full` flags before `chain_spec` is
-    // moved into the node config (the prune modes for `--full`/pre-merge presets are keyed off the
-    // chain's hardfork activations). `prune_config` returns `None` when no pruning flag is set, which
-    // keeps the node a full archive. The launcher passes the resulting config to both reth's
-    // provider factory and its pruner: the provider needs the modes while writing static files,
-    // while the pruner needs them when retiring old history.
-    let prune_config = args.pruning.prune_config(chain_spec.as_ref());
+    Ok(NodeBootstrap {
+        chain_spec,
+        chain_id: effective_chain_id,
+        rollup,
+        snapshot_delayed,
+    })
+}
+
+/// Launch the native Reth node command with Arbitrum's derived chain state.
+pub async fn run(
+    ctx: CliContext,
+    mut command: NodeCommand<ArbChainSpecParser, ArbNodeArgs>,
+) -> eyre::Result<()> {
+    validate_standalone_components(&command)?;
+
+    if command.ext.no_fsync {
+        match command.db.sync_mode {
+            Some(SyncMode::SafeNoSync) | None => {
+                command.db.sync_mode = Some(SyncMode::SafeNoSync);
+            }
+            Some(mode) => {
+                return Err(eyre::eyre!(
+                    "--no-fsync conflicts with --db.sync-mode {mode:?}; use one durability mode"
+                ));
+            }
+        }
+    }
+
+    let bootstrap = resolve_bootstrap(&command.ext, command.chain.clone()).await?;
+    command.chain = bootstrap.chain_spec.clone();
+
+    command
+        .execute(
+            ctx,
+            FnLauncher::new::<ArbChainSpecParser, ArbNodeArgs>(move |builder, args| async move {
+                launch(builder, args, bootstrap).await
+            }),
+        )
+        .await
+}
+
+/// Reject native Reth option groups that have no component in this standalone topology.
+///
+/// `NodeCommand` owns the common node configuration, but Arbitrum derives blocks from L1/feed
+/// messages. It deliberately has no dev miner, devp2p network, transaction pool, generic payload
+/// builder, staged-pipeline debugger, ERA importer, or revmc-JIT wiring. Failing here is safer
+/// than accepting an option that the no-op component would ignore.
+fn validate_standalone_components(
+    command: &NodeCommand<ArbChainSpecParser, ArbNodeArgs>,
+) -> eyre::Result<()> {
+    if command.network != Default::default() {
+        return Err(eyre::eyre!(
+            "network options are unsupported: arb-reth derives Arbitrum messages from L1 and the sequencer feed, not devp2p"
+        ));
+    }
+    if command.txpool != Default::default() {
+        return Err(eyre::eyre!(
+            "txpool options are unsupported: the standalone node has no transaction pool"
+        ));
+    }
+    if command.builder != Default::default() {
+        return Err(eyre::eyre!(
+            "payload-builder options are unsupported: ArbOS messages are built by the Arbitrum engine driver"
+        ));
+    }
+    if command.debug != Default::default() {
+        return Err(eyre::eyre!(
+            "debug node options are unsupported by the standalone Arbitrum launcher"
+        ));
+    }
+    if command.dev != Default::default() {
+        return Err(eyre::eyre!(
+            "dev mode is unsupported: ArbOS blocks must be derived from Arbitrum messages"
+        ));
+    }
+    if command.era.enabled
+        || command.era.source.path.is_some()
+        || command.era.source.url.is_some()
+    {
+        return Err(eyre::eyre!(
+            "ERA import is unsupported: it imports Ethereum block bodies rather than deriving ArbOS blocks"
+        ));
+    }
+    if command.jit != Default::default() {
+        return Err(eyre::eyre!(
+            "--jit options are not wired to arb-revm yet"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn launch(
+    mut builder: WithLaunchContext<NodeBuilder<DatabaseEnv, ChainSpec>>,
+    args: ArbNodeArgs,
+    bootstrap: NodeBootstrap,
+) -> eyre::Result<()> {
+    let task_executor = builder.task_executor().clone();
+    let NodeBootstrap {
+        chain_id: effective_chain_id,
+        rollup,
+        snapshot_delayed,
+        ..
+    } = bootstrap;
+
+    // Resolve the pruning configuration from Reth's native `--prune.*` / `--full` arguments.
+    // It is passed both to the provider factory and the engine-tree pruner so static-file writes
+    // follow the same segment policy.
+    let prune_config = builder
+        .config()
+        .pruning
+        .prune_config(builder.config().chain.as_ref());
     match &prune_config {
         Some(pc) => info!(
             target: "arb-reth",
@@ -498,33 +579,10 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         ),
         None => info!(target: "arb-reth", "archive node (no pruning configured; keeping all history)"),
     }
-    let datadir_args = match args.datadir {
-        Some(path) => DatadirArgs {
-            datadir: MaybePlatformPath::<DataDirPath>::from(path),
-            ..Default::default()
-        },
-        None => DatadirArgs::default(),
-    };
-    let config = NodeConfig::new(chain_spec)
-        .with_datadir_args(datadir_args)
-        .with_metrics(MetricArgs {
-            prometheus: args.metrics,
-            ..Default::default()
-        });
-    let data_dir = config.datadir();
+    let data_dir = builder.config().datadir();
 
     // Resolve the L1-derivation resume log path before `data_dir` is moved into the launcher.
     let resume_checkpoint_path = L1ResumeLog::path_in(data_dir.data_dir());
-
-    let db_path = data_dir.db();
-    info!(target: "arb-reth", path = ?db_path, no_fsync = args.no_fsync, "opening database");
-    let mut db_args = DatabaseArguments::new(ClientVersion::default());
-    if args.no_fsync {
-        db_args = db_args.with_sync_mode(Some(SyncMode::SafeNoSync));
-    }
-    let db = init_db(db_path, db_args)?;
-
-    let node_builder = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
     // The held sender keeps the driver parked (and the node alive) until SIGTERM.
     let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
@@ -532,33 +590,32 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // still drive the same engine callback, but have no sample to record.
     let feed_latency = args.feed_url.as_ref().map(|_| FeedLatencyTracker::new());
 
-    let rpc_addr = args.http.then(|| (args.http_addr, args.http_port).into());
+    // Preserve the complete native tree configuration before `ArbNode` changes the builder's
+    // type-state to its custom no-op add-ons. The driver consumes this exact configuration below.
+    let tuning = crate::ArbEngineTuning::from_tree_config(builder.config().tree_config());
+
+    // ArbOS derives blocks internally, rather than receiving Engine API commands from a consensus
+    // client. Keep the native public RPC settings but never expose the unusable authenticated
+    // Engine API server.
+    builder.config_mut().rpc.disable_auth_server = true;
+    let node_builder = builder.node(ArbNode);
 
     let launcher = ArbLauncher {
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
         chain_id: effective_chain_id,
         genesis_block: rollup.l2_genesis_block,
-        tuning: crate::ArbEngineTuning {
-            persistence_threshold: args.persistence_threshold,
-            memory_block_buffer_target: args.memory_buffer_target,
-            persistence_backpressure_threshold: args.persistence_backpressure,
-            execution_cache_size: args.execution_cache_size_mb.saturating_mul(1024 * 1024),
-            share_execution_cache_with_payload_builder: args
-                .share_execution_cache_with_payload_builder,
-            share_sparse_trie_with_payload_builder: args.share_sparse_trie_with_payload_builder,
-        },
+        tuning,
         prune_config,
         messages: feed_rx,
         feed_latency: feed_latency.clone(),
-        rpc_addr,
     };
 
-    let handle = launcher.launch_node(node_builder).await?;
+    let handle = node_builder.launch_with(launcher).await?;
 
     match handle.http_url() {
         Some(url) => info!(target: "arb-reth", %url, "arb-reth node started; eth_* RPC serving"),
         None => {
-            info!(target: "arb-reth", "arb-reth node started (RPC disabled; pass --http to enable)")
+            info!(target: "arb-reth", "arb-reth node started (HTTP RPC disabled; pass --http to enable it)")
         }
     }
 
@@ -845,4 +902,93 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // Hold feed_tx alive so the driver parks on the channel rather than exiting.
     let _feed_tx = feed_tx;
     handle.wait_for_node_exit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{Parser, Subcommand};
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: TestCommand,
+    }
+
+    #[derive(Debug, Subcommand)]
+    enum TestCommand {
+        Node(Box<NodeCommand<ArbChainSpecParser, ArbNodeArgs>>),
+    }
+
+    #[test]
+    fn native_node_arguments_and_arb_extension_parse_together() {
+        let TestCommand::Node(command) = TestCli::try_parse_from([
+            "arb-reth",
+            "node",
+            "--datadir",
+            "/tmp/arb-reth-node",
+            "--metrics",
+            "127.0.0.1:9001",
+            "--http",
+            "--http.port",
+            "8547",
+            "--ws",
+            "--ws.port",
+            "8548",
+            "--db.sync-mode",
+            "safe-no-sync",
+            "--engine.persistence-threshold",
+            "128",
+            "--engine.memory-block-buffer-target",
+            "64",
+            "--engine.persistence-backpressure-threshold",
+            "512",
+            "--full",
+            "--arb-chain-config",
+            "/tmp/chain-config.json",
+            "--feed-url",
+            "wss://feed.example",
+        ])
+        .expect("native and Arbitrum arguments should parse")
+        .command;
+
+        assert_eq!(command.engine.persistence_threshold, 128);
+        assert_eq!(command.engine.memory_block_buffer_target, 64);
+        assert_eq!(command.engine.persistence_backpressure_threshold(), 512);
+        assert_eq!(command.db.sync_mode, Some(SyncMode::SafeNoSync));
+        assert!(command.pruning.full);
+        assert_eq!(
+            command.ext.chain_config,
+            Some(PathBuf::from("/tmp/chain-config.json"))
+        );
+        assert_eq!(command.ext.feed_url.as_deref(), Some("wss://feed.example"));
+    }
+
+    #[test]
+    fn generic_genesis_does_not_replace_arbos_bootstrap() {
+        let err = TestCli::try_parse_from([
+            "arb-reth",
+            "node",
+            "--chain",
+            "/tmp/ethereum-genesis.json",
+        ])
+        .expect_err("a generic Ethereum genesis is not an ArbOS bootstrap input");
+
+        assert!(err.to_string().contains("unsupported Arbitrum chain spec"));
+    }
+
+    #[test]
+    fn noop_component_options_are_rejected() {
+        let TestCommand::Node(command) = TestCli::try_parse_from([
+            "arb-reth",
+            "node",
+            "--disable-discovery",
+        ])
+        .expect("the native parser should accept its standard flag")
+        .command;
+
+        let err = validate_standalone_components(&command)
+            .expect_err("a no-op network setting must not be silently accepted");
+        assert!(err.to_string().contains("network options are unsupported"));
+    }
 }

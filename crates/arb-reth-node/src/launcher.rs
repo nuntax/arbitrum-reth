@@ -10,7 +10,6 @@
 //! Deadlock rule: never hold a read provider across a `provider_rw()`/`save_blocks()` call.
 
 use core::{future::Future, pin::Pin};
-use std::net::SocketAddr;
 
 use crate::metrics::FeedLatencyTracker;
 use alloy_consensus::Header;
@@ -20,11 +19,12 @@ use eyre::eyre;
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
-use reth_node_api::{AddOnsContext, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter};
+use reth_node_api::{AddOnsContext, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter};
 use reth_node_builder::hooks::NodeHooks;
 use reth_node_builder::{
-    AddOns, LaunchContext, LaunchNode, Node, NodeBuilderWithComponents, NodeComponents,
-    NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter,
+    AddOns, LaunchContext, LaunchNode, Node, NodeAdapter, NodeBuilderWithComponents,
+    NodeComponents, NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter,
+    rpc::RethRpcAddOns,
 };
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
@@ -70,7 +70,7 @@ impl<P> ArbNodeHandle<P> {
     }
 }
 
-/// A custom `LaunchNode` for the no-engine Arbitrum node.
+/// A custom `LaunchNode` for the self-driven Arbitrum node.
 ///
 /// Reuses reth's `LaunchContext` type-state chain for DB/provider/blockchain-db/task
 /// infrastructure but skips the sync pipeline and consensus-engine orchestrator. Spawns
@@ -97,11 +97,9 @@ pub struct ArbLauncher {
     /// Correlates live WebSocket feed messages with canonical in-memory state for Prometheus.
     /// `None` keeps replay and L1-only operation free of feed-latency instrumentation.
     pub feed_latency: Option<FeedLatencyTracker>,
-    /// Optional HTTP bind address for the `eth_*` RPC server (`None` disables RPC).
-    pub rpc_addr: Option<SocketAddr>,
 }
 
-impl<N, DB, T, CB> LaunchNode<NodeBuilderWithComponents<T, CB, ()>> for ArbLauncher
+impl<N, DB, T, CB, AO> LaunchNode<NodeBuilderWithComponents<T, CB, AO>> for ArbLauncher
 where
     N: Node<RethFullAdapter<DB, N>>
         + NodeTypesForProvider
@@ -119,6 +117,7 @@ where
             DB = DB,
         >,
     CB: NodeComponentsBuilder<T> + 'static,
+    AO: RethRpcAddOns<NodeAdapter<T, CB::Components>> + 'static,
     <CB::Components as NodeComponents<T>>::Evm:
         ConfigureEvm<Primitives = ArbPrimitives> + Into<arb_reth_evm::ArbEvmConfig> + Clone,
     CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
@@ -155,7 +154,7 @@ where
     type Node = ArbNodeHandle<BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>>;
     type Future = Pin<Box<dyn Future<Output = eyre::Result<Self::Node>> + Send>>;
 
-    fn launch_node(self, target: NodeBuilderWithComponents<T, CB, ()>) -> Self::Future {
+    fn launch_node(self, target: NodeBuilderWithComponents<T, CB, AO>) -> Self::Future {
         Box::pin(self.launch_impl(target))
     }
 }
@@ -163,9 +162,9 @@ where
 impl ArbLauncher {
     /// Core async launch body. Separated from `launch_node` so it can be `async fn`
     /// (the trait requires a boxed future; `launch_node` boxes it).
-    async fn launch_impl<N, DB, T, CB>(
+    async fn launch_impl<N, DB, T, CB, AO>(
         self,
-        target: NodeBuilderWithComponents<T, CB, ()>,
+        target: NodeBuilderWithComponents<T, CB, AO>,
     ) -> eyre::Result<ArbNodeHandle<BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>>>
     where
         N: Node<RethFullAdapter<DB, N>>
@@ -184,6 +183,7 @@ impl ArbLauncher {
                 DB = DB,
             >,
         CB: NodeComponentsBuilder<T> + 'static,
+        AO: RethRpcAddOns<NodeAdapter<T, CB::Components>> + 'static,
         <CB::Components as NodeComponents<T>>::Evm:
             ConfigureEvm<Primitives = ArbPrimitives> + Into<arb_reth_evm::ArbEvmConfig> + Clone,
         CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
@@ -200,7 +200,6 @@ impl ArbLauncher {
             prune_config,
             messages,
             feed_latency,
-            rpc_addr,
         } = self;
 
         let NodeBuilderWithComponents {
@@ -211,7 +210,7 @@ impl ArbLauncher {
                 AddOns {
                     hooks,
                     exexs: _,
-                    add_ons: _,
+                    add_ons,
                 },
             config,
         } = target;
@@ -220,21 +219,10 @@ impl ArbLauncher {
             ..
         } = hooks;
 
-        // Drive RPC config from the explicit `rpc_addr`: canonical `RpcAddOns` reads addresses from
-        // `NodeConfig.rpc`, not an arg. Enable http+ws with the full module fleet; this node is
-        // self-driven from L1 derivation, so the auth/engine server is disabled.
+        // The native command owns public RPC configuration. This node is self-driven from L1
+        // derivation, so its authenticated Engine API server must always stay disabled.
         let mut config = config;
-        if let Some(addr) = rpc_addr {
-            config.rpc.http = true;
-            config.rpc.http_addr = addr.ip();
-            config.rpc.http_port = addr.port();
-            config.rpc.http_api = Some(reth_rpc_server_types::RpcModuleSelection::All);
-            config.rpc.ws = true;
-            config.rpc.ws_addr = addr.ip();
-            config.rpc.ws_port = addr.port();
-            config.rpc.ws_api = Some(reth_rpc_server_types::RpcModuleSelection::All);
-            config.rpc.disable_auth_server = true;
-        }
+        config.rpc.disable_auth_server = true;
 
         let changeset_cache = ChangesetCache::new();
         let disabled_stages = N::disabled_stages();
@@ -242,7 +230,15 @@ impl ArbLauncher {
         let ctx = ctx
             .with_configured_globals(0)
             .with_loaded_toml_config(config)?
-            .attach(database.clone())
+            .attach(database.clone());
+
+        // TOML is intentionally allowed to configure the public Reth RPC servers, but this
+        // standalone node has no beacon-engine service to back an authenticated Engine API.
+        // Apply this after TOML merging so no config file can inadvertently expose it.
+        let mut ctx = ctx;
+        ctx.node_config_mut().rpc.disable_auth_server = true;
+
+        let ctx = ctx
             .with_adjusted_configs()
             .with_provider_factory::<NodeTypesWithDBAdapter<N, DB>, <CB::Components as NodeComponents<T>>::Evm>(
                 changeset_cache.clone(),
@@ -283,6 +279,9 @@ impl ArbLauncher {
             })?
             .with_components(components_builder, on_component_initialized)
             .await?;
+
+        let rpc = &ctx.node_config().rpc;
+        let rpc_enabled = rpc.http || rpc.ws || !rpc.ipcdisable;
 
         let provider: BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> =
             ctx.node_adapter().provider.clone();
@@ -420,7 +419,7 @@ impl ArbLauncher {
         // from L1 derivation, so the beacon-engine handle is a stub (dangling receiver: engine_*
         // calls would return `EngineUnavailable`), and the auth/engine server is disabled, so
         // nothing ever reaches it.
-        let rpc_handle = if rpc_addr.is_some() {
+        let rpc_handle = if rpc_enabled {
             let (engine_tx, _engine_rx) = tokio::sync::mpsc::unbounded_channel();
             let beacon_engine_handle =
                 reth_engine_primitives::ConsensusEngineHandle::new(engine_tx);
@@ -431,9 +430,7 @@ impl ArbLauncher {
                 engine_events: reth_tokio_util::EventSender::default(),
                 jwt_secret: ctx.auth_jwt_secret()?,
             };
-            let handle = crate::addons::arb_add_ons()
-                .launch_add_ons(add_ons_ctx)
-                .await?;
+            let handle = add_ons.launch_add_ons(add_ons_ctx).await?;
             Some(handle.rpc_server_handles.rpc)
         } else {
             None
@@ -524,7 +521,6 @@ mod tests {
             prune_config: Some(prune_config),
             messages: rx,
             feed_latency: None,
-            rpc_addr: None,
         };
 
         let handle = launcher
@@ -620,18 +616,18 @@ mod tests {
             ctx: LaunchContext::new(task_executor, data_dir),
             chain_id: crate::ARB_ONE_CHAIN_ID,
             genesis_block: 0,
-            tuning: ArbEngineTuning {
-                persistence_threshold: 128,
-                memory_block_buffer_target: 0,
-                persistence_backpressure_threshold: 512,
-                execution_cache_size: 256 * 1024 * 1024,
-                share_execution_cache_with_payload_builder: true,
-                share_sparse_trie_with_payload_builder: false,
-            },
+            tuning: ArbEngineTuning::from_tree_config(
+                reth_engine_primitives::TreeConfig::default()
+                    .with_persistence_backpressure_threshold(512)
+                    .with_persistence_threshold(128)
+                    .with_memory_block_buffer_target(0)
+                    .with_cross_block_cache_size(256 * 1024 * 1024)
+                    .with_share_execution_cache_with_payload_builder(true)
+                    .with_share_sparse_trie_with_payload_builder(false),
+            ),
             prune_config: None,
             messages: rx,
             feed_latency: None,
-            rpc_addr: None,
         };
         let handle = launcher
             .launch_node(node_builder_with_components)
