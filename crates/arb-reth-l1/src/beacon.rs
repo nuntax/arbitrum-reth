@@ -91,7 +91,7 @@ impl BeaconClient {
             }
             tracing::warn!(
                 target: "arb-reth::l1-beacon",
-                slot, attempt, backoff_ms = backoff.as_millis() as u64, err = %last,
+                slot, attempt, backoff_ms = backoff.as_millis() as u64,
                 "transient beacon error, retrying blob sidecars",
             );
             tokio::time::sleep(backoff).await;

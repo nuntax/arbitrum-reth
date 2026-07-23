@@ -45,7 +45,7 @@ pub use persist::persist_executed_block;
 
 // The L1-derivation catch-up runtime and its resume-checkpoint log now live in the
 // `arb-reth-sync` crate; re-export for API stability.
-pub use arb_reth_sync::l1_sync::{run_l1_sync, L1SyncConfig};
+pub use arb_reth_sync::l1_sync::{run_l1_sync, supervise_l1_sync, L1SyncConfig};
 pub use arb_reth_sync::resume::{L1ResumeCheckpoint, L1ResumeLog};
 
 pub mod launcher;
