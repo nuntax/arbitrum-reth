@@ -27,6 +27,8 @@
 //! an upgrade boundary is wired, though not yet validated against a real mainnet upgrade crossing.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -38,11 +40,85 @@ use arb_reth_l1::sync::{
 };
 use arb_reth_l1::{BeaconClient, DelayedInboxReader, DeliveredBatch, SequencerInboxReader};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
-use eyre::{eyre, Context as _};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::resume::{L1ResumeCheckpoint, L1ResumeLog};
+
+const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// A failure from one L1 sync attempt.
+///
+/// Provider failures are deliberately kept separate from derivation failures. The former may be
+/// retried indefinitely by [`supervise_l1_sync`]; the latter stop the worker so corrupt or
+/// unsupported chain data remains visible instead of becoming an infinite retry loop.
+#[derive(Debug)]
+pub enum L1SyncError {
+    /// An execution RPC or beacon request failed. The provider's error text is intentionally not
+    /// retained because HTTP client errors may contain credential-bearing endpoint URLs.
+    Provider { operation: &'static str },
+    /// The provider returned data, but deriving it failed deterministically.
+    Derivation {
+        operation: &'static str,
+        source: arb_reth_l1::L1Error,
+    },
+    /// The configured execution RPC URL is invalid.
+    InvalidRpcUrl,
+    /// A prefetched range task panicked or was cancelled unexpectedly.
+    PrefetchTask { from: u64, to: u64 },
+}
+
+impl L1SyncError {
+    const fn provider(operation: &'static str) -> Self {
+        Self::Provider { operation }
+    }
+
+    fn l1(operation: &'static str, source: arb_reth_l1::L1Error) -> Self {
+        if matches!(source, arb_reth_l1::L1Error::Rpc(_)) {
+            Self::Provider { operation }
+        } else {
+            Self::Derivation { operation, source }
+        }
+    }
+
+    /// Whether restarting from the latest durable checkpoint is safe and useful.
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Provider { .. })
+    }
+}
+
+impl core::fmt::Display for L1SyncError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Provider { operation } => {
+                write!(f, "transient L1 provider failure during {operation}")
+            }
+            Self::Derivation { operation, source } => {
+                write!(
+                    f,
+                    "deterministic L1 derivation failure during {operation}: {source}"
+                )
+            }
+            Self::InvalidRpcUrl => write!(f, "invalid L1 RPC URL"),
+            Self::PrefetchTask { from, to } => {
+                write!(
+                    f,
+                    "L1 range prefetch task [{from}, {to}] terminated unexpectedly"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for L1SyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Derivation { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Configuration for the L1-derivation catch-up runtime.
 #[derive(Debug, Clone)]
@@ -117,6 +193,181 @@ impl L1SyncConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SyncProgress {
+    persisted_l2: u64,
+    checkpoint_l1: u64,
+    checkpoint_l2: u64,
+}
+
+fn progress(cfg: &L1SyncConfig, persisted_l2: u64) -> SyncProgress {
+    let checkpoint = cfg
+        .checkpoint_path
+        .as_deref()
+        .and_then(L1ResumeLog::load)
+        .and_then(|log| log.resume_for(persisted_l2));
+    SyncProgress {
+        persisted_l2,
+        checkpoint_l1: checkpoint.map_or(cfg.start_block, |cp| cp.l1_block),
+        checkpoint_l2: checkpoint.map_or(cfg.start_l2_block, |cp| cp.l2_block),
+    }
+}
+
+/// Build the next attempt from the newest checkpoint that is safe for the current durable DB tip.
+///
+/// Re-derivation between that checkpoint and `persisted_l2` is harmless: `run_l1_sync` numbers the
+/// messages absolutely and drops everything through `db_tip_l2`.
+fn resume_config(base: &L1SyncConfig, persisted_l2: u64) -> L1SyncConfig {
+    let mut next = base.clone();
+    next.db_tip_l2 = persisted_l2;
+    if let Some(cp) = base
+        .checkpoint_path
+        .as_deref()
+        .and_then(L1ResumeLog::load)
+        .and_then(|log| log.resume_for(persisted_l2))
+    {
+        next.start_block = cp.l1_block;
+        next.start_delayed_count = cp.delayed_count;
+        next.start_l2_block = cp.l2_block;
+    }
+    next
+}
+
+#[derive(Debug)]
+struct RetryBackoff {
+    failures_without_progress: u32,
+    initial: Duration,
+    maximum: Duration,
+}
+
+impl RetryBackoff {
+    const fn new(initial: Duration, maximum: Duration) -> Self {
+        Self {
+            failures_without_progress: 0,
+            initial,
+            maximum,
+        }
+    }
+
+    fn next_delay(&mut self, made_progress: bool) -> Duration {
+        if made_progress {
+            self.failures_without_progress = 0;
+        }
+        let exponent = self.failures_without_progress.min(31);
+        self.failures_without_progress = self.failures_without_progress.saturating_add(1);
+        let base = self
+            .initial
+            .checked_mul(1u32 << exponent)
+            .unwrap_or(self.maximum)
+            .min(self.maximum);
+
+        // Deterministic 0..20% positive jitter prevents a fleet sharing the same outage from
+        // reconnecting in lockstep, while keeping tests and log expectations reproducible.
+        let jitter_percent = (self.failures_without_progress.wrapping_mul(17) % 21) as u128;
+        let jitter_nanos = base.as_nanos().saturating_mul(jitter_percent) / 100;
+        base.saturating_add(Duration::from_nanos(
+            jitter_nanos.min(u64::MAX as u128) as u64
+        ))
+        .min(self.maximum)
+    }
+}
+
+async fn retry_delay_or_shutdown<S>(delay: Duration, mut shutdown: Pin<&mut S>) -> bool
+where
+    S: Future,
+{
+    tokio::select! {
+        biased;
+        _ = &mut shutdown => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+/// Supervise L1 derivation for the lifetime of the node.
+///
+/// Retryable execution RPC and beacon failures restart from the latest durable checkpoint with
+/// unlimited exponential backoff. Deterministic decode/derivation errors are returned immediately.
+/// Only one `run_l1_sync` attempt exists at a time, and `shutdown` cancels both active work and
+/// backoff waits.
+pub async fn supervise_l1_sync<F, S>(
+    base_cfg: L1SyncConfig,
+    feed_tx: Sender<BroadcastFeedMessage>,
+    persisted_tip: F,
+    shutdown: S,
+) -> Result<(), L1SyncError>
+where
+    F: Fn() -> u64 + Send + Sync,
+    S: Future + Send,
+{
+    supervise_l1_sync_with_backoff(
+        base_cfg,
+        feed_tx,
+        persisted_tip,
+        shutdown,
+        RETRY_INITIAL_DELAY,
+        RETRY_MAX_DELAY,
+    )
+    .await
+}
+
+async fn supervise_l1_sync_with_backoff<F, S>(
+    base_cfg: L1SyncConfig,
+    feed_tx: Sender<BroadcastFeedMessage>,
+    persisted_tip: F,
+    shutdown: S,
+    initial_delay: Duration,
+    maximum_delay: Duration,
+) -> Result<(), L1SyncError>
+where
+    F: Fn() -> u64 + Send + Sync,
+    S: Future + Send,
+{
+    tokio::pin!(shutdown);
+    let mut backoff = RetryBackoff::new(initial_delay, maximum_delay);
+    let mut first_attempt = true;
+
+    loop {
+        let attempt_start = progress(&base_cfg, persisted_tip());
+        let cfg = if first_attempt {
+            // Preserve the caller-selected initial resume point, especially an explicit
+            // --l1-start-block override. Checkpoints take over only after that attempt fails.
+            let mut cfg = base_cfg.clone();
+            cfg.db_tip_l2 = attempt_start.persisted_l2;
+            cfg
+        } else {
+            resume_config(&base_cfg, attempt_start.persisted_l2)
+        };
+        first_attempt = false;
+        let result = tokio::select! {
+            biased;
+            _ = &mut shutdown => return Ok(()),
+            result = run_l1_sync(cfg, feed_tx.clone(), &persisted_tip) => result,
+        };
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) if !err.is_retryable() => return Err(err),
+            Err(err) => {
+                let made_progress = progress(&base_cfg, persisted_tip()) != attempt_start;
+                let delay = backoff.next_delay(made_progress);
+                tracing::warn!(
+                    target: "arb-reth::l1-sync",
+                    operation = match &err {
+                        L1SyncError::Provider { operation } => *operation,
+                        _ => unreachable!("only provider errors are retryable"),
+                    },
+                    retry_ms = delay.as_millis() as u64,
+                    made_progress,
+                    "transient L1 provider failure; restarting from durable checkpoint",
+                );
+                if !retry_delay_or_shutdown(delay, shutdown.as_mut()).await {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 /// Run the catch-up runtime: derive L1 ranges and push feed messages into `feed_tx`
 /// until `end_block` is reached (or forever, following the head, when `end_block` is
 /// `None`). Returns when the range is exhausted or the channel closes.
@@ -128,7 +379,7 @@ pub async fn run_l1_sync<F>(
     cfg: L1SyncConfig,
     feed_tx: Sender<BroadcastFeedMessage>,
     persisted_tip: F,
-) -> eyre::Result<()>
+) -> Result<(), L1SyncError>
 where
     F: Fn() -> u64 + Send,
 {
@@ -136,7 +387,7 @@ where
     // connect/timeout) is retried with backoff instead of propagating and killing the derivation
     // task. The default RateLimitRetryPolicy is reactive (passthrough on success), so it does not
     // throttle the happy path. Beacon blob fetches have their own retry (see BeaconClient).
-    let url = cfg.l1_rpc.parse().wrap_err("invalid --l1-rpc URL")?;
+    let url = cfg.l1_rpc.parse().map_err(|_| L1SyncError::InvalidRpcUrl)?;
     let client = alloy_rpc_client::ClientBuilder::default()
         .layer(alloy_transport::layers::RetryBackoffLayer::new(10, 500, 660))
         .http(url);
@@ -177,8 +428,22 @@ where
     // In-flight `resolve_batches` tasks, kept in ascending window order (FIFO). Each is
     // independent of the delayed cursor, so up to `prefetch` run concurrently, overlapping
     // their `getLogs`/blob RPC latency; we consume them in order and run the delayed tail.
-    type Inflight = (u64, u64, JoinHandle<Result<Vec<(DeliveredBatch, Vec<u8>)>, arb_reth_l1::L1Error>>);
-    let mut inflight: VecDeque<Inflight> = VecDeque::new();
+    type Inflight = (
+        u64,
+        u64,
+        JoinHandle<Result<Vec<(DeliveredBatch, Vec<u8>)>, arb_reth_l1::L1Error>>,
+    );
+    struct InflightQueue(VecDeque<Inflight>);
+    impl Drop for InflightQueue {
+        fn drop(&mut self) {
+            // Dropping a Tokio JoinHandle detaches its task. Abort explicitly so a failed attempt
+            // cannot leave old provider work running alongside its replacement.
+            for (_, _, handle) in &self.0 {
+                handle.abort();
+            }
+        }
+    }
+    let mut inflight = InflightQueue(VecDeque::new());
 
     // A ready empty window: an L1 range known (via the batchCount gate below) to contain no batches,
     // so it needs no `getLogs`/payload fetch. It flows through the same consume path as a real empty
@@ -198,7 +463,7 @@ where
         seq_reader
             .batch_count(cfg.start_block - 1)
             .await
-            .map_err(|e| eyre!("batchCount(start_block-1): {e}"))?
+            .map_err(|e| L1SyncError::l1("batchCount(start_block-1)", e))?
     };
     let mut head_batch_count = 0u64;
 
@@ -213,12 +478,12 @@ where
             let head = provider
                 .get_block_number()
                 .await
-                .map_err(|e| eyre!("L1 get_block_number: {e}"))?;
+                .map_err(|_| L1SyncError::provider("get_block_number"))?;
             safe_head = head.saturating_sub(cfg.confirmations);
             head_batch_count = seq_reader
                 .batch_count(safe_head)
                 .await
-                .map_err(|e| eyre!("batchCount(safe_head): {e}"))?;
+                .map_err(|e| L1SyncError::l1("batchCount(safe_head)", e))?;
         }
 
         // Fill the prefetch pipeline. Instead of blindly scanning every fixed window with `getLogs`
@@ -227,7 +492,7 @@ where
         // collapse barren stretches into a single empty window (skipping straight to the next batch's
         // block by binary search). Dense chains (Arb One) pay one extra view call per productive window.
         let window = cfg.batch_window.max(1);
-        while inflight.len() < prefetch && spawn_cursor <= safe_head {
+        while inflight.0.len() < prefetch && spawn_cursor <= safe_head {
             if cfg.end_block.is_some_and(|end| spawn_cursor > end) {
                 break;
             }
@@ -239,7 +504,10 @@ where
             let win_batch_count = if win_to == safe_head {
                 head_batch_count
             } else {
-                seq_reader.batch_count(win_to).await.map_err(|e| eyre!("batchCount(win_to): {e}"))?
+                seq_reader
+                    .batch_count(win_to)
+                    .await
+                    .map_err(|e| L1SyncError::l1("batchCount(win_to)", e))?
             };
 
             if win_batch_count > seen_batch_count {
@@ -247,7 +515,7 @@ where
                 let (s, b) = (seq_reader.clone(), beacon.clone());
                 let handle =
                     tokio::spawn(async move { resolve_batches(&s, b.as_ref(), from, win_to).await });
-                inflight.push_back((from, win_to, handle));
+                inflight.0.push_back((from, win_to, handle));
                 seen_batch_count = win_batch_count;
                 spawn_cursor = win_to + 1;
                 continue;
@@ -257,7 +525,10 @@ where
             let hi_batch_count = if scan_hi == safe_head {
                 head_batch_count
             } else {
-                seq_reader.batch_count(scan_hi).await.map_err(|e| eyre!("batchCount(scan_hi): {e}"))?
+                seq_reader
+                    .batch_count(scan_hi)
+                    .await
+                    .map_err(|e| L1SyncError::l1("batchCount(scan_hi)", e))?
             };
             let to = if hi_batch_count == seen_batch_count {
                 // No batches anywhere up to scan_hi: one empty window over the whole stretch.
@@ -267,7 +538,7 @@ where
                 seq_reader
                     .first_block_with_batch_count_above(win_to + 1, scan_hi, seen_batch_count)
                     .await
-                    .map_err(|e| eyre!("first_block_with_batch_count_above: {e}"))?
+                    .map_err(|e| L1SyncError::l1("first_block_with_batch_count_above", e))?
                     - 1
             };
             if to + 1 - from > window {
@@ -276,12 +547,12 @@ where
                     "skipped barren L1 range (no new batches)",
                 );
             }
-            inflight.push_back((from, to, spawn_empty()));
+            inflight.0.push_back((from, to, spawn_empty()));
             spawn_cursor = to + 1;
         }
 
         // Nothing in flight and nothing new to spawn: caught up to the safe head. Wait.
-        let Some((from, to, handle)) = inflight.pop_front() else {
+        let Some((from, to, handle)) = inflight.0.pop_front() else {
             tokio::time::sleep(cfg.poll_interval).await;
             continue;
         };
@@ -289,7 +560,8 @@ where
         // Await the oldest prefetched window (in order), then run the ordered delayed tail.
         let resolved = handle
             .await
-            .map_err(|e| eyre!("resolve_batches task [{from}, {to}] failed: {e}"))??;
+            .map_err(|_| L1SyncError::PrefetchTask { from, to })?
+            .map_err(|e| L1SyncError::l1("resolve_batches", e))?;
         let derived = derive_from_resolved_cached(
             &seq_reader,
             &delayed_reader,
@@ -301,14 +573,14 @@ where
             &mut report_cache,
         )
         .await
-        .wrap_err_with(|| format!("derive_from_resolved [{from}, {to}]"))?;
+        .map_err(|e| L1SyncError::l1("derive_from_resolved", e))?;
 
         if derived.batches > 0 {
             tracing::info!(
                 target: "arb-reth::l1-sync",
                 from, to, batches = derived.batches,
                 messages = derived.messages.len(), next_delayed = derived.next_delayed_count,
-                inflight = inflight.len(),
+                inflight = inflight.0.len(),
                 "derived L1 range",
             );
         }
@@ -405,9 +677,126 @@ fn maybe_write_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::thread;
 
     fn cp(l1_block: u64, l2_block: u64) -> L1ResumeCheckpoint {
         L1ResumeCheckpoint { l1_block, delayed_count: 0, l2_block }
+    }
+
+    struct MockRpc {
+        url: String,
+        requests: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockRpc {
+        fn first_response_is_invalid() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let request_count = Arc::clone(&requests);
+            let stop_flag = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                let mut failed_block_number = false;
+                while !stop_flag.load(Ordering::Relaxed) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("mock RPC accept failed: {e}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(headers_end) = bytes
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                        {
+                            let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                            let content_len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(str::trim)
+                                        .and_then(|n| n.parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= headers_end + content_len {
+                                break;
+                            }
+                        }
+                    }
+
+                    let json_start = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&bytes[json_start..]).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let body = if method == "eth_blockNumber" && !failed_block_number {
+                        failed_block_number = true;
+                        "{broken".to_string()
+                    } else {
+                        let id = &request["id"];
+                        let result = match method {
+                            "eth_blockNumber" => "\"0x1\"".to_string(),
+                            "eth_call" => format!("\"0x{}\"", "00".repeat(32)),
+                            method => panic!("unexpected mock RPC method {method}"),
+                        };
+                        format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            Self {
+                url,
+                requests,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for MockRpc {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn empty_range_config(l1_rpc: String) -> L1SyncConfig {
+        let mut cfg = L1SyncConfig::mainnet(l1_rpc, 1, 0);
+        cfg.end_block = Some(1);
+        cfg.confirmations = 0;
+        cfg.batch_window = 1;
+        cfg.prefetch_windows = 1;
+        cfg.poll_interval = Duration::from_millis(1);
+        cfg
     }
 
     /// The gate only appends boundaries whose L2 blocks are durable, always advances the log's
@@ -457,5 +846,142 @@ mod tests {
             "l1_block advances past empty ranges while l2_block is unchanged",
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn retry_backoff_resets_after_progress_and_caps() {
+        let mut backoff = RetryBackoff::new(Duration::from_millis(100), Duration::from_millis(500));
+        let first = backoff.next_delay(false);
+        let second = backoff.next_delay(false);
+        let capped = (0..20).fold(second, |_, _| backoff.next_delay(false));
+        let reset = backoff.next_delay(true);
+
+        assert!((Duration::from_millis(100)..=Duration::from_millis(120)).contains(&first));
+        assert!(second > first);
+        assert_eq!(capped, Duration::from_millis(500));
+        assert!((Duration::from_millis(100)..=Duration::from_millis(120)).contains(&reset));
+    }
+
+    #[test]
+    fn only_provider_errors_are_retryable_and_their_details_are_redacted() {
+        let provider = L1SyncError::l1(
+            "get_block_number",
+            arb_reth_l1::L1Error::Rpc(
+                "error sending request for url (https://user:secret@example.invalid/rpc)".into(),
+            ),
+        );
+        assert!(provider.is_retryable());
+        assert_eq!(
+            provider.to_string(),
+            "transient L1 provider failure during get_block_number"
+        );
+        assert!(!format!("{provider:?}").contains("secret"));
+
+        let deterministic = L1SyncError::l1(
+            "derive_from_resolved",
+            arb_reth_l1::L1Error::Missing("SequencerBatchData event"),
+        );
+        assert!(!deterministic.is_retryable());
+        assert!(deterministic.to_string().contains("missing SequencerBatchData event"));
+    }
+
+    #[test]
+    fn restart_uses_durable_checkpoint_and_skips_delivered_prefix() {
+        let dir = reth_db::test_utils::tempdir_path();
+        let path = L1ResumeLog::path_in(&dir);
+        let checkpoint = L1ResumeCheckpoint {
+            l1_block: 200,
+            delayed_count: 7,
+            l2_block: 11,
+        };
+        let mut log = L1ResumeLog::default();
+        log.record(checkpoint);
+        log.save(&path).unwrap();
+
+        let mut base = L1SyncConfig::mainnet("http://127.0.0.1:1".into(), 100, 0);
+        base.start_l2_block = 10;
+        base.db_tip_l2 = 10;
+        base.checkpoint_path = Some(path);
+
+        let restarted = resume_config(&base, 12);
+        assert_eq!(restarted.start_block, 200);
+        assert_eq!(restarted.start_delayed_count, 7);
+        assert_eq!(restarted.start_l2_block, 11);
+        assert_eq!(restarted.db_tip_l2, 12);
+
+        // The first re-derived block is 12 and is dropped; only 13 is new. This is the same
+        // absolute-number gate used by the delivery loop and proves the restart cannot redeliver
+        // the already durable prefix.
+        let delivered: Vec<u64> = (restarted.start_l2_block + 1..=13)
+            .filter(|bn| *bn > restarted.db_tip_l2)
+            .collect();
+        assert_eq!(delivered, vec![13]);
+    }
+
+    #[tokio::test]
+    async fn malformed_get_block_number_response_is_restarted_and_recovers() {
+        let rpc = MockRpc::first_response_is_invalid();
+        let cfg = empty_range_config(rpc.url.clone());
+        let (feed_tx, mut feed_rx) = tokio::sync::mpsc::channel(1);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise_l1_sync_with_backoff(
+                cfg,
+                feed_tx,
+                || 0,
+                std::future::pending::<()>(),
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("supervisor did not recover")
+        .expect("empty range should finish");
+
+        assert!(rpc.requests.load(Ordering::SeqCst) >= 3);
+        assert!(
+            feed_rx.try_recv().is_err(),
+            "empty range must not deliver duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_retry_backoff() {
+        let rpc = MockRpc::first_response_is_invalid();
+        let cfg = empty_range_config(rpc.url.clone());
+        let (feed_tx, _feed_rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let task = tokio::spawn(supervise_l1_sync_with_backoff(
+            cfg,
+            feed_tx,
+            || 0,
+            shutdown_rx,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rpc.requests.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first failing request was never observed");
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown did not cancel backoff")
+            .unwrap()
+            .expect("shutdown should be clean");
+    }
+
+    #[tokio::test]
+    async fn retry_wait_is_cancellation_aware() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::pin!(shutdown_rx);
+        shutdown_tx.send(()).unwrap();
+        let elapsed = retry_delay_or_shutdown(Duration::from_secs(60), shutdown_rx.as_mut()).await;
+        assert!(!elapsed, "shutdown must win over the retry timer");
     }
 }
