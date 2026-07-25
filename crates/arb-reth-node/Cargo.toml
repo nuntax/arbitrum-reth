@@ -103,6 +103,7 @@ reth-cli-runner = { git = "https://github.com/nuntax/reth.git", rev = "547581ff5
 reth-tracing = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-node-core = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-node-metrics = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
+reth-node-events = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 reth-metrics = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 
 # D.5: Arbitrum RPC converters (receipt/rpc converters), consumed by the canonical RpcAddOns wiring.
