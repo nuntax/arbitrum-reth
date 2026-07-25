@@ -16,6 +16,7 @@ use alloy_consensus::Header;
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::eyre;
+use futures_util::StreamExt;
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
@@ -300,6 +301,25 @@ impl ArbLauncher {
             );
         let task_executor: TaskExecutor = ctx.task_executor().clone();
         let head = ctx.head();
+        let engine_events = reth_tokio_util::EventSender::default();
+        // Reth's generic `CanonicalBlockAdded` log treats the consensus header gas limit as
+        // executable block capacity and its event elapsed time as execution throughput. Neither
+        // interpretation is valid for Arbitrum: the header carries Nitro's permissive `2^50`
+        // envelope, and ArbOS execution happened before insertion into the engine tree. The
+        // driver emits an Arbitrum-aware replacement with its measured production timings.
+        let node_events = engine_events.new_listener().filter_map(|event| {
+            futures_util::future::ready(
+                (!matches!(
+                    &event,
+                    reth_engine_primitives::ConsensusEngineEvent::CanonicalBlockAdded(..)
+                ))
+                .then(|| event.into()),
+            )
+        });
+        task_executor.spawn_critical_task(
+            "events task",
+            reth_node_events::node::handle_events(None, Some(head.number), node_events),
+        );
 
         // Clone the in-memory state from the provider so the tree updates the same instance that
         // BlockchainProvider serves for RPC queries.
@@ -326,6 +346,7 @@ impl ArbLauncher {
             task_executor.clone(),
             tuning,
             prune_config.map(reth_prune::PrunerBuilder::new),
+            engine_events.clone(),
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
@@ -333,20 +354,23 @@ impl ArbLauncher {
 
         task_executor.spawn_critical_task("arb-engine-driver", async move {
             let res: eyre::Result<()> = async {
-                // Bench accounting: separate time spent WAITING for the next derived feed
-                // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
-                // Emitted every 1000 blocks at target "arb-reth::bench"; harmless at info off.
-                let mut bench_recv_us: u128 = 0;
-                let mut bench_work_us: u128 = 0;
-                let mut bench_n: u64 = 0;
-                let mut bench_wall = std::time::Instant::now();
+                // Periodically summarize progress while distinguishing source wait from local
+                // production. Per-block and per-payload details remain available at DEBUG.
+                let mut status_recv_us: u128 = 0;
+                let mut status_work_us: u128 = 0;
+                let mut status_window_messages: u64 = 0;
+                let mut status_window_blocks: u64 = 0;
+                let mut status_total_blocks: u64 = 0;
+                let mut status_last_applied_sequence: Option<u64> = None;
+                let mut status_window = std::time::Instant::now();
+                const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
                 const MAX_MESSAGE_BATCH: usize = 64;
                 loop {
                     let __r = std::time::Instant::now();
                     let Some(first) = messages_rx.recv().await else {
                         break;
                     };
-                    bench_recv_us += __r.elapsed().as_micros();
+                    status_recv_us += __r.elapsed().as_micros();
 
                     // A batch is a deterministic proof that another message is ready. It replaces
                     // the receiver's racy `is_empty()` hint: historical catch-up can overlap the
@@ -374,34 +398,49 @@ impl ArbLauncher {
                                 .record_driver_dequeue(msg.sequence_number, driver_dequeued_at);
                         }
                         let __w = std::time::Instant::now();
+                        let mut applied_blocks = 0u64;
+                        let mut last_applied_sequence = None;
                         driver
                             .advance_with_applied_overlap(
                                 &msg,
                                 index + 1 < batch_len,
                                 |sequence_number, applied| {
+                                    applied_blocks += 1;
+                                    last_applied_sequence = Some(sequence_number);
                                     if let Some(feed_latency) = feed_latency.as_ref() {
                                         feed_latency.record_canonical(sequence_number, applied);
                                     }
                                 },
                             )
                             .await?;
-                        bench_work_us += __w.elapsed().as_micros();
-                        bench_n += 1;
-                        if bench_n.is_multiple_of(1000) {
-                            let wall_ms = bench_wall.elapsed().as_millis().max(1);
+                        status_work_us += __w.elapsed().as_micros();
+                        status_window_messages += 1;
+                        status_window_blocks += applied_blocks;
+                        status_total_blocks += applied_blocks;
+                        if last_applied_sequence.is_some() {
+                            status_last_applied_sequence = last_applied_sequence;
+                        }
+                        if status_window.elapsed() >= STATUS_INTERVAL {
+                            let wall_ms = status_window.elapsed().as_millis().max(1);
                             tracing::info!(
-                                target: "arb-reth::bench",
-                                blocks = bench_n,
-                                blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
-                                recv_ms = (bench_recv_us / 1000) as u64,
-                                work_ms = (bench_work_us / 1000) as u64,
-                                recv_pct = (100 * bench_recv_us
-                                    / (bench_recv_us + bench_work_us).max(1)) as u64,
-                                "bench: 1000-block window",
+                                target: "arb-reth::status",
+                                last_applied_sequence = ?status_last_applied_sequence,
+                                processed = status_total_blocks,
+                                input_messages = status_window_messages,
+                                window_blocks = status_window_blocks,
+                                blk_per_s =
+                                    (status_window_blocks as u128 * 1000 / wall_ms) as u64,
+                                source_wait_ms = (status_recv_us / 1000) as u64,
+                                processing_ms = (status_work_us / 1000) as u64,
+                                source_wait_pct = (100 * status_recv_us
+                                    / (status_recv_us + status_work_us).max(1)) as u64,
+                                "Arbitrum sync status",
                             );
-                            bench_recv_us = 0;
-                            bench_work_us = 0;
-                            bench_wall = std::time::Instant::now();
+                            status_recv_us = 0;
+                            status_work_us = 0;
+                            status_window_messages = 0;
+                            status_window_blocks = 0;
+                            status_window = std::time::Instant::now();
                         }
                     }
 
@@ -429,7 +468,7 @@ impl ArbLauncher {
                 node: ctx.node_adapter().clone(),
                 config: ctx.node_config(),
                 beacon_engine_handle,
-                engine_events: reth_tokio_util::EventSender::default(),
+                engine_events,
                 jwt_secret: ctx.auth_jwt_secret()?,
             };
             let handle = add_ons.launch_add_ons(add_ons_ctx).await?;

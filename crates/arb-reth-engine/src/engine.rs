@@ -13,8 +13,8 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use alloy_consensus::Header;
 use alloy_consensus::transaction::Recovered;
+use alloy_consensus::{Header, constants::GWEI_TO_WEI};
 use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arb_reth_evm::ArbEvmConfig;
@@ -52,7 +52,9 @@ use reth_execution_cache::CacheStats;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_payload_primitives::{BuiltPayload as _, BuiltPayloadExecutedBlock, PayloadKind};
-use reth_primitives_traits::{Account, Bytecode, RecoveredBlock, SealedHeader};
+use reth_primitives_traits::{
+    Account, Bytecode, RecoveredBlock, SealedHeader, format_gas, format_gas_throughput,
+};
 use reth_provider::providers::{BlockchainProvider, ProviderNodeTypes};
 use reth_provider::{
     AccountReader, BalProvider, BlockHashReader, BlockNumReader, BlockReader, BytecodeReader,
@@ -844,6 +846,7 @@ struct PendingAppliedBlock {
     sequence_number: u64,
     new_hash: B256,
     new_header: Header,
+    tx_count: usize,
     production_timing: ArbBlockProductionTiming,
     execution_cache_stats: Option<Arc<CacheStats>>,
     payload_timing: ArbPayloadJobTiming,
@@ -1120,6 +1123,7 @@ where
         runtime: Runtime,
         tuning: ArbEngineTuning,
         prune_builder: Option<PrunerBuilder>,
+        engine_events: reth_tokio_util::EventSender<ConsensusEngineEvent<ArbPrimitives>>,
     ) -> eyre::Result<Self> {
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1202,11 +1206,11 @@ where
         let (obs_tx, obs_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, B256)>();
         tokio::spawn(async move {
             while let Some(ev) = from_tree.recv().await {
-                if let EngineApiEvent::BeaconConsensus(
-                    ConsensusEngineEvent::CanonicalChainCommitted(header, _),
-                ) = ev
-                {
-                    let _ = obs_tx.send((header.number, header.hash()));
+                if let EngineApiEvent::BeaconConsensus(event) = ev {
+                    if let ConsensusEngineEvent::CanonicalChainCommitted(header, _) = &event {
+                        let _ = obs_tx.send((header.number, header.hash()));
+                    }
+                    engine_events.notify(event);
                 }
             }
         });
@@ -1443,6 +1447,7 @@ where
         debug_assert!(self.pending_applied.is_none());
         let new_hash = built.recovered_block.hash();
         let new_header = built.recovered_block.header().clone();
+        let tx_count = built.recovered_block.body().transactions().count();
         let new_number = new_header.number;
 
         // Feed the executed block to the tree (no re-execution).
@@ -1493,6 +1498,7 @@ where
             sequence_number,
             new_hash,
             new_header,
+            tx_count,
             production_timing,
             execution_cache_stats,
             payload_timing,
@@ -1581,6 +1587,7 @@ where
         let PendingAppliedBlock {
             new_hash,
             new_header,
+            tx_count,
             production_timing,
             execution_cache_stats,
             payload_timing,
@@ -1723,15 +1730,30 @@ where
         };
         block_metrics.mgas_per_second.record(mgas_per_second);
 
-        // Per-block production trace (observability) + per-phase timing breakdown.
-        tracing::info!(
-            target: "arb-reth::engine",
+        // Arbitrum headers deliberately use Nitro's permissive 2^50 Geth gas-limit envelope. It
+        // is not block capacity, so do not report it or derive a misleading fullness percentage
+        // from it. Likewise, measure throughput over actual block production rather than Reth's
+        // much smaller engine-tree insertion interval.
+        tracing::debug!(
+            target: "arb-reth::blocks",
             number = new_number,
-            %new_hash,
-            state_root = %new_header.state_root,
-            gas_used = new_header.gas_used,
-            "produced block",
+            hash = ?new_hash,
+            txs = tx_count,
+            gas_used = %format_gas(new_header.gas_used),
+            gas_throughput = %format_gas_throughput(new_header.gas_used, block_production),
+            base_fee = %format!(
+                "{:.2}Gwei",
+                new_header.base_fee_per_gas.unwrap_or(0) as f64 / GWEI_TO_WEI as f64
+            ),
+            execution_time = ?production_timing.execution,
+            state_root_time = ?production_timing.finish_state_root,
+            production_time = ?block_production,
+            engine_handoff_time = ?engine_handoff,
+            elapsed = ?total,
+            "Arbitrum block added to canonical chain",
         );
+
+        // Keep the full internal timing breakdown at debug.
         tracing::debug!(
             target: "arb-reth::engine::timing",
             number = new_number,

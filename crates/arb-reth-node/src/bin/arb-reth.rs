@@ -30,7 +30,7 @@ use clap::{Args, Parser, Subcommand};
 use reth_cli_commands::node::NodeCommand;
 use reth_cli_runner::CliRunner;
 use reth_node_core::{
-    args::{DefaultEngineValues, LogArgs, OtlpInitStatus, TraceArgs},
+    args::{DefaultEngineValues, DefaultLogArgs, LogArgs, OtlpInitStatus, TraceArgs},
     version::version_metadata,
 };
 use reth_node_metrics::recorder::install_prometheus_recorder;
@@ -120,6 +120,17 @@ enum GenesisSub {
 }
 
 fn main() -> eyre::Result<()> {
+    // Ethereum's per-payload and per-commit INFO logs are too noisy for Arbitrum's block cadence.
+    // Keep periodic progress, lifecycle events, warnings, and errors at INFO. Operators can still
+    // opt into either hot-path target with the native log-filter flags.
+    const ARB_NODE_LOG_FILTER: &str = "payload_builder=warn,reth_node_events::node=warn";
+    const ARB_NODE_FILE_LOG_FILTER: &str = "info,payload_builder=warn,reth_node_events::node=warn";
+    DefaultLogArgs::default()
+        .with_log_stdout_filter(ARB_NODE_LOG_FILTER.to_string())
+        .with_log_file_filter(ARB_NODE_FILE_LOG_FILTER.to_string())
+        .try_init()
+        .expect("arb-reth initializes log defaults before any CLI parsing");
+
     // Use Reth's native engine flags while retaining Arbitrum's empirically sensible defaults.
     // `try_init` must happen before clap evaluates the flag defaults.
     DefaultEngineValues::default()
@@ -133,6 +144,9 @@ fn main() -> eyre::Result<()> {
         .expect("arb-reth initializes engine defaults before any CLI parsing");
 
     let mut cli = Cli::parse();
+    if matches!(&cli.command, Command::Node(_)) {
+        cli.logs.apply_node_defaults();
+    }
     let runner = CliRunner::try_default_runtime()?;
 
     let mut layers = Layers::new();
