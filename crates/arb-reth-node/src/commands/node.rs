@@ -38,7 +38,7 @@ use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
 use arbitrum_alloy_sequencer::init_message::parse_init_message_from_body;
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use clap::Parser;
-use reth_chainspec::MAINNET;
+use reth_chainspec::{ChainSpec, MAINNET};
 use reth_cli_runner::CliContext;
 use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, mdbx::SyncMode};
 use reth_node_builder::{LaunchContext, LaunchNode, NodeBuilder, NodeConfig};
@@ -287,6 +287,15 @@ struct RollupDeployment {
     l2_genesis_block: u64,
 }
 
+/// Returns the delayed-message cursor encoded in the actual L2 genesis header.
+///
+/// Snapshot chain specs use the imported snapshot head as reth's genesis header, so only use its
+/// nonce when its block number matches the rollup's L2 genesis block.
+fn genesis_delayed_messages_read(chain_spec: &ChainSpec, l2_genesis_block: u64) -> Option<u64> {
+    let header = chain_spec.genesis_header();
+    (header.number == l2_genesis_block).then(|| u64::from_be_bytes(header.nonce.0))
+}
+
 /// Resolve the rollup deployment from the CLI, with Nitro-like set/unset semantics:
 ///
 /// - Neither `--l1-sequencer-inbox` nor `--l1-bridge` set: the built-in Arbitrum One deployment,
@@ -480,6 +489,8 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             None => (MAINNET.clone(), args.chain_id),
         },
     };
+    let genesis_delayed =
+        genesis_delayed_messages_read(chain_spec.as_ref(), rollup.l2_genesis_block);
 
     // Resolve the pruning configuration from the `--prune.*` / `--full` flags before `chain_spec` is
     // moved into the node config (the prune modes for `--full`/pre-merge presets are keyed off the
@@ -739,7 +750,15 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         let (start_block, start_delayed, start_l2_block) = if let Some(b) = args.l1_start_block {
             // Manual override: the operator asserts `b` is the batch boundary the tip was built
             // from, so the next derived block is `db_tip + 1`.
-            let delayed = args.l1_start_delayed.or(snapshot_delayed).unwrap_or(0);
+            let delayed = args
+                .l1_start_delayed
+                .or(snapshot_delayed)
+                .or(if db_tip == l2_genesis_block {
+                    genesis_delayed
+                } else {
+                    None
+                })
+                .unwrap_or(0);
             info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 resume point: --l1-start-block override");
             (b, delayed, db_tip)
         } else if let Some(log) = &resume_log {
@@ -799,9 +818,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 .ok_or_else(|| {
                     eyre::eyre!("batch 0 not found near the SequencerInbox deploy block")
                 })?;
-            // Genesis delayed cursor is 0; anchor L2 numbering at genesis so the skip threshold
-            // (db_tip) lines up with the absolute block numbers derivation produces.
-            let delayed = args.l1_start_delayed.unwrap_or(0);
+            // The genesis header nonce is Nitro's cumulative delayed-messages-read count. It is
+            // normally 1 because block 0 consumes the Initialize message.
+            let delayed = args.l1_start_delayed.or(genesis_delayed).unwrap_or(0);
             info!(target: "arb-reth", batch = 0, l1_block = block, delayed, "L1 resume point: genesis (batch 0)");
             (block, delayed, l2_genesis_block)
         };
@@ -849,4 +868,30 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // Hold feed_tx alive so the driver parks on the channel rather than exiting.
     let _feed_tx = feed_tx;
     handle.wait_for_node_exit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROBINHOOD_CHAIN_INFO: &[u8] =
+        include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
+    const ROBINHOOD_GENESIS: &[u8] = include_bytes!("../../tests/fixtures/robinhood-genesis.json");
+
+    #[test]
+    fn robinhood_genesis_delayed_cursor_comes_from_header_nonce() {
+        let (spec, init, _) =
+            crate::orbit_chain_from_files(ROBINHOOD_CHAIN_INFO, ROBINHOOD_GENESIS)
+                .expect("build Robinhood chain spec");
+
+        assert_eq!(
+            genesis_delayed_messages_read(&spec, init.genesis_block_number),
+            Some(1)
+        );
+        assert_eq!(
+            genesis_delayed_messages_read(&spec, init.genesis_block_number + 1),
+            None,
+            "a snapshot head must not be mistaken for the actual L2 genesis"
+        );
+    }
 }
