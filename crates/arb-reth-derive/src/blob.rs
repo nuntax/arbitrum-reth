@@ -93,14 +93,18 @@ mod tests {
     fn encode_blobs(data: &[u8]) -> Vec<Blob> {
         // RLP-encode `data` as a byte string (only alloy-rlp, no extra deps).
         let mut rlp = Vec::new();
-        Header { list: false, payload_length: data.len() }.encode(&mut rlp);
+        Header {
+            list: false,
+            payload_length: data.len(),
+        }
+        .encode(&mut rlp);
         rlp.extend_from_slice(data);
 
         let n_blobs = rlp.len().div_ceil(BLOB_ENCODABLE_DATA).max(1);
         rlp.resize(n_blobs * BLOB_ENCODABLE_DATA, 0);
 
         let mut blobs = Vec::with_capacity(n_blobs);
-        for chunk in rlp.chunks_exact(BLOB_ENCODABLE_DATA) {
+        for chunk in rlp.as_chunks::<BLOB_ENCODABLE_DATA>().0 {
             let mut blob = [0u8; BYTES_PER_BLOB];
             let (bodies, spares) = chunk.split_at(BODY_BYTES_PER_BLOB);
             // bodies -> bytes 1..32 of each field element

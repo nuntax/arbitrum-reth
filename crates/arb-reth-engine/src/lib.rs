@@ -233,9 +233,10 @@ mod tests {
     #[test]
     fn payload_id_distinguishes_equal_timestamp_messages() {
         let parent = alloy_primitives::B256::repeat_byte(0x11);
-        let mut first_message =
-            arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage::default();
-        first_message.sequence_number = 7;
+        let first_message = arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage {
+            sequence_number: 7,
+            ..Default::default()
+        };
         let mut second_message = first_message.clone();
         second_message.sequence_number = 8;
 
