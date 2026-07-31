@@ -71,6 +71,7 @@ use reth_provider::{
     providers::{RocksDBProvider, StaticFileProvider},
     DBProvider, MetadataWriter, ProviderFactory, StorageSettingsCache, TrieWriter,
 };
+use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
 use reth_db_api::models::StorageSettings;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::StorageEntry;
@@ -87,7 +88,7 @@ use reth_provider::{
 };
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
-use reth_storage_api::HeaderProvider;
+use reth_storage_api::{HeaderProvider, PruneCheckpointReader, PruneCheckpointWriter};
 
 use crate::hashed_db::{account_by_address, code_of, storage_at, KECCAK_EMPTY as HASHED_KECCAK_EMPTY};
 
@@ -166,6 +167,22 @@ pub struct SnapshotReadArgs {
     /// Enumerate all non-zero storage slots for this address and print their count.
     #[arg(long)]
     list_storage: bool,
+}
+
+/// Add missing history-boundary metadata to an existing snapshot-imported datadir.
+#[derive(Debug, Parser)]
+#[command(
+    name = "repair-history",
+    about = "Record the unavailable history prefix in a snapshot-imported datadir"
+)]
+pub struct SnapshotRepairHistoryArgs {
+    /// Snapshot-imported datadir containing `db`, `static_files`, and `rocksdb`.
+    #[arg(long, value_name = "DIR")]
+    db: PathBuf,
+
+    /// Blocks stream whose highest header is the imported snapshot head.
+    #[arg(long, value_name = "FILE")]
+    snapshot_head: PathBuf,
 }
 
 pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
@@ -253,6 +270,70 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     drop(factory);
     rename_changeset_files_to_header(&static_files_path)?;
 
+    Ok(())
+}
+
+/// Repair an older import that predates snapshot history-boundary checkpoints.
+///
+/// This only writes two prune-checkpoint rows. It does not modify state, blocks, trie data, or the
+/// snapshot header, and is idempotent for the same snapshot head.
+pub fn repair_history(args: SnapshotRepairHistoryArgs) -> eyre::Result<()> {
+    let (head_num, head_hash, header) = read_head_header(&args.snapshot_head)?;
+    let db = init_db(
+        args.db.join("db"),
+        DatabaseArguments::new(ClientVersion::default()),
+    )?;
+    let static_files = StaticFileProvider::read_write(args.db.join("static_files"))?;
+    let rocksdb = RocksDBProvider::builder(args.db.join("rocksdb"))
+        .with_default_tables()
+        .build()
+        .map_err(|error| eyre::eyre!("RocksDB open error: {error}"))?;
+    let factory: ProviderFactory<ArbNodeTypesWithDB> = ProviderFactory::new(
+        db,
+        arb_chain_spec_with_header(ARB_ONE_CHAIN_ID, header, head_hash),
+        static_files,
+        rocksdb,
+        Runtime::test(),
+    )?;
+    factory.set_storage_settings_cache(StorageSettings::v2());
+
+    {
+        let provider = factory.provider()?;
+        let best = provider.best_block_number()?;
+        if best < head_num {
+            return Err(eyre::eyre!(
+                "database head {best} is below snapshot head {head_num}"
+            ));
+        }
+        let actual_hash = provider
+            .sealed_header(head_num)?
+            .ok_or_else(|| eyre::eyre!("snapshot header {head_num} is missing from the database"))?
+            .hash();
+        if actual_hash != head_hash {
+            return Err(eyre::eyre!(
+                "snapshot header hash mismatch at {head_num}: database={actual_hash:#x}, stream={head_hash:#x}"
+            ));
+        }
+
+        for segment in [PruneSegment::AccountHistory, PruneSegment::StorageHistory] {
+            if let Some(existing) = provider.get_prune_checkpoint(segment)?
+                && existing.block_number.is_some_and(|block| block > head_num)
+            {
+                return Err(eyre::eyre!(
+                    "refusing to move {segment} checkpoint backward from {:?} to {head_num}",
+                    existing.block_number
+                ));
+            }
+        }
+    }
+
+    let provider = factory.database_provider_rw()?;
+    write_snapshot_history_boundaries(&provider, head_num)?;
+    provider.commit()?;
+
+    println!("snapshot history boundary = {head_num}");
+    println!("account history checkpoint: OK");
+    println!("storage history checkpoint: OK");
     Ok(())
 }
 
@@ -455,9 +536,34 @@ fn write_head_blocks(
     for stage in StageId::ALL {
         provider_rw.save_stage_checkpoint(stage, cp)?;
     }
+    write_snapshot_history_boundaries(&provider_rw, head_num)?;
     provider_rw.commit()?;
     tracing::info!(count, head_num, ?head_hash, "wrote headers + checkpoints");
     Ok((head_num, head_hash))
+}
+
+/// Record that account and storage history before the imported snapshot head is unavailable.
+///
+/// The imported hashed state is the complete state at `head_num`, but the import contains no
+/// changesets or history index for earlier blocks. Without these checkpoints, a storage-v2
+/// historical lookup can mistake an imported account for an account first created after its MDBX
+/// snapshot when RocksDB is one persistence commit ahead. Marking the missing prefix makes that
+/// lookup fall back to the imported hashed state.
+fn write_snapshot_history_boundaries(
+    provider: &impl PruneCheckpointWriter,
+    head_num: u64,
+) -> eyre::Result<()> {
+    let checkpoint = PruneCheckpoint {
+        block_number: Some(head_num),
+        tx_number: None,
+        prune_mode: PruneMode::before_inclusive(head_num),
+    };
+
+    for segment in [PruneSegment::AccountHistory, PruneSegment::StorageHistory] {
+        provider.save_prune_checkpoint(segment, checkpoint)?;
+    }
+
+    Ok(())
 }
 
 /// Re-open the DB and assert the head is wired correctly (the boot-wiring gate).
@@ -788,4 +894,117 @@ pub fn read(args: SnapshotReadArgs) -> eyre::Result<()> {
 
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{address, b256};
+    use reth_db_api::{
+        BlockNumberList,
+        models::{storage_sharded_key::StorageShardedKey, ShardedKey},
+    };
+    use reth_storage_api::{
+        AccountReader, PruneCheckpointReader, StateProvider, TryIntoHistoricalStateProvider,
+    };
+
+    #[test]
+    fn snapshot_history_boundaries_preserve_imported_state_during_rocks_ahead_window()
+    -> eyre::Result<()> {
+        const SNAPSHOT_HEAD: u64 = 22_207_817;
+        let address = address!("0000000000000000000000000000000000001234");
+        let storage_key = b256!("0000000000000000000000000000000000000000000000000000000000000042");
+        let account = Account {
+            nonce: 7,
+            balance: U256::from(123_456u64),
+            bytecode_hash: None,
+        };
+        let storage_value = U256::from(987_654u64);
+
+        let temp = tempfile::tempdir()?;
+        let db = init_db(
+            temp.path().join("db"),
+            DatabaseArguments::new(ClientVersion::default()),
+        )?;
+        let static_files = StaticFileProvider::read_write(temp.path().join("static_files"))?;
+        let rocksdb = RocksDBProvider::builder(temp.path().join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .map_err(|error| eyre::eyre!("RocksDB open error: {error}"))?;
+        let factory: ProviderFactory<ArbNodeTypesWithDB> = ProviderFactory::new(
+            db,
+            Arc::new(MAINNET.as_ref().clone()),
+            static_files,
+            rocksdb.clone(),
+            Runtime::test(),
+        )?;
+        factory.set_storage_settings_cache(StorageSettings::v2());
+
+        // Model an imported snapshot account and storage slot. The Finish checkpoint is one block
+        // ahead of the snapshot so requesting SNAPSHOT_HEAD takes the historical-provider path.
+        {
+            let provider = factory.database_provider_rw()?;
+            provider.write_storage_settings(StorageSettings::v2())?;
+            provider
+                .tx_ref()
+                .put::<tables::HashedAccounts>(keccak256(address), account)?;
+            let mut storage = provider
+                .tx_ref()
+                .cursor_dup_write::<tables::HashedStorages>()?;
+            storage.upsert(
+                keccak256(address),
+                &StorageEntry {
+                    key: keccak256(storage_key),
+                    value: storage_value,
+                },
+            )?;
+            provider
+                .save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(SNAPSHOT_HEAD + 1))?;
+            provider.commit()?;
+        }
+
+        // Model the normal storage-v2 commit window: RocksDB history for the next block is visible
+        // while the companion MDBX snapshot still reports the previous visible tip.
+        rocksdb.put::<tables::AccountsHistory>(
+            ShardedKey::new(address, u64::MAX),
+            &BlockNumberList::new([SNAPSHOT_HEAD + 2]).expect("valid history list"),
+        )?;
+        rocksdb.put::<tables::StoragesHistory>(
+            StorageShardedKey::new(address, storage_key, u64::MAX),
+            &BlockNumberList::new([SNAPSHOT_HEAD + 2]).expect("valid history list"),
+        )?;
+
+        // Without a snapshot boundary, Reth interprets the first history entry as the account and
+        // slot not existing yet, even though both are present in the imported hashed state.
+        let state = factory
+            .provider()?
+            .try_into_history_at_block(SNAPSHOT_HEAD)?;
+        assert_eq!(state.basic_account(&address)?, None);
+        assert_eq!(state.storage(address, storage_key)?, None);
+
+        {
+            let provider = factory.database_provider_rw()?;
+            write_snapshot_history_boundaries(&provider, SNAPSHOT_HEAD)?;
+            provider.commit()?;
+        }
+
+        for segment in [PruneSegment::AccountHistory, PruneSegment::StorageHistory] {
+            let checkpoint = factory
+                .provider()?
+                .get_prune_checkpoint(segment)?
+                .expect("snapshot history checkpoint");
+            assert_eq!(checkpoint.block_number, Some(SNAPSHOT_HEAD));
+            assert_eq!(checkpoint.prune_mode, PruneMode::Before(SNAPSHOT_HEAD + 1));
+        }
+
+        // The boundary changes an ambiguous no-history result into a fallback to the imported
+        // hashed state, preserving both the account and storage value during the same skew window.
+        let state = factory
+            .provider()?
+            .try_into_history_at_block(SNAPSHOT_HEAD)?;
+        assert_eq!(state.basic_account(&address)?, Some(account));
+        assert_eq!(state.storage(address, storage_key)?, Some(storage_value));
+
+        Ok(())
+    }
 }

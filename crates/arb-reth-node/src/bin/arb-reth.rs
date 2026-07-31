@@ -19,7 +19,7 @@ use arb_reth_node::commands::{
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
     node::NodeArgs,
     rewind::RewindArgs,
-    snapshot::{SnapshotImportArgs, SnapshotReadArgs},
+    snapshot::{SnapshotImportArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs},
 };
 use clap::{Args, Parser, Subcommand};
 use reth_cli_runner::CliRunner;
@@ -69,6 +69,8 @@ enum SnapshotSub {
     Import(SnapshotImportArgs),
     /// Read hashed-state from a converted Arbitrum reth MDBX snapshot.
     Read(SnapshotReadArgs),
+    /// Add missing history-boundary metadata to an existing snapshot import.
+    RepairHistory(SnapshotRepairHistoryArgs),
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +107,7 @@ fn main() -> eyre::Result<()> {
         Command::Snapshot(cmd) => match cmd.command {
             SnapshotSub::Import(args) => commands::snapshot::import(args),
             SnapshotSub::Read(args) => commands::snapshot::read(args),
+            SnapshotSub::RepairHistory(args) => commands::snapshot::repair_history(args),
         },
         Command::Genesis(cmd) => match cmd.command {
             GenesisSub::Verify(args) => commands::genesis::verify(args),
