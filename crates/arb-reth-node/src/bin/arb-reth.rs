@@ -34,7 +34,11 @@ use reth_node_core::{
     version::version_metadata,
 };
 use reth_node_metrics::recorder::install_prometheus_recorder;
-use reth_tracing::{Layers, tracing::{info, warn}};
+use reth_tasks::RayonConfig;
+use reth_tracing::{
+    Layers,
+    tracing::{info, warn},
+};
 
 /// Stack-probe shim for x86_64: wasmer references `__rust_probestack` which recent
 /// `compiler-builtins` no longer exports; this satisfies the linker. No-op on aarch64.
@@ -147,7 +151,17 @@ fn main() -> eyre::Result<()> {
     if matches!(&cli.command, Command::Node(_)) {
         cli.logs.apply_node_defaults();
     }
-    let runner = CliRunner::try_default_runtime()?;
+    let runtime_config = match &cli.command {
+        Command::Node(command) => reth_tasks::RuntimeConfig::default().with_rayon(RayonConfig {
+            reserved_cpu_cores: command.engine.reserved_cpu_cores,
+            proof_storage_worker_threads: command.engine.storage_worker_count,
+            proof_account_worker_threads: command.engine.account_worker_count,
+            prewarming_threads: command.engine.prewarming_threads,
+            ..Default::default()
+        }),
+        _ => reth_tasks::RuntimeConfig::default(),
+    };
+    let runner = CliRunner::try_with_runtime_config(runtime_config)?;
 
     let mut layers = Layers::new();
     let otlp_status = runner.block_on(cli.traces.init_otlp_tracing(&mut layers))?;
@@ -172,9 +186,9 @@ fn main() -> eyre::Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     match cli.command {
-        Command::Node(command) => runner.run_command_until_exit(move |ctx| {
-            commands::node::run(ctx, *command)
-        }),
+        Command::Node(command) => {
+            runner.run_command_until_exit(move |ctx| commands::node::run(ctx, *command))
+        }
         Command::Snapshot(cmd) => match cmd.command {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
             SnapshotSub::Import(args) => commands::snapshot::import(args),
