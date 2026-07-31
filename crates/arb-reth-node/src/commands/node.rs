@@ -614,23 +614,6 @@ async fn launch(
         ..
     } = bootstrap;
 
-    // Resolve the pruning configuration from Reth's native `--prune.*` / `--full` arguments.
-    // It is passed both to the provider factory and the engine-tree pruner so static-file writes
-    // follow the same segment policy.
-    let prune_config = builder
-        .config()
-        .pruning
-        .prune_config(builder.config().chain.as_ref());
-    match &prune_config {
-        Some(pc) => info!(
-            target: "arb-reth",
-            segments = ?pc.segments,
-            block_interval = pc.block_interval,
-            minimum_pruning_distance = pc.minimum_pruning_distance,
-            "history pruning enabled",
-        ),
-        None => info!(target: "arb-reth", "archive node (no pruning configured; keeping all history)"),
-    }
     let data_dir = builder.config().datadir();
 
     // Resolve the L1-derivation resume log path before `data_dir` is moved into the launcher.
@@ -657,7 +640,6 @@ async fn launch(
         chain_id: effective_chain_id,
         genesis_block: rollup.l2_genesis_block,
         tuning,
-        prune_config,
         messages: feed_rx,
         feed_latency: feed_latency.clone(),
     };

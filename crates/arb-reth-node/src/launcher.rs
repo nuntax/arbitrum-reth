@@ -24,8 +24,7 @@ use reth_node_api::{AddOnsContext, FullNodeTypes, NodeTypes, NodeTypesWithDBAdap
 use reth_node_builder::hooks::NodeHooks;
 use reth_node_builder::{
     AddOns, LaunchContext, LaunchNode, Node, NodeAdapter, NodeBuilderWithComponents,
-    NodeComponents, NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter,
-    rpc::RethRpcAddOns,
+    NodeComponents, NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter, rpc::RethRpcAddOns,
 };
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
@@ -88,10 +87,6 @@ pub struct ArbLauncher {
     pub genesis_block: u64,
     /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
     pub tuning: ArbEngineTuning,
-    /// Optional history-pruning configuration from `--prune.*` / `--full`. `None` keeps the node
-    /// an archive node. A configured mode is applied to both the provider factory and the
-    /// engine-tree persistence pruner so static-file writes follow the same segment policy.
-    pub prune_config: Option<reth_config::PruneConfig>,
     /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
     /// tip, so no per-message version is carried.
     pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
@@ -198,7 +193,6 @@ impl ArbLauncher {
             chain_id,
             genesis_block,
             tuning,
-            prune_config,
             messages,
             feed_latency,
         } = self;
@@ -240,6 +234,27 @@ impl ArbLauncher {
         // Apply this after TOML merging so no config file can inadvertently expose it.
         let mut ctx = ctx;
         ctx.node_config_mut().rpc.disable_auth_server = true;
+
+        // Use Reth's effective configuration after the native CLI and persisted `reth.toml` have
+        // been merged. The provider factory and persistence pruner must use these exact same modes:
+        // otherwise a run can try to append a static-file segment that an earlier run pruned.
+        let prune_config = ctx.prune_config();
+        if prune_config.is_default() {
+            reth_tracing::tracing::info!(
+                target: "arb-reth",
+                "archive node (no pruning configured; keeping all history)",
+            );
+        } else {
+            reth_tracing::tracing::info!(
+                target: "arb-reth",
+                segments = ?prune_config.segments,
+                block_interval = prune_config.block_interval,
+                minimum_pruning_distance = prune_config.minimum_pruning_distance,
+                "history pruning enabled",
+            );
+        }
+        let prune_builder =
+            (!prune_config.is_default()).then(|| reth_prune::PrunerBuilder::new(prune_config));
 
         let ctx = ctx
             .with_adjusted_configs()
@@ -288,17 +303,9 @@ impl ArbLauncher {
 
         let provider: BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> =
             ctx.node_adapter().provider.clone();
-        // Reth's provider factory consults `PruneModes` while it writes static-file segments. In
-        // particular, full sender recovery pruning stops new TransactionSenders writes. Feeding
-        // the configuration only to `PrunerBuilder` would let the writer append to a segment the
-        // pruner deletes, breaking its contiguous-block invariant on the next persistence batch.
+        // `with_provider_factory` already applied the merged pruning modes above.
         let provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DB>> =
-            ctx.provider_factory().clone().with_prune_modes(
-                prune_config
-                    .as_ref()
-                    .map(|config| config.segments.clone())
-                    .unwrap_or_default(),
-            );
+            ctx.provider_factory().clone();
         let task_executor: TaskExecutor = ctx.task_executor().clone();
         let head = ctx.head();
         let engine_events = reth_tokio_util::EventSender::default();
@@ -345,7 +352,7 @@ impl ArbLauncher {
             canonical,
             task_executor.clone(),
             tuning,
-            prune_config.map(reth_prune::PrunerBuilder::new),
+            prune_builder,
             engine_events.clone(),
         )?;
 
@@ -571,6 +578,14 @@ mod tests {
         let data_dir =
             maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
 
+        // Persist pruning only in reth.toml. This exercises the same restart path as a datadir
+        // whose sender static files were pruned by an earlier run without repeating `--full`.
+        let mut reth_config = reth_config::Config::default();
+        reth_config.set_prune_config(prune_config);
+        reth_config
+            .save(&data_dir.config())
+            .expect("save test pruning config");
+
         let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
         let launcher = ArbLauncher {
@@ -578,7 +593,6 @@ mod tests {
             chain_id,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
-            prune_config: Some(prune_config),
             messages: rx,
             feed_latency: None,
         };
@@ -685,7 +699,6 @@ mod tests {
                     .with_share_execution_cache_with_payload_builder(true)
                     .with_share_sparse_trie_with_payload_builder(false),
             ),
-            prune_config: None,
             messages: rx,
             feed_latency: None,
         };
