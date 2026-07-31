@@ -38,6 +38,7 @@ reth-primitives-traits = { version = "0.5.0", default-features = false }
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
+reth-prune-types = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
 # Keep the optimized precompile implementations aligned with reth-node-ethereum.
 revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_limit", "p256-aws-lc-rs"] }
