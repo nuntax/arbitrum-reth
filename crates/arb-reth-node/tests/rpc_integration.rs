@@ -63,7 +63,6 @@ async fn rpc_serves_eth_queries() {
         chain_id: arb_reth_node::ARB_ONE_CHAIN_ID,
         genesis_block: 0,
         tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
-        prune_config: None,
         messages: rx,
         feed_latency: None,
     };

@@ -125,6 +125,7 @@ mod tests {
             Runtime::test(),
             tuning,
             None,
+            reth_tokio_util::EventSender::default(),
         )
         .expect("spawn native payload driver");
 
