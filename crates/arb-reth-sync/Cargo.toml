@@ -27,4 +27,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 tracing = "0.1"
 
 [dev-dependencies]
-reth-db = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784", features = ["test-utils"] }
+reth-db = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22", features = ["test-utils"] }

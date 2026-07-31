@@ -84,6 +84,17 @@ use crate::{ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayload
 /// transfer. Nitro calls this `ArbosVersion_Stylus`.
 const ARBOS_VERSION_STYLUS: u64 = 30;
 
+/// First ArbOS version whose EVM rules restrict SELFDESTRUCT to contracts created in the same
+/// transaction. `ArbSpecId` maps this version to Cancun.
+const ARBOS_VERSION_CANCUN: u64 = 20;
+
+fn arbos_version(parent: &Header) -> Option<u64> {
+    ArbHeaderInfo::decode_header(parent)
+        .ok()
+        .filter(ArbHeaderInfo::is_arbitrum)
+        .map(|info| info.arbos_format_version)
+}
+
 /// Selects the sparse-trie account policy for the child of `parent`.
 ///
 /// Nitro always finalizes blocks with EIP-161 empty-account deletion enabled. Before Stylus,
@@ -91,8 +102,12 @@ const ARBOS_VERSION_STYLUS: u64 = 30;
 /// present-but-empty account. `arb-revm` represents that exception as an explicitly created empty
 /// account, which the sparse trie must preserve. The exception was removed in ArbOS 30.
 fn preserves_created_empty_accounts(parent: &Header) -> bool {
-    ArbHeaderInfo::decode_header(parent)
-        .is_ok_and(|info| info.is_arbitrum() && info.arbos_format_version < ARBOS_VERSION_STYLUS)
+    arbos_version(parent).is_some_and(|version| version < ARBOS_VERSION_STYLUS)
+}
+
+/// Returns true while an existing contract can be fully deleted by SELFDESTRUCT.
+fn uses_legacy_selfdestruct(parent: &Header) -> bool {
+    arbos_version(parent).is_some_and(|version| version < ARBOS_VERSION_CANCUN)
 }
 
 #[cfg(test)]
@@ -117,6 +132,12 @@ mod state_root_policy_tests {
     }
 
     #[test]
+    fn uses_legacy_selfdestruct_before_cancun() {
+        assert!(uses_legacy_selfdestruct(&header_with_arbos_version(19)));
+        assert!(!uses_legacy_selfdestruct(&header_with_arbos_version(20)));
+    }
+
+    #[test]
     fn prunes_created_empty_accounts_from_stylus() {
         assert!(!preserves_created_empty_accounts(
             &header_with_arbos_version(30)
@@ -132,6 +153,7 @@ mod state_root_policy_tests {
         assert!(!preserves_created_empty_accounts(
             &header_with_arbos_version(0)
         ));
+        assert!(!uses_legacy_selfdestruct(&Header::default()));
     }
 }
 
@@ -139,6 +161,7 @@ mod state_root_policy_tests {
 /// only to pre-Stylus blocks.
 #[derive(Debug)]
 struct ArbStateRootStrategy {
+    legacy: DefaultStateRootStrategy,
     pre_stylus: DefaultStateRootStrategy,
     stylus_and_later: DefaultStateRootStrategy,
 }
@@ -146,6 +169,9 @@ struct ArbStateRootStrategy {
 impl Default for ArbStateRootStrategy {
     fn default() -> Self {
         Self {
+            legacy: DefaultStateRootStrategy::default()
+                .with_allow_create_empty_account(true)
+                .with_legacy_selfdestruct_storage_wipes(true),
             pre_stylus: DefaultStateRootStrategy::default().with_allow_create_empty_account(true),
             stylus_and_later: DefaultStateRootStrategy::default(),
         }
@@ -160,7 +186,9 @@ where
         &self,
         ctx: StateRootJobContext<'_, ArbPrimitives, P, ArbEvmConfig>,
     ) -> ProviderResult<PreparedStateRootJob<ArbPrimitives>> {
-        if preserves_created_empty_accounts(ctx.parent_header().header()) {
+        if uses_legacy_selfdestruct(ctx.parent_header().header()) {
+            self.legacy.prepare(ctx)
+        } else if preserves_created_empty_accounts(ctx.parent_header().header()) {
             self.pre_stylus.prepare(ctx)
         } else {
             self.stylus_and_later.prepare(ctx)
@@ -171,7 +199,9 @@ where
         &self,
         ctx: PayloadStateRootJobContext<'_, ArbPrimitives, P>,
     ) -> ProviderResult<Option<PayloadStateRootHandle>> {
-        if preserves_created_empty_accounts(ctx.parent_header()) {
+        if uses_legacy_selfdestruct(ctx.parent_header()) {
+            self.legacy.prepare_payload_builder(ctx)
+        } else if preserves_created_empty_accounts(ctx.parent_header()) {
             self.pre_stylus.prepare_payload_builder(ctx)
         } else {
             self.stylus_and_later.prepare_payload_builder(ctx)

@@ -28,25 +28,25 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { workspace = true }
 
 # reth node types + storage surface
-reth-node-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784", features = ["db-api"] }
-reth-payload-primitives = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-node-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22", features = ["db-api"] }
+reth-payload-primitives = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
 
 # D.2.2: trie, chain-state, execution types, provider write path
-reth-chain-state = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-execution-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-prune-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-trie-common = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-chain-state = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-execution-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-prune-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-trie-common = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 # Keep the optimized precompile implementations aligned with reth-node-ethereum.
 revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_limit", "p256-aws-lc-rs"] }
 revm-database = "42.0.0"
 
 # D.2.3: driver (reth BlockBuilder + revm State<StateProviderDatabase>)
-reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-revm = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-revm = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
 
 # Stage F.3c: L1-derivation catch-up runtime (SequencerInbox + delayed inbox -> feed).
@@ -56,26 +56,26 @@ arb-reth-genesis = { path = "../arb-reth-genesis" }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
 
 # D.3b: NodeBuilder integration (Node<N> + noop components + custom LaunchNode)
-reth-node-builder = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-node-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-transaction-pool = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-eth-wire-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-node-builder = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-node-api = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-transaction-pool = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-eth-wire-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 alloy-rlp = { workspace = true }
 
 # D.3b.2: custom launcher (storage overlay, reth tasks, reth-db DatabaseEnv)
-reth-trie-db = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-trie = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-storage-overlay = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-db-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-db = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-trie-db = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-trie = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-storage-overlay = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-db-api = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-db = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 
 # H/#52: boot-wiring (static-file Headers segment + stage checkpoints)
-reth-stages-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-static-file-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-stages-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-static-file-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 # H/#1: launch genesis-acceptance gate (init_genesis_with_settings_and_validate)
-reth-db-common = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-db-common = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 tracing = "0.1"
 metrics = "0.24"
 
@@ -94,33 +94,33 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 
 # D.3b.4: bin/arb-reth (clap CLI, reth runtime/ctrl-c harness, tracing, node-core)
 clap = { version = "4", features = ["derive"] }
-reth-cli-runner = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-tracing = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-node-core = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-metrics = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-cli-runner = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-tracing = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-node-core = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-metrics = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 
 # D.5: Arbitrum RPC converters (receipt/rpc converters), consumed by the canonical RpcAddOns wiring.
 arb-reth-rpc = { path = "../arb-reth-rpc" }
 arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
 arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", features = ["reth-compat"] }
-reth-rpc = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-rpc-builder = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-rpc-eth-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-rpc-convert = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-rpc-server-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-network-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-tokio-util = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-rpc = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-rpc-builder = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-rpc-eth-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-rpc-convert = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-rpc-server-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-network-api = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-tokio-util = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 
 # Tier-1 engine-tree driver: now in the arb-reth-engine crate (payload stubs + ArbEngineDriver).
 arb-reth-engine = { path = "../arb-reth-engine" }
-reth-engine-tree = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-payload-builder = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-prune = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-config = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-exex-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-stages-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-engine-tree = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-payload-builder = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-prune = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-config = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-exex-types = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-stages-api = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 crossbeam-channel = "0.5"
 
 [features]
@@ -138,14 +138,14 @@ gmp = ["reth-revm/gmp", "revm/gmp"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
-reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784", features = ["test-utils"] }
-reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
-reth-node-builder = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784", features = ["test-utils"] }
+reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22", features = ["test-utils"] }
+reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
+reth-node-builder = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22", features = ["test-utils"] }
 revm-state = "42.0.0"
 tempfile = "3"
 arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", default-features = false, features = ["reth", "k256"] }
 # Per-block replay-parity test: seed the real ArbOS genesis block into the test factory.
-reth-db-common = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-db-common = { git = "https://github.com/nuntax/reth.git", rev = "efe565234071fc766371441016a505edeed5dd22" }
 
 # engine_spike / engine: Tier-1 engine-tree deps live in [dependencies] now (used by engine.rs).
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
