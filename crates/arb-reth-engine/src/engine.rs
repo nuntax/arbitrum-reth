@@ -451,41 +451,60 @@ pub(crate) fn produce_with_timing<'a>(
     let phase_started_at = Instant::now();
 
     let finish_state_timings = Arc::new(FinishStateTimings::default());
-    let (state_root_precomputed, state_root_task_wait, state_root_task_succeeded) =
-        if let Some(mut task) = state_root_task {
-            // Dropping the hook signals that the task has received every ArbOS state transition,
-            // including the EIP-2935 prelude and start-block transaction.
-            builder.evm_mut().db_mut().set_state_hook(None);
-            let wait_started_at = Instant::now();
-            match task.state_root() {
-                Ok(outcome) => (
-                    Some((
-                        outcome.state_root,
-                        Arc::unwrap_or_clone(outcome.trie_updates),
-                    )),
-                    Some(wait_started_at.elapsed()),
-                    true,
-                ),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "arb-reth::engine",
-                        block = parent_header.number + 1,
-                        job = task.name(),
-                        %err,
-                        "state-root task failed; falling back to synchronous state root",
-                    );
-                    (None, Some(wait_started_at.elapsed()), false)
-                }
+    let (
+        state_root_precomputed,
+        state_root_task_hashed_state,
+        state_root_task_wait,
+        state_root_task_succeeded,
+    ) = if let Some(mut task) = state_root_task {
+        // Dropping the hook signals that the task has received every ArbOS state transition,
+        // including the EIP-2935 prelude and start-block transaction.
+        builder.evm_mut().db_mut().set_state_hook(None);
+        let wait_started_at = Instant::now();
+        let task_name = task.name();
+        let result = task.state_root();
+        // The task also publishes the hashed state through a second receiver used by engine
+        // validation. Payload building does not consume that receiver, so drop the handle
+        // before unwrapping the outcome's Arc.
+        drop(task);
+        match result {
+            Ok(outcome) => (
+                Some((
+                    outcome.state_root,
+                    Arc::unwrap_or_clone(outcome.trie_updates),
+                )),
+                Some(Arc::unwrap_or_clone(outcome.hashed_state)),
+                Some(wait_started_at.elapsed()),
+                true,
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    target: "arb-reth::engine",
+                    block = parent_header.number + 1,
+                    job = task_name,
+                    %err,
+                    "state-root task failed; falling back to synchronous state root",
+                );
+                (None, None, Some(wait_started_at.elapsed()), false)
             }
-        } else {
-            (None, None, false)
-        };
-    let outcome = builder
+        }
+    } else {
+        (None, None, None, false)
+    };
+    let mut outcome = builder
         .finish(
             FinishTimingStateProvider::new(trie_state_provider, Arc::clone(&finish_state_timings)),
             state_root_precomputed,
         )
         .wrap_err("BlockBuilder::finish failed")?;
+    // `BlockBuilder::finish` always derives a hashed post-state from the execution bundle even
+    // when a sparse-trie result was supplied. Keep the sparse task's policy-aware hashed state in
+    // the executed block as well, because this is what persistence writes to the hashed tables.
+    // The roots can agree while an omitted legacy storage wipe remains latent until the account is
+    // recreated in a later block.
+    if let Some(hashed_state) = state_root_task_hashed_state {
+        outcome.hashed_state = hashed_state;
+    }
 
     let finish = phase_started_at.elapsed();
     let finish_state_root = finish_state_timings.state_root();
