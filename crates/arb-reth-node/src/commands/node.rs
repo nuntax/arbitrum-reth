@@ -46,7 +46,7 @@ use reth_node_core::{
     args::{DatadirArgs, MetricArgs, PruningArgs},
     dirs::{DataDirPath, MaybePlatformPath},
 };
-use reth_provider::BlockNumReader;
+use reth_provider::{BlockNumReader, HeaderProvider};
 use reth_tracing::tracing::info;
 
 /// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
@@ -224,8 +224,8 @@ pub struct NodeArgs {
     #[arg(long = "l1-getlogs-range", value_name = "BLOCKS")]
     l1_getlogs_range: Option<u64>,
 
-    /// Delayed cursor before the start block. Optional override: defaults to the snapshot tip
-    /// header's nonce (the L2 tip's `delayedMessagesRead`), so it need not be supplied.
+    /// Delayed cursor before the start block. Optional override: defaults to the current durable L2
+    /// tip header's nonce (`delayedMessagesRead`), so it normally need not be supplied.
     #[arg(long = "l1-start-delayed")]
     l1_start_delayed: Option<u64>,
 
@@ -294,6 +294,16 @@ struct RollupDeployment {
 fn genesis_delayed_messages_read(chain_spec: &ChainSpec, l2_genesis_block: u64) -> Option<u64> {
     let header = chain_spec.genesis_header();
     (header.number == l2_genesis_block).then(|| u64::from_be_bytes(header.nonce.0))
+}
+
+/// Returns the delayed-message cursor stored in a persisted L2 header's nonce.
+fn header_delayed_messages_read<P>(provider: &P, block: u64) -> eyre::Result<Option<u64>>
+where
+    P: HeaderProvider<Header = alloy_consensus::Header>,
+{
+    Ok(provider
+        .sealed_header(block)?
+        .map(|header| u64::from_be_bytes(header.nonce.0)))
 }
 
 /// Resolve the rollup deployment from the CLI, with Nitro-like set/unset semantics:
@@ -419,9 +429,6 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // header (so reth's genesis-hash check accepts the DB). Takes precedence over --chain.
     // When --chain is provided the chain id is derived from the JSON so eth_chainId and the
     // driver agree. When not provided, the mainnet placeholder is used with --chain-id.
-    // `snapshot_delayed` carries the L2 tip's `delayedMessagesRead` (the header nonce) so the
-    // L1-sync delayed cursor defaults to it without a manual flag.
-    let mut snapshot_delayed: Option<u64> = None;
     let (chain_spec, effective_chain_id) = match (&orbit, &args.snapshot_head, &args.chain_config) {
         (Some((spec, init, info)), _, _) => {
             info!(
@@ -438,11 +445,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         }
         (None, Some(head_path), _) => {
             let (num, hash, header) = crate::read_head_header(head_path)?;
-            snapshot_delayed = Some(u64::from_be_bytes(header.nonce.0));
+            let delayed_messages_read = u64::from_be_bytes(header.nonce.0);
             info!(
                 target: "arb-reth",
                 head_block = num, %hash, chain_id = args.chain_id,
-                delayed_messages_read = snapshot_delayed.unwrap(),
+                delayed_messages_read,
                 "booting on snapshot head header",
             );
             (
@@ -750,15 +757,15 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         let (start_block, start_delayed, start_l2_block) = if let Some(b) = args.l1_start_block {
             // Manual override: the operator asserts `b` is the batch boundary the tip was built
             // from, so the next derived block is `db_tip + 1`.
-            let delayed = args
-                .l1_start_delayed
-                .or(snapshot_delayed)
-                .or(if db_tip == l2_genesis_block {
-                    genesis_delayed
-                } else {
-                    None
-                })
-                .unwrap_or(0);
+            let delayed = match args.l1_start_delayed {
+                Some(delayed) => delayed,
+                None => header_delayed_messages_read(&handle.provider, db_tip)?.ok_or_else(|| {
+                    eyre::eyre!(
+                        "cannot recover the delayed-message cursor: durable L2 tip header \
+                         {db_tip} is missing; pass --l1-start-delayed explicitly"
+                    )
+                })?,
+            };
             info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 resume point: --l1-start-block override");
             (b, delayed, db_tip)
         } else if let Some(log) = &resume_log {
@@ -873,6 +880,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::{B64, B256};
+    use reth_provider::test_utils::MockEthProvider;
 
     const ROBINHOOD_CHAIN_INFO: &[u8] =
         include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
@@ -892,6 +902,29 @@ mod tests {
             genesis_delayed_messages_read(&spec, init.genesis_block_number + 1),
             None,
             "a snapshot head must not be mistaken for the actual L2 genesis"
+        );
+    }
+
+    #[test]
+    fn manual_resume_delayed_cursor_comes_from_durable_tip_header() {
+        let provider: MockEthProvider = MockEthProvider::new();
+        let tip = 3_117;
+        provider.add_header(
+            B256::ZERO,
+            Header {
+                number: tip,
+                nonce: B64::new(393u64.to_be_bytes()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            header_delayed_messages_read(&provider, tip).unwrap(),
+            Some(393)
+        );
+        assert_eq!(
+            header_delayed_messages_read(&provider, tip + 1).unwrap(),
+            None
         );
     }
 }
