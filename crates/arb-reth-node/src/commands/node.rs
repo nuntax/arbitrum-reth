@@ -23,7 +23,7 @@
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crate::launcher::ArbLauncher;
@@ -287,6 +287,23 @@ struct RollupDeployment {
     l2_genesis_block: u64,
 }
 
+/// Validates the pair of files required to boot an Orbit chain.
+fn orbit_boot_paths<'a>(
+    chain_info: Option<&'a Path>,
+    genesis: Option<&'a Path>,
+) -> eyre::Result<Option<(&'a Path, &'a Path)>> {
+    match (chain_info, genesis) {
+        (Some(chain_info), Some(genesis)) => Ok(Some((chain_info, genesis))),
+        (Some(_), None) => Err(eyre::eyre!(
+            "--chain-info requires --genesis (the genesis state and prealloc are chain-specific)"
+        )),
+        (None, Some(_)) => Err(eyre::eyre!(
+            "--genesis requires --chain-info (the rollup addresses live there)"
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Returns the delayed-message cursor encoded in the actual L2 genesis header.
 ///
 /// Snapshot chain specs use the imported snapshot head as reth's genesis header, so only use its
@@ -384,32 +401,21 @@ async fn derive_genesis_from_l1(
 pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
 
-    // --chain-info boots an Orbit chain. Highest precedence; supplies BOTH the chain spec and the
-    // rollup deployment (L1 addresses). With --genesis the chain spec + prealloc come from the
-    // genesis file (byte-exact, for a chain that ships a custom genesis like Robinhood mainnet);
-    // without it the chain config comes from the chaininfo entry (ArbOS-init-only genesis, e.g. a
-    // testnet with "no custom genesis"). `--genesis` alone (no chaininfo) has no rollup addresses.
-    let orbit = match (&args.chain_info, &args.genesis_json) {
-        (Some(ci), genesis_opt) => {
+    // --chain-info plus --genesis boots an Orbit chain. The pair supplies both the chain spec and
+    // prealloc state, plus the L1 rollup deployment. Accepting either file alone would silently
+    // construct a different genesis.
+    let orbit = match orbit_boot_paths(
+        args.chain_info.as_deref(),
+        args.genesis_json.as_deref(),
+    )? {
+        Some((ci, genesis)) => {
             let ci_json = fs::read(ci).map_err(|e| eyre::eyre!("read chain-info {ci:?}: {e}"))?;
-            let (spec, init, info) = match genesis_opt {
-                Some(g) => {
-                    let g_json = fs::read(g).map_err(|e| eyre::eyre!("read genesis {g:?}: {e}"))?;
-                    crate::orbit_chain_from_files(&ci_json, &g_json)?
-                }
-                None => crate::orbit_chain_from_chain_info(
-                    &ci_json,
-                    args.initial_l1_base_fee.map(alloy_primitives::U256::from),
-                )?,
-            };
+            let genesis_json = fs::read(genesis)
+                .map_err(|e| eyre::eyre!("read genesis {genesis:?}: {e}"))?;
+            let (spec, init, info) = crate::orbit_chain_from_files(&ci_json, &genesis_json)?;
             Some((std::sync::Arc::new(spec), init, info))
         }
-        (None, Some(_)) => {
-            return Err(eyre::eyre!(
-                "--genesis requires --chain-info (the rollup addresses live there)"
-            ));
-        }
-        (None, None) => None,
+        None => None,
     };
 
     // Resolve the rollup addresses + deploy/genesis anchors as one set up front, so a
@@ -925,6 +931,30 @@ mod tests {
         assert_eq!(
             header_delayed_messages_read(&provider, tip + 1).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn orbit_boot_requires_chain_info_and_genesis_together() {
+        let chain_info = Path::new("chaininfo.json");
+        let genesis = Path::new("genesis.json");
+
+        assert_eq!(
+            orbit_boot_paths(Some(chain_info), Some(genesis)).unwrap(),
+            Some((chain_info, genesis))
+        );
+        assert!(orbit_boot_paths(None, None).unwrap().is_none());
+        assert!(
+            orbit_boot_paths(Some(chain_info), None)
+                .unwrap_err()
+                .to_string()
+                .contains("--chain-info requires --genesis")
+        );
+        assert!(
+            orbit_boot_paths(None, Some(genesis))
+                .unwrap_err()
+                .to_string()
+                .contains("--genesis requires --chain-info")
         );
     }
 }
