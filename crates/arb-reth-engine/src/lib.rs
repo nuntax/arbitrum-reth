@@ -253,12 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn arb_defaults_share_only_the_execution_cache() {
+    fn arb_defaults_share_execution_cache_and_sparse_trie() {
         let config = ArbEngineTuning::reth_defaults().to_tree_config();
 
         assert_eq!(config.cross_block_cache_size(), 256 * 1024 * 1024);
         assert!(config.share_execution_cache_with_payload_builder());
-        assert!(!config.share_sparse_trie_with_payload_builder());
+        assert!(config.share_sparse_trie_with_payload_builder());
     }
 }
 

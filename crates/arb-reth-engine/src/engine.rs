@@ -24,6 +24,7 @@ use arb_revm::executor::{
     ArbExecCfg, ArbParentHeader, digest_message, is_redeem_scheduled_log,
     scheduled_retries_from_redeem_logs,
 };
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -37,13 +38,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState, StateTrieOverlayManager};
+use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
 };
 use reth_engine_tree::engine::{EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine};
 use reth_engine_tree::persistence::PersistenceHandle;
-use reth_engine_tree::tree::state_root_strategy::PayloadStateRootHandle;
+use reth_engine_tree::tree::state_root_strategy::{
+    DefaultStateRootStrategy, PayloadStateRootHandle, PayloadStateRootJobContext,
+    PreparedStateRootJob, StateRootJobContext, StateRootStrategy,
+};
 use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler};
 use reth_evm::execute::BlockBuilder as _;
 use reth_evm::{ConfigureEvm as _, Evm as _};
@@ -65,16 +69,115 @@ use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
     DBProvider, PruneCheckpointReader, StageCheckpointReader, StateProvider, StorageSettingsCache,
 };
+use reth_storage_overlay::OverlayManager;
 use reth_tasks::Runtime;
 use reth_trie::{
     AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput, updates::TrieUpdates,
 };
-use reth_trie_db::ChangesetCache;
 use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
 use crate::{ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator};
+
+/// First ArbOS version that no longer creates an empty retryable escrow account for a zero-value
+/// transfer. Nitro calls this `ArbosVersion_Stylus`.
+const ARBOS_VERSION_STYLUS: u64 = 30;
+
+/// Selects the sparse-trie account policy for the child of `parent`.
+///
+/// Nitro always finalizes blocks with EIP-161 empty-account deletion enabled. Before Stylus,
+/// however, its zero-value transfer helper deliberately revives a deleted retryable escrow as a
+/// present-but-empty account. `arb-revm` represents that exception as an explicitly created empty
+/// account, which the sparse trie must preserve. The exception was removed in ArbOS 30.
+fn preserves_created_empty_accounts(parent: &Header) -> bool {
+    ArbHeaderInfo::decode_header(parent)
+        .is_ok_and(|info| info.is_arbitrum() && info.arbos_format_version < ARBOS_VERSION_STYLUS)
+}
+
+#[cfg(test)]
+mod state_root_policy_tests {
+    use super::*;
+
+    fn header_with_arbos_version(arbos_format_version: u64) -> Header {
+        let mut header = Header::default();
+        ArbHeaderInfo {
+            arbos_format_version,
+            ..Default::default()
+        }
+        .update_header(&mut header);
+        header
+    }
+
+    #[test]
+    fn preserves_created_empty_accounts_before_stylus() {
+        assert!(preserves_created_empty_accounts(
+            &header_with_arbos_version(29)
+        ));
+    }
+
+    #[test]
+    fn prunes_created_empty_accounts_from_stylus() {
+        assert!(!preserves_created_empty_accounts(
+            &header_with_arbos_version(30)
+        ));
+        assert!(!preserves_created_empty_accounts(
+            &header_with_arbos_version(51)
+        ));
+    }
+
+    #[test]
+    fn does_not_enable_exception_for_non_arbitrum_header() {
+        assert!(!preserves_created_empty_accounts(&Header::default()));
+        assert!(!preserves_created_empty_accounts(
+            &header_with_arbos_version(0)
+        ));
+    }
+}
+
+/// Reth's default state-root machinery with the historical ArbOS empty-account exception applied
+/// only to pre-Stylus blocks.
+#[derive(Debug)]
+struct ArbStateRootStrategy {
+    pre_stylus: DefaultStateRootStrategy,
+    stylus_and_later: DefaultStateRootStrategy,
+}
+
+impl Default for ArbStateRootStrategy {
+    fn default() -> Self {
+        Self {
+            pre_stylus: DefaultStateRootStrategy::default().with_allow_create_empty_account(true),
+            stylus_and_later: DefaultStateRootStrategy::default(),
+        }
+    }
+}
+
+impl<P> StateRootStrategy<ArbPrimitives, P, ArbEvmConfig> for ArbStateRootStrategy
+where
+    DefaultStateRootStrategy: StateRootStrategy<ArbPrimitives, P, ArbEvmConfig>,
+{
+    fn prepare(
+        &self,
+        ctx: StateRootJobContext<'_, ArbPrimitives, P, ArbEvmConfig>,
+    ) -> ProviderResult<PreparedStateRootJob<ArbPrimitives>> {
+        if preserves_created_empty_accounts(ctx.parent_header().header()) {
+            self.pre_stylus.prepare(ctx)
+        } else {
+            self.stylus_and_later.prepare(ctx)
+        }
+    }
+
+    fn prepare_payload_builder(
+        &self,
+        ctx: PayloadStateRootJobContext<'_, ArbPrimitives, P>,
+    ) -> ProviderResult<Option<PayloadStateRootHandle>> {
+        if preserves_created_empty_accounts(ctx.parent_header()) {
+            self.pre_stylus.prepare_payload_builder(ctx)
+        } else {
+            self.stylus_and_later.prepare_payload_builder(ctx)
+        }
+    }
+}
 
 /// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
 type ToTree = crossbeam_channel::Sender<
@@ -318,7 +421,7 @@ pub(crate) fn produce_with_timing<'a>(
     let phase_started_at = Instant::now();
 
     let finish_state_timings = Arc::new(FinishStateTimings::default());
-    let (state_root_precomputed, changed_paths, state_root_task_wait, state_root_task_succeeded) =
+    let (state_root_precomputed, state_root_task_wait, state_root_task_succeeded) =
         if let Some(mut task) = state_root_task {
             // Dropping the hook signals that the task has received every ArbOS state transition,
             // including the EIP-2935 prelude and start-block transaction.
@@ -330,7 +433,6 @@ pub(crate) fn produce_with_timing<'a>(
                         outcome.state_root,
                         Arc::unwrap_or_clone(outcome.trie_updates),
                     )),
-                    outcome.changed_paths,
                     Some(wait_started_at.elapsed()),
                     true,
                 ),
@@ -342,11 +444,11 @@ pub(crate) fn produce_with_timing<'a>(
                         %err,
                         "state-root task failed; falling back to synchronous state root",
                     );
-                    (None, None, Some(wait_started_at.elapsed()), false)
+                    (None, Some(wait_started_at.elapsed()), false)
                 }
             }
         } else {
-            (None, None, None, false)
+            (None, None, false)
         };
     let outcome = builder
         .finish(
@@ -391,7 +493,6 @@ pub(crate) fn produce_with_timing<'a>(
             execution_output,
             hashed_state: Arc::new(outcome.hashed_state),
             trie_updates: Arc::new(outcome.trie_updates),
-            changed_paths,
         },
         ArbBlockProductionTiming {
             total: started_at.elapsed(),
@@ -601,9 +702,8 @@ pub struct ArbEngineTuning {
     pub share_execution_cache_with_payload_builder: bool,
     /// Share reth's sparse trie task with the native payload builder.
     ///
-    /// This overlaps state-root computation with ArbOS execution. It is disabled by default to
-    /// retain reth's conservative payload-builder behavior on hosts that may build payloads in
-    /// parallel.
+    /// This overlaps state-root computation with ArbOS execution. The Arbitrum producer builds
+    /// one payload at a time, so sharing is enabled by default.
     pub share_sparse_trie_with_payload_builder: bool,
 }
 
@@ -625,7 +725,7 @@ impl ArbEngineTuning {
             persistence_backpressure_threshold: 16,
             execution_cache_size: 256 * 1024 * 1024,
             share_execution_cache_with_payload_builder: true,
-            share_sparse_trie_with_payload_builder: false,
+            share_sparse_trie_with_payload_builder: true,
         }
     }
 
@@ -1077,9 +1177,7 @@ where
         // ---- engine-tree wiring (all reth components) ----
         let consensus: Arc<dyn reth_consensus::FullConsensus<ArbPrimitives>> =
             Arc::new(reth_consensus::noop::NoopConsensus::default());
-        let changeset_cache = ChangesetCache::new();
-        let state_trie_overlays =
-            StateTrieOverlayManager::new(runtime.state_trie_overlay_worker_pool());
+        let state_trie_overlays = OverlayManager::new(runtime.state_trie_overlay_worker_pool());
         let tree_config = tuning.to_tree_config();
         tracing::info!(
             target: "arb-reth::engine",
@@ -1098,10 +1196,10 @@ where
             ArbPayloadValidator,
             tree_config.clone(),
             Box::new(NoopInvalidBlockHook::default()),
-            changeset_cache.clone(),
             state_trie_overlays.clone(),
             runtime.clone(),
-        );
+        )
+        .with_state_root_strategy(Arc::new(ArbStateRootStrategy::default()));
 
         let builder = ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id);
         let generator = ArbPayloadJobGenerator::new(provider.clone(), runtime.clone(), builder);
@@ -1126,7 +1224,6 @@ where
             tree_config.clone(),
             EngineApiKind::Ethereum,
             evm_config.clone(),
-            changeset_cache.clone(),
             runtime.clone(),
         );
 

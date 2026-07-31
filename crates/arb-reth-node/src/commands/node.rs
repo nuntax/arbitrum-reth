@@ -110,7 +110,9 @@ pub struct NodeArgs {
     /// with ArbOS execution. Recommended for this serial Arbitrum producer on a multi-core host.
     #[arg(
         long = "share-sparse-trie-with-payload-builder",
-        default_value_t = false
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
     )]
     share_sparse_trie_with_payload_builder: bool,
 
