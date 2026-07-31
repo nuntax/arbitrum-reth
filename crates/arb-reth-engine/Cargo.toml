@@ -31,23 +31,23 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 revm = { workspace = true }
 revm-database = "42.0.0"
 
-reth-chain-state = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-basic-payload-builder = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-engine-tree = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-execution-cache = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-execution-types = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-exex-types = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-payload-builder = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-payload-primitives = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
+reth-chain-state = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-basic-payload-builder = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-engine-tree = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-execution-cache = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-execution-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-exex-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-payload-builder = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-payload-primitives = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
-reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-prune = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-revm = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-stages-api = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa", features = ["db-api"] }
-reth-storage-overlay = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-trie = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
+reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-prune = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-revm = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-stages-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784", features = ["db-api"] }
+reth-storage-overlay = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-trie = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }

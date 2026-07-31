@@ -20,21 +20,21 @@ alloy-primitives = { version = "1", default-features = false }
 alloy-rpc-types-eth = { version = "2.0", default-features = false }
 eyre = "0.6.12"
 
-reth-chain-state = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-node-api = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
+reth-chain-state = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-consensus = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-engine-primitives = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-node-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
-reth-rpc = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-rpc-builder = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-rpc-convert = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-rpc-eth-types = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-rpc-server-types = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa", features = ["db-api"] }
-reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-tokio-util = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-transaction-pool = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
-reth-network-api = { git = "https://github.com/nuntax/reth.git", rev = "be196d9eb1c2216940a91563af46ac26ffc15eaa" }
+reth-rpc = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-rpc-builder = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-rpc-convert = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-rpc-eth-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-rpc-server-types = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784", features = ["db-api"] }
+reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-tokio-util = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-transaction-pool = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
+reth-network-api = { git = "https://github.com/nuntax/reth.git", rev = "9cc1ea540a32b57aa39c83064edbf94ab71e0784" }
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
