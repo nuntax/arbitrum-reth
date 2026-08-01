@@ -95,4 +95,9 @@ Stop the node before modifying the datadir. If `N` is the first divergent L2 blo
 
 Run the same `node` command again afterwards. Start with `rewind --dry-run` when the target has not been independently verified.
 
+Normally the node resumes from `arb-l1-resume.json`. If a rewind leaves no usable checkpoint and
+reports an L1 boundary, pass that boundary with `--l1-start-block`. The node recovers the matching
+delayed-message cursor from the durable L2 tip header. `--l1-start-delayed` is only needed to
+override that value during manual recovery.
+
 See the [node command](../commands/node.md), [observability guide](../observability/README.md), and [rewind command](../commands/rewind.md) for option details.

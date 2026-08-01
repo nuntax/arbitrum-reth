@@ -23,7 +23,7 @@
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crate::launcher::ArbLauncher;
@@ -46,7 +46,7 @@ use reth_node_core::{
     args::{DatadirArgs, MetricArgs, PruningArgs},
     dirs::{DataDirPath, MaybePlatformPath},
 };
-use reth_provider::BlockNumReader;
+use reth_provider::{BlockNumReader, HeaderProvider};
 use reth_tracing::tracing::info;
 
 /// `arb-reth`: standalone no-engine Arbitrum (ArbOS-on-reth) node.
@@ -224,8 +224,8 @@ pub struct NodeArgs {
     #[arg(long = "l1-getlogs-range", value_name = "BLOCKS")]
     l1_getlogs_range: Option<u64>,
 
-    /// Delayed cursor before the start block. Optional override: defaults to the snapshot tip
-    /// header's nonce (the L2 tip's `delayedMessagesRead`), so it need not be supplied.
+    /// Delayed cursor before the start block. Optional override: defaults to the current durable L2
+    /// tip header's nonce (`delayedMessagesRead`), so it normally need not be supplied.
     #[arg(long = "l1-start-delayed")]
     l1_start_delayed: Option<u64>,
 
@@ -287,6 +287,23 @@ struct RollupDeployment {
     l2_genesis_block: u64,
 }
 
+/// Validates the pair of files required to boot an Orbit chain.
+fn orbit_boot_paths<'a>(
+    chain_info: Option<&'a Path>,
+    genesis: Option<&'a Path>,
+) -> eyre::Result<Option<(&'a Path, &'a Path)>> {
+    match (chain_info, genesis) {
+        (Some(chain_info), Some(genesis)) => Ok(Some((chain_info, genesis))),
+        (Some(_), None) => Err(eyre::eyre!(
+            "--chain-info requires --genesis (the genesis state and prealloc are chain-specific)"
+        )),
+        (None, Some(_)) => Err(eyre::eyre!(
+            "--genesis requires --chain-info (the rollup addresses live there)"
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Returns the delayed-message cursor encoded in the actual L2 genesis header.
 ///
 /// Snapshot chain specs use the imported snapshot head as reth's genesis header, so only use its
@@ -294,6 +311,16 @@ struct RollupDeployment {
 fn genesis_delayed_messages_read(chain_spec: &ChainSpec, l2_genesis_block: u64) -> Option<u64> {
     let header = chain_spec.genesis_header();
     (header.number == l2_genesis_block).then(|| u64::from_be_bytes(header.nonce.0))
+}
+
+/// Returns the delayed-message cursor stored in a persisted L2 header's nonce.
+fn header_delayed_messages_read<P>(provider: &P, block: u64) -> eyre::Result<Option<u64>>
+where
+    P: HeaderProvider<Header = alloy_consensus::Header>,
+{
+    Ok(provider
+        .sealed_header(block)?
+        .map(|header| u64::from_be_bytes(header.nonce.0)))
 }
 
 /// Resolve the rollup deployment from the CLI, with Nitro-like set/unset semantics:
@@ -374,32 +401,21 @@ async fn derive_genesis_from_l1(
 pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
 
-    // --chain-info boots an Orbit chain. Highest precedence; supplies BOTH the chain spec and the
-    // rollup deployment (L1 addresses). With --genesis the chain spec + prealloc come from the
-    // genesis file (byte-exact, for a chain that ships a custom genesis like Robinhood mainnet);
-    // without it the chain config comes from the chaininfo entry (ArbOS-init-only genesis, e.g. a
-    // testnet with "no custom genesis"). `--genesis` alone (no chaininfo) has no rollup addresses.
-    let orbit = match (&args.chain_info, &args.genesis_json) {
-        (Some(ci), genesis_opt) => {
+    // --chain-info plus --genesis boots an Orbit chain. The pair supplies both the chain spec and
+    // prealloc state, plus the L1 rollup deployment. Accepting either file alone would silently
+    // construct a different genesis.
+    let orbit = match orbit_boot_paths(
+        args.chain_info.as_deref(),
+        args.genesis_json.as_deref(),
+    )? {
+        Some((ci, genesis)) => {
             let ci_json = fs::read(ci).map_err(|e| eyre::eyre!("read chain-info {ci:?}: {e}"))?;
-            let (spec, init, info) = match genesis_opt {
-                Some(g) => {
-                    let g_json = fs::read(g).map_err(|e| eyre::eyre!("read genesis {g:?}: {e}"))?;
-                    crate::orbit_chain_from_files(&ci_json, &g_json)?
-                }
-                None => crate::orbit_chain_from_chain_info(
-                    &ci_json,
-                    args.initial_l1_base_fee.map(alloy_primitives::U256::from),
-                )?,
-            };
+            let genesis_json = fs::read(genesis)
+                .map_err(|e| eyre::eyre!("read genesis {genesis:?}: {e}"))?;
+            let (spec, init, info) = crate::orbit_chain_from_files(&ci_json, &genesis_json)?;
             Some((std::sync::Arc::new(spec), init, info))
         }
-        (None, Some(_)) => {
-            return Err(eyre::eyre!(
-                "--genesis requires --chain-info (the rollup addresses live there)"
-            ));
-        }
-        (None, None) => None,
+        None => None,
     };
 
     // Resolve the rollup addresses + deploy/genesis anchors as one set up front, so a
@@ -419,9 +435,6 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // header (so reth's genesis-hash check accepts the DB). Takes precedence over --chain.
     // When --chain is provided the chain id is derived from the JSON so eth_chainId and the
     // driver agree. When not provided, the mainnet placeholder is used with --chain-id.
-    // `snapshot_delayed` carries the L2 tip's `delayedMessagesRead` (the header nonce) so the
-    // L1-sync delayed cursor defaults to it without a manual flag.
-    let mut snapshot_delayed: Option<u64> = None;
     let (chain_spec, effective_chain_id) = match (&orbit, &args.snapshot_head, &args.chain_config) {
         (Some((spec, init, info)), _, _) => {
             info!(
@@ -438,11 +451,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         }
         (None, Some(head_path), _) => {
             let (num, hash, header) = crate::read_head_header(head_path)?;
-            snapshot_delayed = Some(u64::from_be_bytes(header.nonce.0));
+            let delayed_messages_read = u64::from_be_bytes(header.nonce.0);
             info!(
                 target: "arb-reth",
                 head_block = num, %hash, chain_id = args.chain_id,
-                delayed_messages_read = snapshot_delayed.unwrap(),
+                delayed_messages_read,
                 "booting on snapshot head header",
             );
             (
@@ -750,15 +763,15 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         let (start_block, start_delayed, start_l2_block) = if let Some(b) = args.l1_start_block {
             // Manual override: the operator asserts `b` is the batch boundary the tip was built
             // from, so the next derived block is `db_tip + 1`.
-            let delayed = args
-                .l1_start_delayed
-                .or(snapshot_delayed)
-                .or(if db_tip == l2_genesis_block {
-                    genesis_delayed
-                } else {
-                    None
-                })
-                .unwrap_or(0);
+            let delayed = match args.l1_start_delayed {
+                Some(delayed) => delayed,
+                None => header_delayed_messages_read(&handle.provider, db_tip)?.ok_or_else(|| {
+                    eyre::eyre!(
+                        "cannot recover the delayed-message cursor: durable L2 tip header \
+                         {db_tip} is missing; pass --l1-start-delayed explicitly"
+                    )
+                })?,
+            };
             info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 resume point: --l1-start-block override");
             (b, delayed, db_tip)
         } else if let Some(log) = &resume_log {
@@ -873,6 +886,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::{B64, B256};
+    use reth_provider::test_utils::MockEthProvider;
 
     const ROBINHOOD_CHAIN_INFO: &[u8] =
         include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
@@ -892,6 +908,53 @@ mod tests {
             genesis_delayed_messages_read(&spec, init.genesis_block_number + 1),
             None,
             "a snapshot head must not be mistaken for the actual L2 genesis"
+        );
+    }
+
+    #[test]
+    fn manual_resume_delayed_cursor_comes_from_durable_tip_header() {
+        let provider: MockEthProvider = MockEthProvider::new();
+        let tip = 3_117;
+        provider.add_header(
+            B256::ZERO,
+            Header {
+                number: tip,
+                nonce: B64::new(393u64.to_be_bytes()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            header_delayed_messages_read(&provider, tip).unwrap(),
+            Some(393)
+        );
+        assert_eq!(
+            header_delayed_messages_read(&provider, tip + 1).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn orbit_boot_requires_chain_info_and_genesis_together() {
+        let chain_info = Path::new("chaininfo.json");
+        let genesis = Path::new("genesis.json");
+
+        assert_eq!(
+            orbit_boot_paths(Some(chain_info), Some(genesis)).unwrap(),
+            Some((chain_info, genesis))
+        );
+        assert!(orbit_boot_paths(None, None).unwrap().is_none());
+        assert!(
+            orbit_boot_paths(Some(chain_info), None)
+                .unwrap_err()
+                .to_string()
+                .contains("--chain-info requires --genesis")
+        );
+        assert!(
+            orbit_boot_paths(None, Some(genesis))
+                .unwrap_err()
+                .to_string()
+                .contains("--genesis requires --chain-info")
         );
     }
 }
