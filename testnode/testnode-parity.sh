@@ -116,7 +116,6 @@ cmd_run() {
     --l1-sequencer-inbox "$SEQUENCER_INBOX" \
     --l1-bridge "$BRIDGE" \
     --l1-start-block 0 \
-    --l1-start-delayed 0 \
     > "$ARB_LOG" 2>&1 &
   echo $! > "$ARB_PIDFILE"
   log "arb-reth pid $(cat "$ARB_PIDFILE"); logs at $ARB_LOG"
