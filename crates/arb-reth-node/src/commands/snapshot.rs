@@ -1,6 +1,6 @@
 //! `arb-reth snapshot import` / `arb-reth snapshot read`.
 //!
-//! ## `import`: import a Nitro genesis-state stream into reth MDBX.
+//! ## `import`: import a Nitro state stream into reth MDBX.
 //!
 //! Reads a line-oriented state export produced by Nitro's state-dumper and writes
 //! the accounts/bytecodes/storage directly into reth's `HashedAccounts`,
@@ -88,6 +88,8 @@ use reth_trie_db::{
 // Boot-wiring: write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
 use alloy_rlp::Decodable;
+use arb_revm::ArbSpecId;
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use reth_provider::{
     BlockNumReader, DatabaseProviderFactory, StageCheckpointWriter, StaticFileProviderFactory,
     StaticFileWriter,
@@ -143,6 +145,22 @@ struct SnapshotImportManifest {
     state_root: B256,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotPreimagePolicy {
+    /// Legacy destructive storage wipes are still possible. The current importer can prove a
+    /// complete preimage set only for the canonical Arbitrum One Nitro genesis.
+    CanonicalGenesisRequired,
+    /// ArbOS 20 enables non-destructive selfdestruct semantics, so a forward sync cannot wipe
+    /// storage that was inherited from the imported snapshot.
+    NotRequired,
+}
+
+impl SnapshotPreimagePolicy {
+    const fn requires_preimages(self) -> bool {
+        matches!(self, Self::CanonicalGenesisRequired)
+    }
+}
+
 /// Build Reth's native plaintext storage-slot preimage sidecar from a Nitro Classic export.
 #[derive(Debug, Parser)]
 #[command(
@@ -159,14 +177,14 @@ pub struct SnapshotBuildPreimagesArgs {
     out: PathBuf,
 }
 
-/// Import a Nitro genesis state stream into reth MDBX and verify the state root.
+/// Import a Nitro state stream into reth MDBX and verify the state root.
 #[derive(Debug, Parser)]
 #[command(
     name = "arb-snapshot-import",
-    about = "Import a Nitro genesis state stream into reth MDBX and verify the state root"
+    about = "Import a Nitro state stream into reth MDBX and verify the state root"
 )]
 pub struct SnapshotImportArgs {
-    /// Path to the Nitro genesis state stream file.
+    /// Path to the Nitro state stream file.
     #[arg(long, value_name = "FILE")]
     state: PathBuf,
 
@@ -400,25 +418,33 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     let rocksdb_path = args.out.join("rocksdb");
     let preimage_path = db_path.join("preimage");
     ensure_fresh_import_target(&args.out)?;
-    if !preimage_path.join("mdbx.dat").is_file() {
-        eyre::bail!(
-            "slot-preimage sidecar is missing at {}; run `arb-reth snapshot build-preimages` first",
-            preimage_path.display()
-        );
-    }
-    let manifest = read_preimage_manifest(&preimage_path)?;
-    let preimages = SlotPreimages::open(&preimage_path)?;
 
     let head = read_head_header(&args.blocks)?;
-    validate_snapshot_identity(expected, manifest, &head)?;
+    let preimage_policy = validate_snapshot_identity(expected, &head)?;
+    let preimage_manifest = if preimage_policy.requires_preimages() {
+        if !preimage_path.join("mdbx.dat").is_file() {
+            eyre::bail!(
+                "slot-preimage sidecar is missing at {}; run `arb-reth snapshot build-preimages` first",
+                preimage_path.display()
+            );
+        }
+        Some(read_preimage_manifest(&preimage_path)?)
+    } else {
+        None
+    };
+    let preimages = preimage_policy
+        .requires_preimages()
+        .then(|| SlotPreimages::open(&preimage_path))
+        .transpose()?;
+    let preimage_reader = preimages.as_ref().map(SlotPreimages::reader).transpose()?;
 
     tracing::info!(path = ?args.state, "validating state stream before database creation");
-    let state_stats = preflight_state_stream(&args.state, &preimages.reader()?)?;
+    let state_stats = preflight_state_stream(&args.state, preimage_reader.as_ref())?;
     tracing::info!(
         accounts = state_stats.accounts,
         slots = state_stats.slots,
         bytecodes = state_stats.bytecodes,
-        unique_slot_preimages = manifest.unique_mappings,
+        unique_slot_preimages = preimage_manifest.map(|manifest| manifest.unique_mappings),
         "state stream preflight complete"
     );
 
@@ -463,7 +489,7 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     }
 
     tracing::info!(path = ?args.state, "streaming state import (storage v2)");
-    stream_import(&factory, &args.state, &preimages.reader()?)?;
+    stream_import(&factory, &args.state, preimage_reader.as_ref())?;
 
     tracing::info!("computing state root (may take several minutes for large states)");
     let computed = compute_state_root_chunked(&factory)?;
@@ -499,21 +525,10 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
 
 fn validate_snapshot_identity(
     expected: B256,
-    manifest: SlotPreimageManifest,
     head: &(u64, B256, Header),
-) -> eyre::Result<()> {
-    if expected != arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT {
-        eyre::bail!(
-            "Arbitrum One Nitro genesis state root must be {:#x}, got {expected:#x}",
-            arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT
-        );
-    }
-    if head.0 != manifest.stats.next_block_number {
-        eyre::bail!(
-            "snapshot head block {} does not match Classic export block {}",
-            head.0,
-            manifest.stats.next_block_number
-        );
+) -> eyre::Result<SnapshotPreimagePolicy> {
+    if head.2.number != head.0 || head.2.hash_slow() != head.1 {
+        eyre::bail!("snapshot head contains an invalid number or block hash");
     }
     if head.2.state_root != expected {
         eyre::bail!(
@@ -521,14 +536,24 @@ fn validate_snapshot_identity(
             head.2.state_root
         );
     }
-    if head.1 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_HASH {
+
+    let info = ArbHeaderInfo::decode_header(&head.2)
+        .map_err(|error| eyre::eyre!("decode snapshot head ArbOS version: {error}"))?;
+    let spec = ArbSpecId::from_arbos_version(info.arbos_format_version);
+    if spec.is_enabled_in(ArbSpecId::ARBOS_20) {
+        return Ok(SnapshotPreimagePolicy::NotRequired);
+    }
+
+    if head.0 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_NUMBER
+        || head.1 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_HASH
+        || expected != arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT
+    {
         eyre::bail!(
-            "snapshot head hash {:#x} does not match canonical Arbitrum One Nitro genesis hash {:#x}",
-            head.1,
-            arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_HASH,
+            "pre-ArbOS 20 snapshot at block {} requires a complete slot-preimage set for that exact snapshot; currently only the canonical Arbitrum One Nitro genesis is supported",
+            head.0
         );
     }
-    Ok(())
+    Ok(SnapshotPreimagePolicy::CanonicalGenesisRequired)
 }
 
 fn write_snapshot_import_manifest(
@@ -574,12 +599,6 @@ fn validate_snapshot_import_manifest(
     if head.2.number != head.0 || head.2.hash_slow() != head.1 {
         eyre::bail!("snapshot head stream contains an invalid number or block hash");
     }
-    if head.0 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_NUMBER
-        || head.1 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_HASH
-        || head.2.state_root != arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT
-    {
-        eyre::bail!("snapshot import manifest is not the canonical Arbitrum One Nitro genesis");
-    }
     Ok(())
 }
 
@@ -589,27 +608,32 @@ pub(crate) fn validate_snapshot_import_for_launch(
     head: &(u64, B256, Header),
 ) -> eyre::Result<()> {
     let preimage_path = out.join("db/preimage");
-    if !preimage_path.join(MANIFEST_FILE).is_file() {
+    let import_manifest_path = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
+    if !import_manifest_path.is_file() && !preimage_path.join(MANIFEST_FILE).is_file() {
         // Older imports predate completion manifests. Preserve their existing launch behavior.
         return Ok(());
     }
-    if !preimage_path.join("mdbx.dat").is_file() {
-        eyre::bail!(
-            "snapshot slot-preimage database is missing at {}",
-            preimage_path.display()
-        );
-    }
-    read_preimage_manifest(&preimage_path)?;
 
-    let path = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
     let manifest: SnapshotImportManifest =
-        serde_json::from_reader(File::open(&path).map_err(|error| {
+        serde_json::from_reader(File::open(&import_manifest_path).map_err(|error| {
             eyre::eyre!(
                 "snapshot import is incomplete: missing completion manifest at {}: {error}",
-                path.display()
+                import_manifest_path.display()
             )
         })?)?;
-    validate_snapshot_import_manifest(manifest, head)
+    validate_snapshot_import_manifest(manifest, head)?;
+
+    let preimage_policy = validate_snapshot_identity(head.2.state_root, head)?;
+    if preimage_policy.requires_preimages() {
+        if !preimage_path.join("mdbx.dat").is_file() {
+            eyre::bail!(
+                "snapshot slot-preimage database is missing at {}",
+                preimage_path.display()
+            );
+        }
+        read_preimage_manifest(&preimage_path)?;
+    }
+    Ok(())
 }
 
 fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
@@ -1139,7 +1163,7 @@ fn parse_state_record(line: &str, line_number: usize) -> eyre::Result<Option<Sta
 
 fn preflight_state_stream(
     path: &Path,
-    preimages: &SlotPreimagesReader,
+    preimages: Option<&SlotPreimagesReader>,
 ) -> eyre::Result<StateStreamStats> {
     let reader = BufReader::with_capacity(4 * 1024 * 1024, File::open(path)?);
     let mut stats = StateStreamStats::default();
@@ -1170,12 +1194,14 @@ fn preflight_state_stream(
                 if value.is_zero() {
                     continue;
                 }
-                require_slot_preimage(preimages, slot_hash).map_err(|error| {
-                    eyre::eyre!(
-                        "S: invalid slot preimage at line {}: {error}",
-                        line_index + 1
-                    )
-                })?;
+                if let Some(preimages) = preimages {
+                    require_slot_preimage(preimages, slot_hash).map_err(|error| {
+                        eyre::eyre!(
+                            "S: invalid slot preimage at line {}: {error}",
+                            line_index + 1
+                        )
+                    })?;
+                }
                 stats.slots += 1;
             }
         }
@@ -1196,7 +1222,7 @@ fn preflight_state_stream(
 fn stream_import<PF>(
     factory: &PF,
     path: &PathBuf,
-    preimages: &SlotPreimagesReader,
+    preimages: Option<&SlotPreimagesReader>,
 ) -> eyre::Result<()>
 where
     PF: reth_provider::DatabaseProviderFactory<ProviderRW: DBProvider<Tx: DbTxMut>>,
@@ -1291,9 +1317,11 @@ where
                     continue;
                 }
 
-                require_slot_preimage(preimages, slot_hash).map_err(|e| {
-                    eyre::eyre!("S: invalid slot preimage at line {}: {e}", line_index + 1)
-                })?;
+                if let Some(preimages) = preimages {
+                    require_slot_preimage(preimages, slot_hash).map_err(|e| {
+                        eyre::eyre!("S: invalid slot preimage at line {}: {e}", line_index + 1)
+                    })?;
+                }
 
                 // Commit if threshold reached.
                 if storage_units >= COMMIT_THRESHOLD {
@@ -1598,12 +1626,21 @@ mod tests {
             ),
         )?;
         assert_eq!(
-            preflight_state_stream(&state_path, &store.reader()?)?,
+            preflight_state_stream(&state_path, Some(&store.reader()?))?,
             StateStreamStats {
                 accounts: 1,
                 slots: 1,
                 bytecodes: 1,
             }
+        );
+        assert_eq!(
+            preflight_state_stream(&state_path, None)?,
+            StateStreamStats {
+                accounts: 1,
+                slots: 1,
+                bytecodes: 1,
+            },
+            "post-ArbOS 20 snapshots do not require slot preimages"
         );
 
         std::fs::write(
@@ -1613,11 +1650,11 @@ mod tests {
                 B256::ZERO
             ),
         )?;
-        let error = preflight_state_stream(&state_path, &store.reader()?).unwrap_err();
+        let error = preflight_state_stream(&state_path, Some(&store.reader()?)).unwrap_err();
         assert!(error.to_string().contains("missing bytecode record"));
 
         std::fs::write(&state_path, format!("C {code_hash:#x} 00\n"))?;
-        let error = preflight_state_stream(&state_path, &store.reader()?).unwrap_err();
+        let error = preflight_state_stream(&state_path, Some(&store.reader()?)).unwrap_err();
         assert!(error.to_string().contains("bytecode hash mismatch"));
         Ok(())
     }
@@ -1710,20 +1747,20 @@ mod tests {
 
     #[test]
     fn snapshot_identity_binds_export_header_and_state_root() {
-        let manifest = canonical_test_manifest();
         let head = canonical_test_head();
-        validate_snapshot_identity(
-            arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
-            manifest,
-            &head,
-        )
-        .unwrap();
+        assert_eq!(
+            validate_snapshot_identity(
+                arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
+                &head,
+            )
+            .unwrap(),
+            SnapshotPreimagePolicy::CanonicalGenesisRequired
+        );
 
         let wrong_number = (head.0 + 1, head.1, head.2.clone());
         assert!(
             validate_snapshot_identity(
                 arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
-                manifest,
                 &wrong_number,
             )
             .is_err()
@@ -1734,23 +1771,41 @@ mod tests {
         assert!(
             validate_snapshot_identity(
                 arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
-                manifest,
                 &(head.0, head.1, wrong_root_header),
             )
             .is_err()
         );
-        assert!(validate_snapshot_identity(B256::ZERO, manifest, &head).is_err());
+        assert!(validate_snapshot_identity(B256::ZERO, &head).is_err());
 
         let mut alternate_header = head.2.clone();
         alternate_header.timestamp += 1;
         let alternate = (head.0, alternate_header.hash_slow(), alternate_header);
         let error = validate_snapshot_identity(
             arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
-            manifest,
             &alternate,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("canonical Arbitrum One"));
+        assert!(error.to_string().contains("pre-ArbOS 20 snapshot"));
+
+        let mut post_arbos_twenty = Header {
+            number: 500_000_000,
+            state_root: b256!("1111111111111111111111111111111111111111111111111111111111111111"),
+            ..Default::default()
+        };
+        ArbHeaderInfo {
+            arbos_format_version: 20,
+            ..Default::default()
+        }
+        .update_header(&mut post_arbos_twenty);
+        let post_arbos_twenty = (
+            post_arbos_twenty.number,
+            post_arbos_twenty.hash_slow(),
+            post_arbos_twenty,
+        );
+        assert_eq!(
+            validate_snapshot_identity(post_arbos_twenty.2.state_root, &post_arbos_twenty).unwrap(),
+            SnapshotPreimagePolicy::NotRequired
+        );
     }
 
     #[test]
@@ -1772,6 +1827,21 @@ mod tests {
         altered_header.timestamp += 1;
         let altered = (head.0, altered_header.hash_slow(), altered_header);
         assert!(validate_snapshot_import_for_launch(temp.path(), &altered).is_err());
+
+        let post_temp = tempfile::tempdir()?;
+        let mut post_header = Header {
+            number: 500_000_000,
+            state_root: b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+            ..Default::default()
+        };
+        ArbHeaderInfo {
+            arbos_format_version: 20,
+            ..Default::default()
+        }
+        .update_header(&mut post_header);
+        let post_head = (post_header.number, post_header.hash_slow(), post_header);
+        write_snapshot_import_manifest(post_temp.path(), &post_head)?;
+        validate_snapshot_import_for_launch(post_temp.path(), &post_head)?;
         Ok(())
     }
 
@@ -1784,11 +1854,16 @@ mod tests {
         drop(SlotPreimages::open(&preimage_path)?);
         write_preimage_manifest(&preimage_path, canonical_test_manifest())?;
 
-        let header = Header {
+        let mut header = Header {
             number: arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_NUMBER + 1,
             state_root: arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
             ..Default::default()
         };
+        ArbHeaderInfo {
+            arbos_format_version: 19,
+            ..Default::default()
+        }
+        .update_header(&mut header);
         let blocks = temp.path().join("head.stream");
         std::fs::write(
             &blocks,
@@ -1807,7 +1882,7 @@ mod tests {
             blocks,
         })
         .unwrap_err();
-        assert!(error.to_string().contains("does not match Classic export"));
+        assert!(error.to_string().contains("pre-ArbOS 20 snapshot"));
         assert!(!out.join("db/mdbx.dat").exists());
         assert!(!out.join("static_files").exists());
         assert!(!out.join("rocksdb").exists());
