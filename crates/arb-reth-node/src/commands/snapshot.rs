@@ -489,6 +489,9 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     // node re-scans on boot.
     drop(factory);
     rename_changeset_files_to_header(&static_files_path)?;
+    for path in [&db_path, &static_files_path, &rocksdb_path] {
+        sync_directory(path)?;
+    }
     write_snapshot_import_manifest(&args.out, &head)?;
 
     Ok(())
