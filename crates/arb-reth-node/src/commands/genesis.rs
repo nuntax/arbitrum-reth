@@ -25,38 +25,11 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use alloy_primitives::{address, hex, Address, B256, U256};
+use alloy_primitives::{hex, Address, B256, U256};
 use alloy_trie::{TrieAccount, EMPTY_ROOT_HASH};
-use arb_revm::arbos_init::{build_mainnet_genesis_accounts, ArbosInitConfig};
-use arb_reth_genesis::{readers, verify};
+use arb_revm::arbos_init::build_mainnet_genesis_accounts;
+use arb_reth_genesis::{arbitrum_one, readers, verify};
 use clap::Parser;
-
-/// ArbOS state account (Nitro constant 0xa4b05ff…).
-const ARBOS_STATE: Address = address!("0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
-
-/// Arbitrum One Nitro-genesis oracles (block 22207817), read from the live chain.
-const GENESIS_STATE_ROOT: &str =
-    "0x7f2bfc4481d02bfcfc606ebb949384ef78d03a0f30a2dc9cccd652eb80926ae1";
-const ARBOS_STORAGE_ROOT: &str =
-    "0x95d4357ce7baf56bfdcc4f01b594b8f071c588adf58fd79e322ea6d029748573";
-/// `prevHeader.Time` at the migration == genesis block timestamp; the retryable expiry cutoff.
-const GENESIS_TIMESTAMP: u64 = 1661956342;
-
-/// Exact ArbOS init parameters for the Arbitrum One genesis, all verified via eth_getProof on
-/// 0xa4b05… @ block 22207817 (the response's storageHash matched the sub-oracle).
-fn arb_one_init() -> ArbosInitConfig {
-    ArbosInitConfig {
-        initial_arbos_version: 6,
-        initial_chain_owner: address!("0xd345e41ae2cb00311956aa7109fc801ae8c81a52"),
-        chain_id: U256::from(42161u64),
-        genesis_block_number: 22207817,
-        initial_l1_base_fee: U256::from(50_000_000_000u64), // 50 GWei
-        // chainConfig StorageBytes length == 0 at the v6 genesis (added in a later ArbOS version);
-        // an empty Vec makes our unconditional `chain_config.set` a no-op, matching the chain.
-        serialized_chain_config: Vec::new(),
-        debug_precompiles: false,
-    }
-}
 
 /// Convert the Nitro classic-state export into a reth-readable genesis and verify the state root.
 #[derive(Debug, Parser)]
@@ -110,7 +83,7 @@ pub fn verify(args: GenesisVerifyArgs) -> eyre::Result<()> {
         t.elapsed().as_secs_f64()
     );
 
-    let config = arb_one_init();
+    let config = arbitrum_one::init_config();
 
     let built = if arbos_only {
         println!("building ArbOS state only (no classic accounts)…");
@@ -120,7 +93,7 @@ pub fn verify(args: GenesisVerifyArgs) -> eyre::Result<()> {
             address_table,
             retryables,
             std::iter::empty(),
-            GENESIS_TIMESTAMP,
+            arbitrum_one::GENESIS_TIMESTAMP,
         )
         .map_err(|e| eyre::eyre!(e))?;
         println!("built {} ArbOS accounts in {:.1}s", accounts.len(), t.elapsed().as_secs_f64());
@@ -151,7 +124,7 @@ pub fn verify(args: GenesisVerifyArgs) -> eyre::Result<()> {
             address_table,
             retryables,
             acct_iter,
-            GENESIS_TIMESTAMP,
+            arbitrum_one::GENESIS_TIMESTAMP,
         )
         .map_err(|e| eyre::eyre!(e))?;
         println!(
@@ -188,10 +161,10 @@ pub fn verify(args: GenesisVerifyArgs) -> eyre::Result<()> {
     // ArbOS storage sub-root check (always available).
     let arbos = built
         .iter()
-        .find(|a| a.address == ARBOS_STATE)
+        .find(|a| a.address == arbitrum_one::ARBOS_STATE)
         .ok_or_else(|| eyre::eyre!("ArbOS state account 0xa4b05… not found in built genesis"))?;
     let arbos_root = verify::storage_root_of(arbos);
-    let arbos_ok = format!("{arbos_root:#x}") == ARBOS_STORAGE_ROOT;
+    let arbos_ok = arbos_root == arbitrum_one::ARBOS_STORAGE_ROOT;
     println!(
         "ArbOS storage root: {arbos_root:#x}  [{}]  ({} storage slots)",
         if arbos_ok { "MATCH" } else { "MISMATCH" },
@@ -200,7 +173,7 @@ pub fn verify(args: GenesisVerifyArgs) -> eyre::Result<()> {
 
     if arbos_only {
         if !arbos_ok {
-            eyre::bail!("ArbOS storage root mismatch (expected {ARBOS_STORAGE_ROOT})");
+            eyre::bail!("ArbOS storage root mismatch (expected {:#x})", arbitrum_one::ARBOS_STORAGE_ROOT);
         }
         println!("\n✅ ArbOS sub-oracle MATCH");
         return Ok(());
@@ -208,14 +181,14 @@ pub fn verify(args: GenesisVerifyArgs) -> eyre::Result<()> {
 
     let t = Instant::now();
     let root = verify::state_root(&built);
-    let ok = format!("{root:#x}") == GENESIS_STATE_ROOT;
+    let ok = root == arbitrum_one::GENESIS_STATE_ROOT;
     println!(
         "full genesis state root: {root:#x}  [{}]  (computed in {:.1}s)",
         if ok { "MATCH" } else { "MISMATCH" },
         t.elapsed().as_secs_f64()
     );
     if !ok {
-        eyre::bail!("genesis state root mismatch (expected {GENESIS_STATE_ROOT})");
+        eyre::bail!("genesis state root mismatch (expected {:#x})", arbitrum_one::GENESIS_STATE_ROOT);
     }
     println!("\n✅ Arbitrum One genesis state root MATCH (block 22207817)");
     Ok(())

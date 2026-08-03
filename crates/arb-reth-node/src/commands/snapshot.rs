@@ -87,6 +87,7 @@ use reth_provider::{
     StaticFileWriter,
 };
 use reth_stages_types::{StageCheckpoint, StageId};
+use reth_stages::stages::slot_preimages::SlotPreimages;
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{HeaderProvider, PruneCheckpointReader, PruneCheckpointWriter};
 
@@ -117,6 +118,25 @@ const KECCAK_EMPTY: [u8; 32] =
 
 use crate::ArbNode;
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
+
+/// Number of preimages sorted and inserted in one auxiliary MDBX transaction.
+const PREIMAGE_BATCH_SIZE: usize = 250_000;
+
+/// Build Reth's native plaintext storage-slot preimage sidecar from a Nitro Classic export.
+#[derive(Debug, Parser)]
+#[command(
+    name = "arb-snapshot-build-preimages",
+    about = "Build the Storage V2 slot-preimage sidecar from a Nitro Classic state export"
+)]
+pub struct SnapshotBuildPreimagesArgs {
+    /// Classic state export directory containing index.json and its referenced JSON files.
+    #[arg(long, value_name = "DIR")]
+    classic_state: PathBuf,
+
+    /// Target reth datadir. The sidecar is written to `<out>/db/preimage`.
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
+}
 
 /// Import a Nitro genesis state stream into reth MDBX and verify the state root.
 #[derive(Debug, Parser)]
@@ -183,6 +203,56 @@ pub struct SnapshotRepairHistoryArgs {
     /// Blocks stream whose highest header is the imported snapshot head.
     #[arg(long, value_name = "FILE")]
     snapshot_head: PathBuf,
+}
+
+/// Construct the native `keccak256(slot) -> plain slot` sidecar used by Storage V2.
+pub fn build_preimages(args: SnapshotBuildPreimagesArgs) -> eyre::Result<()> {
+    let preimage_path = args.out.join("db").join("preimage");
+    std::fs::create_dir_all(&preimage_path)?;
+    let store = SlotPreimages::open(&preimage_path)?;
+    let mut batch = Vec::with_capacity(PREIMAGE_BATCH_SIZE);
+    let mut inserted_candidates = 0u64;
+
+    let stats = arb_reth_genesis::preimages::visit_arbitrum_one_slot_preimages(
+        &args.classic_state,
+        |hashed_slot, plain_slot| {
+            batch.push((hashed_slot, plain_slot));
+            if batch.len() == PREIMAGE_BATCH_SIZE {
+                inserted_candidates += flush_preimage_batch(&store, &mut batch)? as u64;
+                tracing::info!(inserted_candidates, "building slot-preimage sidecar");
+            }
+            Ok(())
+        },
+    )?;
+    inserted_candidates += flush_preimage_batch(&store, &mut batch)? as u64;
+
+    println!("preimage store       = {}", preimage_path.display());
+    println!("classic accounts     = {}", stats.classic_accounts);
+    println!("classic storage slots= {}", stats.classic_slots);
+    println!("ArbOS accounts       = {}", stats.arbos_accounts);
+    println!("ArbOS storage slots  = {}", stats.arbos_slots);
+    println!("source slot mappings = {}", stats.total_slots());
+    println!("batch-unique mappings= {inserted_candidates}");
+    Ok(())
+}
+
+fn flush_preimage_batch(
+    store: &SlotPreimages,
+    batch: &mut Vec<(B256, B256)>,
+) -> eyre::Result<usize> {
+    if batch.is_empty() {
+        return Ok(0)
+    }
+
+    batch.sort_unstable_by_key(|(hashed_slot, _)| *hashed_slot);
+    batch.dedup_by_key(|(hashed_slot, _)| *hashed_slot);
+    debug_assert!(batch
+        .iter()
+        .all(|(hashed_slot, plain_slot)| *hashed_slot == keccak256(*plain_slot)));
+    store.insert_preimages(batch)?;
+    let inserted_candidates = batch.len();
+    batch.clear();
+    Ok(inserted_candidates)
 }
 
 pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
@@ -907,6 +977,27 @@ mod tests {
     use reth_storage_api::{
         AccountReader, PruneCheckpointReader, StateProvider, TryIntoHistoricalStateProvider,
     };
+
+    #[test]
+    fn preimage_batches_are_deduplicated_and_native_store_roundtrips() -> eyre::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = SlotPreimages::open(temp.path())?;
+        let plain_a = b256!("0000000000000000000000000000000000000000000000000000000000000042");
+        let plain_b = b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let mut batch = vec![
+            (keccak256(plain_b), plain_b),
+            (keccak256(plain_a), plain_a),
+            (keccak256(plain_a), plain_a),
+        ];
+
+        assert_eq!(flush_preimage_batch(&store, &mut batch)?, 2);
+        assert!(batch.is_empty());
+
+        let reader = store.reader()?;
+        assert_eq!(reader.get(&keccak256(plain_a))?, Some(plain_a));
+        assert_eq!(reader.get(&keccak256(plain_b))?, Some(plain_b));
+        Ok(())
+    }
 
     #[test]
     fn snapshot_history_boundaries_preserve_imported_state_during_rocks_ahead_window()
