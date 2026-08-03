@@ -59,5 +59,5 @@ reth-trie = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc44
 reth-db-common = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-chainspec = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-node-types = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
-reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872", features = ["test-utils"] }
+reth-provider = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872", features = ["test-utils", "partial-persistence"] }
 tempfile = "3"

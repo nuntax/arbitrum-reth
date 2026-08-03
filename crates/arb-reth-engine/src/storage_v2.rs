@@ -819,6 +819,34 @@ mod tests {
     }
 
     #[test]
+    fn storage_wipe_marks_an_empty_hashed_storage_update() {
+        let address = address!("0000000000000000000000000000000000001234");
+        let mut revert = AccountRevert::default();
+        revert.wipe_storage = true;
+        let mut state = BundleState::default();
+        state.reverts = Reverts::new(vec![vec![(address, revert)]]);
+        let mut block = executed_block(
+            arb_header(1, B256::ZERO, B256::ZERO),
+            state,
+            HashedPostState::default(),
+            TrieUpdates::default(),
+        );
+
+        mark_hashed_storage_wipes(&mut block);
+
+        let hashed_address = keccak256(address);
+        let trie_data = block.trie_data();
+        let storage = trie_data
+            .sorted
+            .hashed_state
+            .storages
+            .get(&hashed_address)
+            .expect("wipe marker must exist even without changed slots");
+        assert!(storage.wiped);
+        assert!(storage.storage_slots.is_empty());
+    }
+
+    #[test]
     fn arbos_twenty_uses_non_destructive_selfdestruct_semantics() {
         let mut legacy = Header::default();
         ArbHeaderInfo {
@@ -852,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_v2_wipe_persists_plain_changeset_and_unwinds() -> eyre::Result<()> {
+    fn storage_v2_partial_frontier_masks_flushes_and_unwinds_a_wipe() -> eyre::Result<()> {
         let factory = create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
         let genesis_hash = init_genesis_with_settings(&factory, StorageSettings::v2())?;
 
@@ -945,10 +973,37 @@ mod tests {
 
         let (response_tx, response_rx) = crossbeam_channel::bounded(1);
         persistence.save_blocks(
-            SaveBlocksInput::new(vec![initial, destroyed], 0, 0, 2, 2),
+            SaveBlocksInput::new(vec![initial, destroyed.clone()], 0, 0, 2, 1),
             response_tx,
         )?;
         response_rx.recv_timeout(std::time::Duration::from_secs(10))?;
+
+        let provider = factory.provider()?;
+        let checkpoint = provider
+            .get_stage_checkpoint(StageId::Finish)?
+            .expect("Finish checkpoint must exist");
+        assert_eq!(checkpoint.block_number, 2);
+        assert_eq!(
+            checkpoint
+                .finish_stage_checkpoint()
+                .expect("partial frontier must be recorded")
+                .partial_state_trie,
+            Some(1)
+        );
+
+        // Block 1 creates the storage, but block 2 is the in-memory masking suffix and wipes it.
+        // The durable hashed-state/trie frontier must therefore not retain block 1's slots.
+        let mut hashed_storage = provider
+            .tx_ref()
+            .cursor_dup_read::<tables::HashedStorages>()?;
+        assert!(hashed_storage.seek_exact(keccak256(address))?.is_none());
+        let mut storage_trie = provider
+            .tx_ref()
+            .cursor_dup_read::<tables::StoragesTrie>()?;
+        assert!(storage_trie.seek_exact(keccak256(address))?.is_none());
+        drop(storage_trie);
+        drop(hashed_storage);
+        drop(provider);
 
         let changeset = factory.static_file_provider().storage_changeset(2)?;
         assert!(changeset.iter().any(|(block_address, entry)| {
@@ -962,6 +1017,23 @@ mod tests {
                 && entry.value == value_b
         }));
 
+        // Advance only the state/trie frontier through the masking block. This is the next
+        // persistence cycle used by the engine when a retained suffix becomes durable.
+        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+        persistence.save_blocks(
+            SaveBlocksInput::new(vec![destroyed], 2, 1, 2, 2),
+            response_tx,
+        )?;
+        response_rx.recv_timeout(std::time::Duration::from_secs(10))?;
+
+        let provider = factory.provider()?;
+        let checkpoint = provider
+            .get_stage_checkpoint(StageId::Finish)?
+            .expect("Finish checkpoint must exist");
+        assert_eq!(checkpoint.block_number, 2);
+        assert!(checkpoint.finish_stage_checkpoint().is_none());
+        drop(provider);
+
         let state = factory.latest()?;
         assert_eq!(state.basic_account(&address)?, None);
         assert_eq!(
@@ -971,6 +1043,10 @@ mod tests {
         assert_eq!(
             state.storage(address, B256::from(slot_b.to_be_bytes()))?,
             None
+        );
+        assert_eq!(
+            state.state_root(HashedPostState::default())?,
+            destroyed_root
         );
         drop(state);
 
