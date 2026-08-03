@@ -4,12 +4,27 @@ use std::path::Path;
 
 use alloy_primitives::{B256, keccak256};
 use arb_revm::arbos_init::build_mainnet_genesis_accounts;
+use serde::{Deserialize, Serialize};
 
 use crate::{arbitrum_one, readers};
 
+/// Completion marker written into a fully-built slot-preimage sidecar.
+pub const MANIFEST_FILE: &str = "manifest.json";
+
+const MANIFEST_VERSION: u64 = 1;
+const CLASSIC_ACCOUNTS: u64 = 1_294_583;
+const CLASSIC_STORAGE_SLOTS: u64 = 24_491_013;
+const ADDRESS_TABLE_ENTRIES: u64 = 680_046;
+const RETRYABLES: u64 = 16_206;
+const ARBOS_ACCOUNTS: u64 = 15;
+const ARBOS_STORAGE_SLOTS: u64 = 1_410_458;
+const UNIQUE_SLOT_PREIMAGES: u64 = 18_784_532;
+
 /// Counts collected while enumerating an Arbitrum One genesis export.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotPreimageStats {
+    /// Next block recorded by the Classic export manifest.
+    pub next_block_number: u64,
     /// Classic accounts read from `accounts.json`.
     pub classic_accounts: u64,
     /// Non-zero Classic account storage entries visited.
@@ -18,12 +33,77 @@ pub struct SlotPreimageStats {
     pub arbos_accounts: u64,
     /// Non-zero ArbOS/address-table/retryable storage entries visited.
     pub arbos_slots: u64,
+    /// Entries restored into ArbOS's address table.
+    pub address_table_entries: u64,
+    /// Live retryables restored into ArbOS state.
+    pub retryables: u64,
 }
 
 impl SlotPreimageStats {
     /// Total number of account-slot entries visited before global slot-key deduplication.
     pub const fn total_slots(self) -> u64 {
         self.classic_slots + self.arbos_slots
+    }
+
+    /// Require the exact canonical Arbitrum One Classic export shape.
+    pub fn validate_canonical(self) -> eyre::Result<()> {
+        let expected = Self {
+            next_block_number: arbitrum_one::GENESIS_BLOCK_NUMBER,
+            classic_accounts: CLASSIC_ACCOUNTS,
+            classic_slots: CLASSIC_STORAGE_SLOTS,
+            arbos_accounts: ARBOS_ACCOUNTS,
+            arbos_slots: ARBOS_STORAGE_SLOTS,
+            address_table_entries: ADDRESS_TABLE_ENTRIES,
+            retryables: RETRYABLES,
+        };
+        if self != expected {
+            eyre::bail!(
+                "Classic export does not match canonical Arbitrum One Nitro genesis: got {self:?}, expected {expected:?}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Provenance and completion record for the native slot-preimage store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotPreimageManifest {
+    /// Manifest schema version.
+    pub version: u64,
+    /// Source and generated record counts.
+    pub stats: SlotPreimageStats,
+    /// Number of globally unique `keccak256(slot) -> slot` mappings written.
+    pub unique_mappings: u64,
+}
+
+impl SlotPreimageManifest {
+    /// Construct and validate a completed canonical manifest.
+    pub fn new(stats: SlotPreimageStats, unique_mappings: u64) -> eyre::Result<Self> {
+        let manifest = Self {
+            version: MANIFEST_VERSION,
+            stats,
+            unique_mappings,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validate the schema, canonical source counts, and global mapping count.
+    pub fn validate(self) -> eyre::Result<()> {
+        if self.version != MANIFEST_VERSION {
+            eyre::bail!(
+                "unsupported slot-preimage manifest version {}, expected {MANIFEST_VERSION}",
+                self.version
+            );
+        }
+        self.stats.validate_canonical()?;
+        if self.unique_mappings != UNIQUE_SLOT_PREIMAGES {
+            eyre::bail!(
+                "slot-preimage mapping count mismatch: got {}, expected {UNIQUE_SLOT_PREIMAGES}",
+                self.unique_mappings
+            );
+        }
+        Ok(())
     }
 }
 
@@ -41,7 +121,10 @@ pub fn visit_arbitrum_one_slot_preimages(
     mut visit: impl FnMut(B256, B256) -> eyre::Result<()>,
 ) -> eyre::Result<SlotPreimageStats> {
     let index = readers::read_index(&export_dir.join("index.json"))?;
-    let mut stats = SlotPreimageStats::default();
+    let mut stats = SlotPreimageStats {
+        next_block_number: index.next_block_number,
+        ..Default::default()
+    };
 
     for account in readers::accounts(&export_dir.join(&index.accounts_path))? {
         let account = account?;
@@ -51,6 +134,8 @@ pub fn visit_arbitrum_one_slot_preimages(
 
     let address_table = readers::address_table(&export_dir.join(&index.address_table_path))?;
     let retryables = readers::retryables(&export_dir.join(&index.retryable_path))?;
+    stats.address_table_entries = address_table.len() as u64;
+    stats.retryables = retryables.len() as u64;
     let arbos_accounts = build_mainnet_genesis_accounts(
         &arbitrum_one::init_config(),
         address_table,
@@ -129,5 +214,28 @@ mod tests {
         assert!(stats.arbos_accounts > 0);
         assert!(stats.arbos_slots > 0);
         assert!(stats.total_slots() > stats.classic_slots);
+    }
+
+    #[test]
+    fn manifest_requires_the_complete_canonical_export() {
+        let stats = SlotPreimageStats {
+            next_block_number: arbitrum_one::GENESIS_BLOCK_NUMBER,
+            classic_accounts: CLASSIC_ACCOUNTS,
+            classic_slots: CLASSIC_STORAGE_SLOTS,
+            arbos_accounts: ARBOS_ACCOUNTS,
+            arbos_slots: ARBOS_STORAGE_SLOTS,
+            address_table_entries: ADDRESS_TABLE_ENTRIES,
+            retryables: RETRYABLES,
+        };
+
+        let manifest = SlotPreimageManifest::new(stats, UNIQUE_SLOT_PREIMAGES).unwrap();
+        let mut unsupported = manifest;
+        unsupported.version += 1;
+        assert!(unsupported.validate().is_err());
+        assert!(SlotPreimageManifest::new(stats, UNIQUE_SLOT_PREIMAGES - 1).is_err());
+
+        let mut incomplete = stats;
+        incomplete.classic_slots -= 1;
+        assert!(SlotPreimageManifest::new(incomplete, UNIQUE_SLOT_PREIMAGES).is_err());
     }
 }

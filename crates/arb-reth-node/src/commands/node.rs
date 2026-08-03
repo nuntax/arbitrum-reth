@@ -451,6 +451,13 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         }
         (None, Some(head_path), _) => {
             let (num, hash, header) = crate::read_head_header(head_path)?;
+            let datadir = args.datadir.as_deref().ok_or_else(|| {
+                eyre::eyre!("--snapshot-head requires an explicit --datadir")
+            })?;
+            super::snapshot::validate_snapshot_import_for_launch(
+                datadir,
+                &(num, hash, header.clone()),
+            )?;
             let delayed_messages_read = u64::from_be_bytes(header.nonce.0);
             info!(
                 target: "arb-reth",

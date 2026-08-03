@@ -10,6 +10,10 @@ pub const ARBOS_STATE: Address = address!("A4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 pub const GENESIS_STATE_ROOT: B256 =
     b256!("7f2bfc4481d02bfcfc606ebb949384ef78d03a0f30a2dc9cccd652eb80926ae1");
 
+/// Canonical Arbitrum One Nitro genesis block hash.
+pub const GENESIS_BLOCK_HASH: B256 =
+    b256!("7d237dd685b96381544e223f8906e35645d63b89c19983f2246db48568c07986");
+
 /// Canonical ArbOS account storage root at the Arbitrum One Nitro genesis block.
 pub const ARBOS_STORAGE_ROOT: B256 =
     b256!("95d4357ce7baf56bfdcc4f01b594b8f071c588adf58fd79e322ea6d029748573");

@@ -25,6 +25,7 @@
 //! ```text
 //! arb-reth snapshot import \
 //!   --state /tmp/arb1_genesis_state.stream \
+//!   --blocks /tmp/arb1_head_block.stream \
 //!   --out   /tmp/arbreth-mdbx \
 //!   --expect 0x7f2bfc4481d02bfcfc606ebb949384ef78d03a0f30a2dc9cccd652eb80926ae1
 //! ```
@@ -49,35 +50,40 @@
 //! ```
 
 use std::{
-    fs::File,
-    io::{BufRead, BufReader},
-    path::PathBuf,
+    collections::HashSet,
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
-use alloy_primitives::{hex, keccak256, Address, B256, U256};
-use clap::Parser;
 use alloy_genesis::{ChainConfig, Genesis};
-use reth_chainspec::{ChainSpec, MAINNET};
-use reth_db::{init_db, mdbx::DatabaseArguments, open_db_read_only, ClientVersion};
+use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
+use clap::Parser;
+use reth_chainspec::ChainSpec;
+#[cfg(test)]
+use reth_chainspec::MAINNET;
+use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, open_db_read_only};
+use reth_db_api::models::StorageSettings;
 use reth_db_api::{
     cursor::{DbCursorRW, DbDupCursorRO},
     database::Database as RethDatabase,
     tables,
     transaction::{DbTx, DbTxMut},
 };
-use reth_primitives_traits::{Account, Bytecode, SealedHeader};
-use reth_provider::{
-    providers::{RocksDBProvider, StaticFileProvider},
-    DBProvider, MetadataWriter, ProviderFactory, StorageSettingsCache, TrieWriter,
-};
-use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
-use reth_db_api::models::StorageSettings;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::StorageEntry;
+use reth_primitives_traits::{Account, Bytecode, SealedHeader};
+use reth_provider::{
+    DBProvider, MetadataWriter, ProviderFactory, StorageSettingsCache, TrieWriter,
+    providers::{RocksDBProvider, StaticFileProvider},
+};
+use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
 use reth_tasks::Runtime;
 use reth_trie::{IntermediateStateRootState, StateRoot as StateRootComputer, StateRootProgress};
-use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, PackedKeyAdapter};
+use reth_trie_db::{
+    DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, PackedKeyAdapter,
+};
 
 // Boot-wiring: write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
@@ -86,12 +92,16 @@ use reth_provider::{
     BlockNumReader, DatabaseProviderFactory, StageCheckpointWriter, StaticFileProviderFactory,
     StaticFileWriter,
 };
-use reth_stages_types::{StageCheckpoint, StageId};
 use reth_stages::stages::slot_preimages::{SlotPreimages, SlotPreimagesReader};
+use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{HeaderProvider, PruneCheckpointReader, PruneCheckpointWriter};
 
-use crate::hashed_db::{account_by_address, code_of, storage_at, KECCAK_EMPTY as HASHED_KECCAK_EMPTY};
+use arb_reth_genesis::preimages::{MANIFEST_FILE, SlotPreimageManifest};
+
+use crate::hashed_db::{
+    KECCAK_EMPTY as HASHED_KECCAK_EMPTY, account_by_address, code_of, storage_at,
+};
 
 // Storage v2 keys trie nodes with `PackedKeyAdapter` (v1 used `LegacyKeyAdapter`). The state root
 // is adapter-independent (the MPT hash of key→value), so the genesis root still validates; only the
@@ -121,6 +131,17 @@ type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 
 /// Number of preimages sorted and inserted in one auxiliary MDBX transaction.
 const PREIMAGE_BATCH_SIZE: usize = 250_000;
+
+const SNAPSHOT_IMPORT_MANIFEST_FILE: &str = "snapshot-import.json";
+const SNAPSHOT_IMPORT_MANIFEST_VERSION: u64 = 1;
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+struct SnapshotImportManifest {
+    version: u64,
+    block_number: u64,
+    block_hash: B256,
+    state_root: B256,
+}
 
 /// Build Reth's native plaintext storage-slot preimage sidecar from a Nitro Classic export.
 #[derive(Debug, Parser)]
@@ -158,11 +179,10 @@ pub struct SnapshotImportArgs {
     #[arg(long, value_name = "HEX")]
     expect: String,
 
-    /// Optional blocks stream (`H <num> <hash> <headerRLP>` records). When given, the head
-    /// header is written (static-file Headers + HeaderNumbers + BlockBodyIndices) and all stage
-    /// checkpoints are set to the head block, making the DB openable at that block.
+    /// Blocks stream (`H <num> <hash> <headerRLP>` records) containing the canonical snapshot
+    /// head. Its block number and state root must match the Classic export and `--expect`.
     #[arg(long, value_name = "FILE")]
-    blocks: Option<PathBuf>,
+    blocks: PathBuf,
 }
 
 /// Read hashed state from a converted Arbitrum reth MDBX snapshot.
@@ -208,32 +228,121 @@ pub struct SnapshotRepairHistoryArgs {
 /// Construct the native `keccak256(slot) -> plain slot` sidecar used by Storage V2.
 pub fn build_preimages(args: SnapshotBuildPreimagesArgs) -> eyre::Result<()> {
     let preimage_path = args.out.join("db").join("preimage");
-    std::fs::create_dir_all(&preimage_path)?;
-    let store = SlotPreimages::open(&preimage_path)?;
-    let mut batch = Vec::with_capacity(PREIMAGE_BATCH_SIZE);
-    let mut inserted_candidates = 0u64;
+    if preimage_path.exists() {
+        eyre::bail!(
+            "refusing to replace existing slot-preimage sidecar at {}",
+            preimage_path.display()
+        );
+    }
 
-    let stats = arb_reth_genesis::preimages::visit_arbitrum_one_slot_preimages(
-        &args.classic_state,
-        |hashed_slot, plain_slot| {
-            batch.push((hashed_slot, plain_slot));
-            if batch.len() == PREIMAGE_BATCH_SIZE {
-                inserted_candidates += flush_preimage_batch(&store, &mut batch)? as u64;
-                tracing::info!(inserted_candidates, "building slot-preimage sidecar");
-            }
-            Ok(())
-        },
-    )?;
-    inserted_candidates += flush_preimage_batch(&store, &mut batch)? as u64;
+    let db_path = args.out.join("db");
+    std::fs::create_dir_all(&db_path)?;
+    if let Some(stale) = find_staging_preimage_dir(&db_path)? {
+        eyre::bail!(
+            "incomplete slot-preimage build exists at {}; remove it after confirming no build is running",
+            stale.display()
+        );
+    }
+    let staging_path = db_path.join(".preimage.tmp");
+    std::fs::create_dir(&staging_path)?;
+
+    let build_result = (|| -> eyre::Result<_> {
+        let store = SlotPreimages::open(&staging_path)?;
+        let mut batch = Vec::with_capacity(PREIMAGE_BATCH_SIZE);
+        let mut unique_mappings = 0u64;
+
+        let stats = arb_reth_genesis::preimages::visit_arbitrum_one_slot_preimages(
+            &args.classic_state,
+            |hashed_slot, plain_slot| {
+                batch.push((hashed_slot, plain_slot));
+                if batch.len() == PREIMAGE_BATCH_SIZE {
+                    unique_mappings += flush_preimage_batch(&store, &mut batch)? as u64;
+                    tracing::info!(unique_mappings, "building slot-preimage sidecar");
+                }
+                Ok(())
+            },
+        )?;
+        unique_mappings += flush_preimage_batch(&store, &mut batch)? as u64;
+
+        let manifest = SlotPreimageManifest::new(stats, unique_mappings)?;
+        drop(store);
+        write_preimage_manifest(&staging_path, manifest)?;
+        sync_directory(&staging_path)?;
+        Ok((stats, unique_mappings))
+    })();
+
+    let (stats, unique_mappings) = match build_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging_path);
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = std::fs::rename(&staging_path, &preimage_path) {
+        let _ = std::fs::remove_dir_all(&staging_path);
+        return Err(error.into());
+    }
+    sync_directory(&db_path)?;
 
     println!("preimage store       = {}", preimage_path.display());
+    println!("next block           = {}", stats.next_block_number);
     println!("classic accounts     = {}", stats.classic_accounts);
     println!("classic storage slots= {}", stats.classic_slots);
+    println!("address table entries= {}", stats.address_table_entries);
+    println!("retryables           = {}", stats.retryables);
     println!("ArbOS accounts       = {}", stats.arbos_accounts);
     println!("ArbOS storage slots  = {}", stats.arbos_slots);
     println!("source slot mappings = {}", stats.total_slots());
-    println!("batch-unique mappings= {inserted_candidates}");
+    println!("unique slot mappings = {unique_mappings}");
     Ok(())
+}
+
+fn write_preimage_manifest(
+    preimage_path: &Path,
+    manifest: SlotPreimageManifest,
+) -> eyre::Result<()> {
+    let manifest_path = preimage_path.join(MANIFEST_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest_path)?;
+    serde_json::to_writer_pretty(&mut file, &manifest)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_preimage_manifest(preimage_path: &Path) -> eyre::Result<SlotPreimageManifest> {
+    let manifest_path = preimage_path.join(MANIFEST_FILE);
+    let manifest: SlotPreimageManifest =
+        serde_json::from_reader(File::open(&manifest_path).map_err(|error| {
+            eyre::eyre!(
+                "slot-preimage completion manifest is missing at {}: {error}",
+                manifest_path.display()
+            )
+        })?)?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+fn sync_directory(path: &Path) -> eyre::Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn find_staging_preimage_dir(db_path: &Path) -> eyre::Result<Option<PathBuf>> {
+    for entry in std::fs::read_dir(db_path)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".preimage.tmp")
+        {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
 }
 
 fn flush_preimage_batch(
@@ -241,58 +350,90 @@ fn flush_preimage_batch(
     batch: &mut Vec<(B256, B256)>,
 ) -> eyre::Result<usize> {
     if batch.is_empty() {
-        return Ok(0)
+        return Ok(0);
     }
 
     batch.sort_unstable_by_key(|(hashed_slot, _)| *hashed_slot);
+    for pair in batch.windows(2) {
+        if pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1 {
+            eyre::bail!(
+                "conflicting slot preimages in batch for {:#x}: first={:#x}, second={:#x}",
+                pair[0].0,
+                pair[0].1,
+                pair[1].1
+            );
+        }
+    }
     batch.dedup_by_key(|(hashed_slot, _)| *hashed_slot);
-    debug_assert!(batch
-        .iter()
-        .all(|(hashed_slot, plain_slot)| *hashed_slot == keccak256(*plain_slot)));
-    store.insert_preimages(batch)?;
-    let inserted_candidates = batch.len();
+    let reader = store.reader()?;
+    let mut missing = Vec::with_capacity(batch.len());
+    for &(hashed_slot, plain_slot) in batch.iter() {
+        let actual_hash = keccak256(plain_slot);
+        if actual_hash != hashed_slot {
+            eyre::bail!(
+                "invalid slot-preimage mapping: key={hashed_slot:#x}, plain={plain_slot:#x}, hash={actual_hash:#x}"
+            );
+        }
+        match reader.get(&hashed_slot)? {
+            Some(existing) if existing == plain_slot => {}
+            Some(existing) => {
+                eyre::bail!(
+                    "conflicting slot preimage for {hashed_slot:#x}: existing={existing:#x}, new={plain_slot:#x}"
+                );
+            }
+            None => missing.push((hashed_slot, plain_slot)),
+        }
+    }
+    drop(reader);
+    store.insert_preimages(&missing)?;
+    let inserted = missing.len();
     batch.clear();
-    Ok(inserted_candidates)
+    Ok(inserted)
 }
 
 pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
-    let expect_str = args.expect.trim_start_matches("0x");
-    let expected: B256 = B256::from_slice(&hex::decode(expect_str)?);
+    let expected = parse_b256(&args.expect)
+        .map_err(|error| eyre::eyre!("invalid --expect state root: {error}"))?;
 
     let db_path = args.out.join("db");
     let static_files_path = args.out.join("static_files");
     let rocksdb_path = args.out.join("rocksdb");
-
-    std::fs::create_dir_all(&db_path)?;
-    std::fs::create_dir_all(&static_files_path)?;
-    std::fs::create_dir_all(&rocksdb_path)?;
-
     let preimage_path = db_path.join("preimage");
+    ensure_fresh_import_target(&args.out)?;
     if !preimage_path.join("mdbx.dat").is_file() {
         eyre::bail!(
             "slot-preimage sidecar is missing at {}; run `arb-reth snapshot build-preimages` first",
             preimage_path.display()
         );
     }
+    let manifest = read_preimage_manifest(&preimage_path)?;
     let preimages = SlotPreimages::open(&preimage_path)?;
-    let preimage_reader = preimages.reader()?;
+
+    let head = read_head_header(&args.blocks)?;
+    validate_snapshot_identity(expected, manifest, &head)?;
+
+    tracing::info!(path = ?args.state, "validating state stream before database creation");
+    let state_stats = preflight_state_stream(&args.state, &preimages.reader()?)?;
+    tracing::info!(
+        accounts = state_stats.accounts,
+        slots = state_stats.slots,
+        bytecodes = state_stats.bytecodes,
+        unique_slot_preimages = manifest.unique_mappings,
+        "state stream preflight complete"
+    );
+
+    std::fs::create_dir_all(&static_files_path)?;
+    std::fs::create_dir_all(&rocksdb_path)?;
 
     tracing::info!(path = ?db_path, "opening MDBX");
     let db = init_db(&db_path, DatabaseArguments::new(ClientVersion::default()))?;
 
-    // With --blocks we inject the snapshot's real head header so genesis_hash() matches the DB
-    // and reth's launch genesis-check passes. Without --blocks we fall back to MAINNET (fine
-    // for the state-root gate, which is chain-spec-independent).
-    let chain_spec: Arc<ChainSpec> = match &args.blocks {
-        Some(bp) => {
-            let (_num, hash, header) = read_head_header(bp)?;
-            arb_chain_spec_with_header(ARB_ONE_CHAIN_ID, header, hash)
-        }
-        None => Arc::new(MAINNET.as_ref().clone()),
-    };
+    // Inject the snapshot's real head header so genesis_hash() matches the DB and reth's launch
+    // genesis-check passes.
+    let chain_spec: Arc<ChainSpec> =
+        arb_chain_spec_with_header(ARB_ONE_CHAIN_ID, head.2.clone(), head.1);
 
-    let static_file_provider =
-        StaticFileProvider::read_write(static_files_path.clone())?;
+    let static_file_provider = StaticFileProvider::read_write(static_files_path.clone())?;
     let rocksdb_provider = RocksDBProvider::builder(&rocksdb_path)
         .with_default_tables()
         .build()
@@ -316,11 +457,13 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     {
         let provider_rw = factory.database_provider_rw()?;
         provider_rw.write_storage_settings(StorageSettings::v2())?;
-        provider_rw.commit().map_err(|e| eyre::eyre!("persist storage settings: {e}"))?;
+        provider_rw
+            .commit()
+            .map_err(|e| eyre::eyre!("persist storage settings: {e}"))?;
     }
 
     tracing::info!(path = ?args.state, "streaming state import (storage v2)");
-    stream_import(&factory, &args.state, &preimage_reader)?;
+    stream_import(&factory, &args.state, &preimages.reader()?)?;
 
     tracing::info!("computing state root (may take several minutes for large states)");
     let computed = compute_state_root_chunked(&factory)?;
@@ -332,13 +475,11 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     }
     println!("MATCH");
 
-    if let Some(blocks_path) = &args.blocks {
-        tracing::info!(path = ?blocks_path, "writing head header + checkpoints");
-        let (head_num, head_hash) = write_head_blocks(&factory, blocks_path)?;
-        verify_head(&factory, head_num, head_hash)?;
-        // The injected-header chain spec means reth's launch genesis-check accepts this DB.
-        verify_launch(&factory, head_hash)?;
-    }
+    tracing::info!(path = ?args.blocks, "writing head header + checkpoints");
+    let (head_num, head_hash) = write_head_blocks(&factory, &args.blocks)?;
+    verify_head(&factory, head_num, head_hash)?;
+    // The injected-header chain spec means reth's launch genesis-check accepts this DB.
+    verify_launch(&factory, head_hash)?;
 
     // The changeset segments were created in their fixed 500k slot (`_22000000_…`) but
     // `set_expected_block_start(head)` moved their header's expected range to start at `head`.
@@ -348,7 +489,155 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     // node re-scans on boot.
     drop(factory);
     rename_changeset_files_to_header(&static_files_path)?;
+    write_snapshot_import_manifest(&args.out, &head)?;
 
+    Ok(())
+}
+
+fn validate_snapshot_identity(
+    expected: B256,
+    manifest: SlotPreimageManifest,
+    head: &(u64, B256, Header),
+) -> eyre::Result<()> {
+    if expected != arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT {
+        eyre::bail!(
+            "Arbitrum One Nitro genesis state root must be {:#x}, got {expected:#x}",
+            arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT
+        );
+    }
+    if head.0 != manifest.stats.next_block_number {
+        eyre::bail!(
+            "snapshot head block {} does not match Classic export block {}",
+            head.0,
+            manifest.stats.next_block_number
+        );
+    }
+    if head.2.state_root != expected {
+        eyre::bail!(
+            "snapshot head state root {:#x} does not match --expect {expected:#x}",
+            head.2.state_root
+        );
+    }
+    if head.1 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_HASH {
+        eyre::bail!(
+            "snapshot head hash {:#x} does not match canonical Arbitrum One Nitro genesis hash {:#x}",
+            head.1,
+            arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_HASH,
+        );
+    }
+    Ok(())
+}
+
+fn write_snapshot_import_manifest(
+    out: &Path,
+    head: &(u64, B256, Header),
+) -> eyre::Result<()> {
+    let manifest = SnapshotImportManifest {
+        version: SNAPSHOT_IMPORT_MANIFEST_VERSION,
+        block_number: head.0,
+        block_hash: head.1,
+        state_root: head.2.state_root,
+    };
+    validate_snapshot_import_manifest(manifest, head)?;
+
+    let path = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    serde_json::to_writer_pretty(&mut file, &manifest)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    sync_directory(out)?;
+    Ok(())
+}
+
+fn validate_snapshot_import_manifest(
+    manifest: SnapshotImportManifest,
+    head: &(u64, B256, Header),
+) -> eyre::Result<()> {
+    if manifest.version != SNAPSHOT_IMPORT_MANIFEST_VERSION {
+        eyre::bail!(
+            "unsupported snapshot import manifest version {}, expected {SNAPSHOT_IMPORT_MANIFEST_VERSION}",
+            manifest.version,
+        );
+    }
+    if manifest.block_number != head.0
+        || manifest.block_hash != head.1
+        || manifest.state_root != head.2.state_root
+    {
+        eyre::bail!("snapshot import manifest does not match the supplied head stream");
+    }
+    if head.2.number != head.0 || head.2.hash_slow() != head.1 {
+        eyre::bail!("snapshot head stream contains an invalid number or block hash");
+    }
+    if head.0 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_NUMBER
+        || head.1 != arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_HASH
+        || head.2.state_root != arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT
+    {
+        eyre::bail!("snapshot import manifest is not the canonical Arbitrum One Nitro genesis");
+    }
+    Ok(())
+}
+
+/// Refuse to launch a new-format snapshot datadir unless its import completed successfully.
+pub(crate) fn validate_snapshot_import_for_launch(
+    out: &Path,
+    head: &(u64, B256, Header),
+) -> eyre::Result<()> {
+    let preimage_path = out.join("db/preimage");
+    if !preimage_path.join(MANIFEST_FILE).is_file() {
+        // Older imports predate completion manifests. Preserve their existing launch behavior.
+        return Ok(());
+    }
+    if !preimage_path.join("mdbx.dat").is_file() {
+        eyre::bail!(
+            "snapshot slot-preimage database is missing at {}",
+            preimage_path.display()
+        );
+    }
+    read_preimage_manifest(&preimage_path)?;
+
+    let path = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
+    let manifest: SnapshotImportManifest =
+        serde_json::from_reader(File::open(&path).map_err(|error| {
+            eyre::eyre!(
+                "snapshot import is incomplete: missing completion manifest at {}: {error}",
+                path.display()
+            )
+        })?)?;
+    validate_snapshot_import_manifest(manifest, head)
+}
+
+fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
+    let import_manifest = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
+    if import_manifest.exists() {
+        eyre::bail!(
+            "snapshot import requires a fresh target; completion manifest already exists at {}",
+            import_manifest.display()
+        );
+    }
+    let db_path = out.join("db");
+    if db_path.exists() {
+        for entry in std::fs::read_dir(&db_path)? {
+            let entry = entry?;
+            if entry.file_name() != "preimage" {
+                eyre::bail!(
+                    "snapshot import requires a fresh target; unexpected path exists at {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+
+    for path in [out.join("static_files"), out.join("rocksdb")] {
+        if path.exists() {
+            eyre::bail!(
+                "snapshot import requires a fresh target; remove the previous import at {}",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -477,7 +766,11 @@ fn arb_chain_spec_with_header(chain_id: u64, header: Header, hash: B256) -> Arc<
         london_block: Some(0),
         ..Default::default()
     };
-    let genesis = Genesis { config, number: Some(header.number), ..Default::default() };
+    let genesis = Genesis {
+        config,
+        number: Some(header.number),
+        ..Default::default()
+    };
     let mut spec = ChainSpec::from_genesis(genesis);
     // Override the computed (alloc-derived, wrong) genesis header with the real one.
     spec.genesis_header = SealedHeader::new(header, hash);
@@ -485,20 +778,13 @@ fn arb_chain_spec_with_header(chain_id: u64, header: Header, hash: B256) -> Arc<
 }
 
 /// Read the highest-numbered `H <num> <hash> <headerRLP>` record (the head/genesis header).
-fn read_head_header(path: &PathBuf) -> eyre::Result<(u64, B256, Header)> {
+fn read_head_header(path: &Path) -> eyre::Result<(u64, B256, Header)> {
     let reader = std::io::BufReader::new(File::open(path)?);
     let mut best: Option<(u64, B256, Header)> = None;
-    for line in reader.lines() {
-        let line = line?;
-        let mut p = line.splitn(4, ' ');
-        if p.next() != Some("H") {
+    for (line_index, line) in reader.lines().enumerate() {
+        let Some((num, hash, header)) = parse_header_record(&line?, line_index + 1)? else {
             continue;
-        }
-        let num: u64 = p.next().ok_or_else(|| eyre::eyre!("H: missing number"))?.parse()?;
-        let hash = parse_b256(p.next().ok_or_else(|| eyre::eyre!("H: missing hash"))?)?;
-        let rlp = hex::decode(p.next().ok_or_else(|| eyre::eyre!("H: missing headerRLP"))?)?;
-        let header = Header::decode(&mut rlp.as_slice())
-            .map_err(|e| eyre::eyre!("decode header {num}: {e}"))?;
+        };
         if best.as_ref().map(|(n, ..)| num >= *n).unwrap_or(true) {
             best = Some((num, hash, header));
         }
@@ -506,10 +792,87 @@ fn read_head_header(path: &PathBuf) -> eyre::Result<(u64, B256, Header)> {
     best.ok_or_else(|| eyre::eyre!("no H records in {path:?}"))
 }
 
+fn parse_header_record(
+    line: &str,
+    line_number: usize,
+) -> eyre::Result<Option<(u64, B256, Header)>> {
+    let mut parts = line.split_whitespace();
+    let Some(tag) = parts.next() else {
+        return Ok(None);
+    };
+    if matches!(tag, "B" | "R") {
+        let num: u64 = parts
+            .next()
+            .ok_or_else(|| eyre::eyre!("{tag}: missing number at line {line_number}"))?
+            .parse()
+            .map_err(|error| {
+                eyre::eyre!("{tag}: bad number at line {line_number}: {error}")
+            })?;
+        let encoded = hex::decode(
+            parts
+                .next()
+                .ok_or_else(|| eyre::eyre!("{tag}: missing RLP at line {line_number}"))?,
+        )?;
+        if parts.next().is_some() {
+            eyre::bail!("{tag}: unexpected trailing fields at line {line_number}");
+        }
+
+        let mut input = encoded.as_slice();
+        let rlp_header = alloy_rlp::Header::decode(&mut input).map_err(|error| {
+            eyre::eyre!("decode {tag} record for block {num} at line {line_number}: {error}")
+        })?;
+        if !rlp_header.list || input.len() != rlp_header.payload_length {
+            eyre::bail!("invalid {tag} RLP for block {num} at line {line_number}");
+        }
+        return Ok(None);
+    }
+    if tag != "H" {
+        eyre::bail!("unknown block record {tag:?} at line {line_number}");
+    }
+    let num: u64 = parts
+        .next()
+        .ok_or_else(|| eyre::eyre!("H: missing number at line {line_number}"))?
+        .parse()
+        .map_err(|error| eyre::eyre!("H: bad number at line {line_number}: {error}"))?;
+    let hash = parse_b256(
+        parts
+            .next()
+            .ok_or_else(|| eyre::eyre!("H: missing hash at line {line_number}"))?,
+    )?;
+    let rlp = hex::decode(
+        parts
+            .next()
+            .ok_or_else(|| eyre::eyre!("H: missing headerRLP at line {line_number}"))?,
+    )?;
+    if parts.next().is_some() {
+        eyre::bail!("H: unexpected trailing fields at line {line_number}");
+    }
+    let mut input = rlp.as_slice();
+    let header = Header::decode(&mut input)
+        .map_err(|error| eyre::eyre!("decode header {num} at line {line_number}: {error}"))?;
+    if !input.is_empty() {
+        eyre::bail!("trailing bytes after header RLP at line {line_number}");
+    }
+    if header.number != num {
+        eyre::bail!(
+            "header number mismatch: record={num}, decoded={}",
+            header.number
+        );
+    }
+    let computed_hash = header.hash_slow();
+    if computed_hash != hash {
+        eyre::bail!("header hash mismatch at {num}: record={hash:#x}, decoded={computed_hash:#x}");
+    }
+    Ok(Some((num, hash, header)))
+}
+
 /// Launch-acceptance gate: runs `init_genesis` with validation against the converted DB.
 /// With the injected-header chain spec it must find the genesis present (no GenesisHashMismatch,
 /// no re-write), confirming a node would open this DB cleanly.
-fn verify_launch(factory: &ProviderFactory<ArbNodeTypesWithDB>, head_hash: B256) -> eyre::Result<()> {
+fn verify_launch(
+    factory: &ProviderFactory<ArbNodeTypesWithDB>,
+    head_hash: B256,
+) -> eyre::Result<()> {
     use reth_db_common::init::init_genesis_with_settings_and_validate;
     let got = init_genesis_with_settings_and_validate(factory, StorageSettings::v2(), true)
         .map_err(|e| eyre::eyre!("init_genesis (launch genesis check) rejected the DB: {e}"))?;
@@ -518,7 +881,9 @@ fn verify_launch(factory: &ProviderFactory<ArbNodeTypesWithDB>, head_hash: B256)
         println!("LAUNCH OK");
         Ok(())
     } else {
-        Err(eyre::eyre!("init_genesis returned {got:#x}, expected {head_hash:#x}"))
+        Err(eyre::eyre!(
+            "init_genesis returned {got:#x}, expected {head_hash:#x}"
+        ))
     }
 }
 
@@ -527,7 +892,7 @@ fn verify_launch(factory: &ProviderFactory<ArbNodeTypesWithDB>, head_hash: B256)
 /// `ProviderFactory` reports it as the head. Returns `(head_number, head_hash)`.
 fn write_head_blocks(
     factory: &ProviderFactory<ArbNodeTypesWithDB>,
-    path: &PathBuf,
+    path: &Path,
 ) -> eyre::Result<(u64, B256)> {
     let provider_rw = factory.database_provider_rw()?;
     let sfp = provider_rw.static_file_provider();
@@ -537,17 +902,10 @@ fn write_head_blocks(
     let mut head_hash = B256::ZERO;
     let mut count = 0u64;
 
-    for line in reader.lines() {
-        let line = line?;
-        let mut p = line.splitn(4, ' ');
-        if p.next() != Some("H") {
+    for (line_index, line) in reader.lines().enumerate() {
+        let Some((num, hash, header)) = parse_header_record(&line?, line_index + 1)? else {
             continue;
-        }
-        let num: u64 = p.next().ok_or_else(|| eyre::eyre!("H: missing number"))?.parse()?;
-        let hash = parse_b256(p.next().ok_or_else(|| eyre::eyre!("H: missing hash"))?)?;
-        let rlp = hex::decode(p.next().ok_or_else(|| eyre::eyre!("H: missing headerRLP"))?)?;
-        let header = Header::decode(&mut rlp.as_slice())
-            .map_err(|e| eyre::eyre!("decode header {num}: {e}"))?;
+        };
 
         // Genesis TD == difficulty for the first block (Arbitrum difficulty is 1).
         let mut writer = sfp.get_writer(num, StaticFileSegment::Headers)?;
@@ -559,8 +917,12 @@ fn write_head_blocks(
         }
         writer.commit()?;
 
-        provider_rw.tx_ref().put::<tables::HeaderNumbers>(hash, num)?;
-        provider_rw.tx_ref().put::<tables::BlockBodyIndices>(num, Default::default())?;
+        provider_rw
+            .tx_ref()
+            .put::<tables::HeaderNumbers>(hash, num)?;
+        provider_rw
+            .tx_ref()
+            .put::<tables::BlockBodyIndices>(num, Default::default())?;
 
         if num >= head_num {
             head_num = num;
@@ -599,12 +961,19 @@ fn write_head_blocks(
     // init_genesis model): `set_expected_block_start(head)` aligns (b), and appending an empty
     // changeset for `head` sets block_range=[head,head] with csoff[0]=head, giving highest=head (a)
     // and an aligned map (c). The file is then renamed to match its new expected range.
-    for seg in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets] {
+    for seg in [
+        StaticFileSegment::AccountChangeSets,
+        StaticFileSegment::StorageChangeSets,
+    ] {
         let mut w = sfp.get_writer(head_num, seg)?;
         w.user_header_mut().set_expected_block_start(head_num);
         match seg {
-            StaticFileSegment::AccountChangeSets => w.append_account_changeset(Vec::new(), head_num)?,
-            StaticFileSegment::StorageChangeSets => w.append_storage_changeset(Vec::new(), head_num)?,
+            StaticFileSegment::AccountChangeSets => {
+                w.append_account_changeset(Vec::new(), head_num)?
+            }
+            StaticFileSegment::StorageChangeSets => {
+                w.append_storage_changeset(Vec::new(), head_num)?
+            }
             _ => unreachable!(),
         }
         w.commit()?;
@@ -668,6 +1037,159 @@ fn verify_head(
     }
 }
 
+#[derive(Debug)]
+enum StateRecord {
+    Account {
+        account_hash: B256,
+        account: Account,
+    },
+    Code {
+        code_hash: B256,
+        bytecode: Bytecode,
+    },
+    Storage {
+        slot_hash: B256,
+        value: U256,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StateStreamStats {
+    accounts: u64,
+    slots: u64,
+    bytecodes: u64,
+}
+
+fn parse_state_record(line: &str, line_number: usize) -> eyre::Result<Option<StateRecord>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+
+    let mut parts = line.split_whitespace();
+    let tag = parts.next().expect("non-empty line");
+    let mut next = |field: &str| {
+        parts
+            .next()
+            .ok_or_else(|| eyre::eyre!("{tag}: missing {field} at line {line_number}"))
+    };
+
+    let record = match tag {
+        "A" => {
+            let account_hash = parse_b256(next("accountHash")?).map_err(|error| {
+                eyre::eyre!("A: bad accountHash at line {line_number}: {error}")
+            })?;
+            let nonce = next("nonce")?
+                .parse()
+                .map_err(|error| eyre::eyre!("A: bad nonce at line {line_number}: {error}"))?;
+            let balance = U256::from_str_radix(next("balance")?.trim_start_matches("0x"), 16)
+                .map_err(|error| eyre::eyre!("A: bad balance at line {line_number}: {error}"))?;
+            let code_hash = parse_b256(next("codeHash")?)
+                .map_err(|error| eyre::eyre!("A: bad codeHash at line {line_number}: {error}"))?;
+            parse_b256(next("storageRoot")?).map_err(|error| {
+                eyre::eyre!("A: bad storageRoot at line {line_number}: {error}")
+            })?;
+
+            let bytecode_hash = (code_hash.0 != KECCAK_EMPTY).then_some(code_hash);
+            StateRecord::Account {
+                account_hash,
+                account: Account {
+                    nonce,
+                    balance,
+                    bytecode_hash,
+                },
+            }
+        }
+        "C" => {
+            let code_hash = parse_b256(next("codeHash")?)
+                .map_err(|error| eyre::eyre!("C: bad codeHash at line {line_number}: {error}"))?;
+            let code = hex::decode(next("code")?)
+                .map_err(|error| eyre::eyre!("C: bad code hex at line {line_number}: {error}"))?;
+            let actual_hash = keccak256(&code);
+            if actual_hash != code_hash {
+                eyre::bail!(
+                    "C: bytecode hash mismatch at line {line_number}: declared={code_hash:#x}, actual={actual_hash:#x}"
+                );
+            }
+            StateRecord::Code {
+                code_hash,
+                bytecode: Bytecode::new_raw(Bytes::from(code)),
+            }
+        }
+        "S" => {
+            let slot_hash = parse_b256(next("slotHash")?)
+                .map_err(|error| eyre::eyre!("S: bad slotHash at line {line_number}: {error}"))?;
+            let value = U256::from_str_radix(next("value")?.trim_start_matches("0x"), 16)
+                .map_err(|error| eyre::eyre!("S: bad value at line {line_number}: {error}"))?;
+            StateRecord::Storage { slot_hash, value }
+        }
+        _ => {
+            eyre::bail!("unknown state record {tag:?} at line {line_number}");
+        }
+    };
+
+    if parts.next().is_some() {
+        eyre::bail!("{tag}: unexpected trailing fields at line {line_number}");
+    }
+    Ok(Some(record))
+}
+
+fn preflight_state_stream(
+    path: &Path,
+    preimages: &SlotPreimagesReader,
+) -> eyre::Result<StateStreamStats> {
+    let reader = BufReader::with_capacity(4 * 1024 * 1024, File::open(path)?);
+    let mut stats = StateStreamStats::default();
+    let mut saw_account = false;
+    let mut required_code_hashes: HashSet<B256> = HashSet::new();
+    let mut provided_code_hashes: HashSet<B256> = HashSet::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let Some(record) = parse_state_record(&line?, line_index + 1)? else {
+            continue;
+        };
+        match record {
+            StateRecord::Account { account, .. } => {
+                saw_account = true;
+                stats.accounts += 1;
+                if let Some(code_hash) = account.bytecode_hash {
+                    required_code_hashes.insert(code_hash);
+                }
+            }
+            StateRecord::Code { code_hash, .. } => {
+                stats.bytecodes += 1;
+                provided_code_hashes.insert(code_hash);
+            }
+            StateRecord::Storage { slot_hash, value } => {
+                if !saw_account {
+                    eyre::bail!("S record before any A record at line {}", line_index + 1);
+                }
+                if value.is_zero() {
+                    continue;
+                }
+                require_slot_preimage(preimages, slot_hash).map_err(|error| {
+                    eyre::eyre!(
+                        "S: invalid slot preimage at line {}: {error}",
+                        line_index + 1
+                    )
+                })?;
+                stats.slots += 1;
+            }
+        }
+    }
+
+    if stats.accounts == 0 {
+        eyre::bail!("state stream contains no accounts");
+    }
+    if let Some(missing) = required_code_hashes
+        .difference(&provided_code_hashes)
+        .next()
+    {
+        eyre::bail!("state stream is missing bytecode record {missing:#x}");
+    }
+    Ok(stats)
+}
+
 fn stream_import<PF>(
     factory: &PF,
     path: &PathBuf,
@@ -690,38 +1212,16 @@ where
     // Flush storage when the next A/C line arrives.
     let mut current_account_hash: Option<B256> = None;
 
-    for (line_no, line_result) in reader.lines().enumerate() {
-        let line = line_result?;
-        let line = line.trim();
-        if line.is_empty() {
+    for (line_index, line) in reader.lines().enumerate() {
+        let Some(record) = parse_state_record(&line?, line_index + 1)? else {
             continue;
-        }
+        };
 
-        let mut parts = line.splitn(7, ' ');
-        let tag = parts.next().unwrap_or("");
-
-        match tag {
-            "A" => {
-                // A <accountHash> <nonce> <balance> <codeHash> <storageRoot>
-                let acct_hash_hex = parts.next().ok_or_else(|| eyre::eyre!("A: missing accountHash at line {line_no}"))?;
-                let nonce_str     = parts.next().ok_or_else(|| eyre::eyre!("A: missing nonce at line {line_no}"))?;
-                let balance_str   = parts.next().ok_or_else(|| eyre::eyre!("A: missing balance at line {line_no}"))?;
-                let code_hash_hex = parts.next().ok_or_else(|| eyre::eyre!("A: missing codeHash at line {line_no}"))?;
-                // storageRoot is ignored; we use the S lines directly.
-
-                let acct_hash = parse_b256(acct_hash_hex)
-                    .map_err(|e| eyre::eyre!("A: bad accountHash at line {line_no}: {e}"))?;
-                let nonce: u64 = nonce_str.parse()
-                    .map_err(|e| eyre::eyre!("A: bad nonce at line {line_no}: {e}"))?;
-                let balance = U256::from_str_radix(balance_str.trim_start_matches("0x"), 16)
-                    .map_err(|e| eyre::eyre!("A: bad balance at line {line_no}: {e}"))?;
-                let code_hash = parse_b256(code_hash_hex)
-                    .map_err(|e| eyre::eyre!("A: bad codeHash at line {line_no}: {e}"))?;
-
-                let bytecode_hash = if code_hash.0 == KECCAK_EMPTY { None } else { Some(code_hash) };
-
-                let account = Account { nonce, balance, bytecode_hash };
-
+        match record {
+            StateRecord::Account {
+                account_hash,
+                account,
+            } => {
                 // Commit if threshold reached (before this account pushes us over).
                 if storage_units >= COMMIT_THRESHOLD {
                     provider_rw.commit()?;
@@ -737,8 +1237,10 @@ where
                 }
 
                 // Write hashed account.
-                provider_rw.tx_ref().put::<tables::HashedAccounts>(acct_hash, account)?;
-                current_account_hash = Some(acct_hash);
+                provider_rw
+                    .tx_ref()
+                    .put::<tables::HashedAccounts>(account_hash, account)?;
+                current_account_hash = Some(account_hash);
                 total_accounts += 1;
                 storage_units += 1;
 
@@ -746,21 +1248,10 @@ where
                     tracing::info!(total_accounts, total_slots, "writing accounts...");
                 }
             }
-
-            "C" => {
-                // C <codeHash> <code:hex>
-                let code_hash_hex = parts.next().ok_or_else(|| eyre::eyre!("C: missing codeHash at line {line_no}"))?;
-                let code_hex      = parts.next().ok_or_else(|| eyre::eyre!("C: missing code at line {line_no}"))?;
-
-                let code_hash = parse_b256(code_hash_hex)
-                    .map_err(|e| eyre::eyre!("C: bad codeHash at line {line_no}: {e}"))?;
-
-                let code_bytes = hex::decode(code_hex)
-                    .map_err(|e| eyre::eyre!("C: bad code hex at line {line_no}: {e}"))?;
-
-                // Use new_raw to avoid revalidation; the hash is already the pre-image.
-                let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from(code_bytes));
-
+            StateRecord::Code {
+                code_hash,
+                bytecode,
+            } => {
                 // Commit if threshold reached.
                 if storage_units >= COMMIT_THRESHOLD {
                     provider_rw.commit()?;
@@ -775,32 +1266,31 @@ where
                     storage_units = 0;
                 }
 
-                provider_rw.tx_ref().put::<tables::Bytecodes>(code_hash, bytecode)?;
+                provider_rw
+                    .tx_ref()
+                    .put::<tables::Bytecodes>(code_hash, bytecode)?;
                 total_bytecodes += 1;
                 storage_units += 1;
             }
-
-            "S" => {
-                // S <slotHash> <value:hex>
+            StateRecord::Storage { slot_hash, value } => {
                 let acct_hash = match current_account_hash {
                     Some(h) => h,
-                    None => return Err(eyre::eyre!("S line at {line_no} before any A line")),
+                    None => {
+                        return Err(eyre::eyre!(
+                            "S record before any A record at line {}",
+                            line_index + 1
+                        ));
+                    }
                 };
-                let slot_hash_hex = parts.next().ok_or_else(|| eyre::eyre!("S: missing slotHash at line {line_no}"))?;
-                let value_str     = parts.next().ok_or_else(|| eyre::eyre!("S: missing value at line {line_no}"))?;
-
-                let slot_hash = parse_b256(slot_hash_hex)
-                    .map_err(|e| eyre::eyre!("S: bad slotHash at line {line_no}: {e}"))?;
-                let value = U256::from_str_radix(value_str.trim_start_matches("0x"), 16)
-                    .map_err(|e| eyre::eyre!("S: bad value at line {line_no}: {e}"))?;
 
                 if value.is_zero() {
                     // Zero slots have no effect on the trie.
                     continue;
                 }
 
-                require_slot_preimage(preimages, slot_hash)
-                    .map_err(|e| eyre::eyre!("S: invalid slot preimage at line {line_no}: {e}"))?;
+                require_slot_preimage(preimages, slot_hash).map_err(|e| {
+                    eyre::eyre!("S: invalid slot preimage at line {}: {e}", line_index + 1)
+                })?;
 
                 // Commit if threshold reached.
                 if storage_units >= COMMIT_THRESHOLD {
@@ -816,7 +1306,10 @@ where
                     storage_units = 0;
                 }
 
-                let entry = StorageEntry { key: slot_hash, value };
+                let entry = StorageEntry {
+                    key: slot_hash,
+                    value,
+                };
                 let tx = provider_rw.tx_ref();
                 let mut cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
                 cursor.upsert(acct_hash, &entry)?;
@@ -824,24 +1317,22 @@ where
                 total_slots += 1;
                 storage_units += 1;
             }
-
-            _ => {
-                // Unknown tag: skip silently (comments, blank lines, etc.)
-            }
         }
     }
 
     // Final commit.
     provider_rw.commit()?;
-    tracing::info!(total_accounts, total_slots, total_bytecodes, "all data written to MDBX");
+    tracing::info!(
+        total_accounts,
+        total_slots,
+        total_bytecodes,
+        "all data written to MDBX"
+    );
 
     Ok(())
 }
 
-fn require_slot_preimage(
-    preimages: &SlotPreimagesReader,
-    hashed_slot: B256,
-) -> eyre::Result<B256> {
+fn require_slot_preimage(preimages: &SlotPreimagesReader, hashed_slot: B256) -> eyre::Result<B256> {
     let plain_slot = preimages
         .get(&hashed_slot)?
         .ok_or_else(|| eyre::eyre!("missing preimage for slot {hashed_slot:#x}"))?;
@@ -856,7 +1347,9 @@ fn require_slot_preimage(
 
 fn compute_state_root_chunked<PF>(factory: &PF) -> eyre::Result<B256>
 where
-    PF: reth_provider::DatabaseProviderFactory<ProviderRW: DBProvider<Tx: DbTxMut> + TrieWriter + StorageSettingsCache>,
+    PF: reth_provider::DatabaseProviderFactory<
+            ProviderRW: DBProvider<Tx: DbTxMut> + TrieWriter + StorageSettingsCache,
+        >,
 {
     let mut intermediate_state: Option<IntermediateStateRootState> = None;
     let mut total_flushed: usize = 0;
@@ -875,9 +1368,7 @@ where
                 StateRootProgress::Progress(state, _, updates) => {
                     (None, Some(*state), Some(updates))
                 }
-                StateRootProgress::Complete(root, _, updates) => {
-                    (Some(root), None, Some(updates))
-                }
+                StateRootProgress::Complete(root, _, updates) => (Some(root), None, Some(updates)),
             }
         };
 
@@ -892,10 +1383,14 @@ where
                 "trie progress: committing to free dirty pages"
             );
             intermediate_state = Some(state);
-            provider_rw.commit().map_err(|e| eyre::eyre!("trie progress commit: {e}"))?;
+            provider_rw
+                .commit()
+                .map_err(|e| eyre::eyre!("trie progress commit: {e}"))?;
         } else if let Some(root) = root_result {
             tracing::info!(%root, flushed = n, total_flushed, "state root computation complete");
-            provider_rw.commit().map_err(|e| eyre::eyre!("trie final commit: {e}"))?;
+            provider_rw
+                .commit()
+                .map_err(|e| eyre::eyre!("trie final commit: {e}"))?;
             return Ok(root);
         }
     }
@@ -904,7 +1399,11 @@ where
 fn parse_b256(hex_str: &str) -> eyre::Result<B256> {
     let s = hex_str.trim_start_matches("0x");
     if s.len() != 64 {
-        return Err(eyre::eyre!("expected 64 hex chars, got {}: {:?}", s.len(), &hex_str[..s.len().min(20)]));
+        return Err(eyre::eyre!(
+            "expected 64 hex chars, got {}: {:?}",
+            s.len(),
+            &hex_str[..s.len().min(20)]
+        ));
     }
     let bytes = hex::decode(s)?;
     Ok(B256::from_slice(&bytes))
@@ -914,7 +1413,10 @@ pub fn read(args: SnapshotReadArgs) -> eyre::Result<()> {
     // Parse the address.
     let addr_str = args.addr.trim_start_matches("0x");
     if addr_str.len() != 40 {
-        return Err(eyre::eyre!("--addr must be 40 hex chars (20 bytes), got {}", args.addr));
+        return Err(eyre::eyre!(
+            "--addr must be 40 hex chars (20 bytes), got {}",
+            args.addr
+        ));
     }
     let addr_bytes = hex::decode(addr_str)?;
     let address = Address::from_slice(&addr_bytes);
@@ -927,7 +1429,11 @@ pub fn read(args: SnapshotReadArgs) -> eyre::Result<()> {
     let db_path = args.db.join("db");
 
     // Pick the actual MDBX directory: prefer <dir>/db, fall back to <dir>.
-    let mdbx_path = if db_path.exists() { db_path } else { args.db.clone() };
+    let mdbx_path = if db_path.exists() {
+        db_path
+    } else {
+        args.db.clone()
+    };
 
     let db = open_db_read_only(
         mdbx_path.as_path(),
@@ -1004,7 +1510,7 @@ mod tests {
     use alloy_primitives::{address, b256};
     use reth_db_api::{
         BlockNumberList,
-        models::{storage_sharded_key::StorageShardedKey, ShardedKey},
+        models::{ShardedKey, storage_sharded_key::StorageShardedKey},
     };
     use reth_storage_api::{
         AccountReader, PruneCheckpointReader, StateProvider, TryIntoHistoricalStateProvider,
@@ -1028,6 +1534,25 @@ mod tests {
         let reader = store.reader()?;
         assert_eq!(reader.get(&keccak256(plain_a))?, Some(plain_a));
         assert_eq!(reader.get(&keccak256(plain_b))?, Some(plain_b));
+        drop(reader);
+
+        let mut duplicate_batch = vec![(keccak256(plain_a), plain_a)];
+        assert_eq!(flush_preimage_batch(&store, &mut duplicate_batch)?, 0);
+
+        let corrupt_temp = tempfile::tempdir()?;
+        let corrupt_store = SlotPreimages::open(corrupt_temp.path())?;
+        corrupt_store.insert_preimages(&[(keccak256(plain_a), plain_b)])?;
+        let mut conflicting_batch = vec![(keccak256(plain_a), plain_a)];
+        let error = flush_preimage_batch(&corrupt_store, &mut conflicting_batch).unwrap_err();
+        assert!(error.to_string().contains("conflicting slot preimage"));
+
+        let mut internally_conflicting = vec![(B256::ZERO, plain_a), (B256::ZERO, plain_b)];
+        let error = flush_preimage_batch(&store, &mut internally_conflicting).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting slot preimages in batch")
+        );
         Ok(())
     }
 
@@ -1047,6 +1572,267 @@ mod tests {
         let error = require_slot_preimage(&corrupt_store.reader()?, hashed).unwrap_err();
         assert!(error.to_string().contains("corrupt preimage"));
         Ok(())
+    }
+
+    #[test]
+    fn state_stream_preflight_checks_code_and_slot_preimages() -> eyre::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = SlotPreimages::open(&temp.path().join("preimages"))?;
+        let state_path = temp.path().join("state.stream");
+        let account_hash = keccak256(address!("0000000000000000000000000000000000001234"));
+        let plain_slot = b256!("0000000000000000000000000000000000000000000000000000000000000042");
+        let slot_hash = keccak256(plain_slot);
+        store.insert_preimages(&[(slot_hash, plain_slot)])?;
+        let code = [0x60, 0x00, 0x56];
+        let code_hash = keccak256(code);
+
+        std::fs::write(
+            &state_path,
+            format!(
+                "A {account_hash:#x} 7 2a {code_hash:#x} {:#x}\nS {slot_hash:#x} 01\nC {code_hash:#x} {}\n",
+                B256::ZERO,
+                hex::encode(code),
+            ),
+        )?;
+        assert_eq!(
+            preflight_state_stream(&state_path, &store.reader()?)?,
+            StateStreamStats {
+                accounts: 1,
+                slots: 1,
+                bytecodes: 1,
+            }
+        );
+
+        std::fs::write(
+            &state_path,
+            format!(
+                "A {account_hash:#x} 7 2a {code_hash:#x} {:#x}\n",
+                B256::ZERO
+            ),
+        )?;
+        let error = preflight_state_stream(&state_path, &store.reader()?).unwrap_err();
+        assert!(error.to_string().contains("missing bytecode record"));
+
+        std::fs::write(&state_path, format!("C {code_hash:#x} 00\n"))?;
+        let error = preflight_state_stream(&state_path, &store.reader()?).unwrap_err();
+        assert!(error.to_string().contains("bytecode hash mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_import_requires_a_fresh_target() -> eyre::Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp.path().join("db/preimage"))?;
+        ensure_fresh_import_target(temp.path())?;
+
+        std::fs::create_dir(temp.path().join("db/.preimage.tmp"))?;
+        assert!(find_staging_preimage_dir(&temp.path().join("db"))?.is_some());
+        std::fs::remove_dir(temp.path().join("db/.preimage.tmp"))?;
+
+        std::fs::create_dir(temp.path().join("static_files"))?;
+        let error = ensure_fresh_import_target(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("fresh target"));
+
+        let other = tempfile::tempdir()?;
+        std::fs::create_dir_all(other.path().join("db"))?;
+        std::fs::write(other.path().join("db/mdbx.dat"), [])?;
+        let error = ensure_fresh_import_target(other.path()).unwrap_err();
+        assert!(error.to_string().contains("unexpected path"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_head_record_is_self_authenticating() -> eyre::Result<()> {
+        use alloy_rlp::Encodable;
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("head.stream");
+        let header = Header {
+            number: 42,
+            state_root: b256!("1111111111111111111111111111111111111111111111111111111111111111"),
+            ..Default::default()
+        };
+        let hash = header.hash_slow();
+        let mut encoded = Vec::new();
+        header.encode(&mut encoded);
+        std::fs::write(&path, format!("H 42 {hash:#x} {}\n", hex::encode(encoded)))?;
+        let (number, decoded_hash, decoded) = read_head_header(&path)?;
+        assert_eq!(number, 42);
+        assert_eq!(decoded_hash, hash);
+        assert_eq!(decoded.state_root, header.state_root);
+
+        std::fs::write(
+            &path,
+            format!(
+                "H 42 {hash:#x} {}\nB 42 c2c0c0\nR 42 c0\n",
+                hex::encode(alloy_rlp::encode(header.clone()))
+            ),
+        )?;
+        assert_eq!(read_head_header(&path)?.0, 42);
+
+        let bad_path = temp.path().join("bad-head.stream");
+        std::fs::write(
+            &bad_path,
+            format!(
+                "H 42 {:#x} {}\n",
+                B256::ZERO,
+                hex::encode(alloy_rlp::encode(header.clone()))
+            ),
+        )?;
+        let error = read_head_header(&bad_path).unwrap_err();
+        assert!(error.to_string().contains("header hash mismatch"));
+
+        let trailing_path = temp.path().join("trailing-head.stream");
+        let mut encoded = alloy_rlp::encode(header.clone());
+        encoded.push(0);
+        std::fs::write(
+            &trailing_path,
+            format!("H 42 {hash:#x} {}\n", hex::encode(encoded)),
+        )?;
+        let error = read_head_header(&trailing_path).unwrap_err();
+        assert!(error.to_string().contains("trailing bytes"));
+
+        let invalid_body_path = temp.path().join("invalid-body.stream");
+        std::fs::write(
+            &invalid_body_path,
+            format!(
+                "H 42 {hash:#x} {}\nB 42 80\n",
+                hex::encode(alloy_rlp::encode(header))
+            ),
+        )?;
+        let error = read_head_header(&invalid_body_path).unwrap_err();
+        assert!(error.to_string().contains("invalid B RLP"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_identity_binds_export_header_and_state_root() {
+        let manifest = canonical_test_manifest();
+        let head = canonical_test_head();
+        validate_snapshot_identity(
+            arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
+            manifest,
+            &head,
+        )
+        .unwrap();
+
+        let wrong_number = (head.0 + 1, head.1, head.2.clone());
+        assert!(
+            validate_snapshot_identity(
+                arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
+                manifest,
+                &wrong_number,
+            )
+            .is_err()
+        );
+
+        let mut wrong_root_header = head.2.clone();
+        wrong_root_header.state_root = B256::ZERO;
+        assert!(
+            validate_snapshot_identity(
+                arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
+                manifest,
+                &(head.0, head.1, wrong_root_header),
+            )
+            .is_err()
+        );
+        assert!(validate_snapshot_identity(B256::ZERO, manifest, &head).is_err());
+
+        let mut alternate_header = head.2.clone();
+        alternate_header.timestamp += 1;
+        let alternate = (head.0, alternate_header.hash_slow(), alternate_header);
+        let error = validate_snapshot_identity(
+            arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
+            manifest,
+            &alternate,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical Arbitrum One"));
+    }
+
+    #[test]
+    fn new_snapshot_format_requires_a_matching_completion_manifest() -> eyre::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let preimage_path = temp.path().join("db/preimage");
+        std::fs::create_dir_all(&preimage_path)?;
+        drop(SlotPreimages::open(&preimage_path)?);
+        write_preimage_manifest(&preimage_path, canonical_test_manifest())?;
+        let head = canonical_test_head();
+
+        let error = validate_snapshot_import_for_launch(temp.path(), &head).unwrap_err();
+        assert!(error.to_string().contains("snapshot import is incomplete"));
+
+        write_snapshot_import_manifest(temp.path(), &head)?;
+        validate_snapshot_import_for_launch(temp.path(), &head)?;
+
+        let mut altered_header = head.2.clone();
+        altered_header.timestamp += 1;
+        let altered = (head.0, altered_header.hash_slow(), altered_header);
+        assert!(validate_snapshot_import_for_launch(temp.path(), &altered).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_snapshot_identity_does_not_create_database() -> eyre::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let out = temp.path().join("out");
+        let preimage_path = out.join("db/preimage");
+        std::fs::create_dir_all(&preimage_path)?;
+        drop(SlotPreimages::open(&preimage_path)?);
+        write_preimage_manifest(&preimage_path, canonical_test_manifest())?;
+
+        let header = Header {
+            number: arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_NUMBER + 1,
+            state_root: arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
+            ..Default::default()
+        };
+        let blocks = temp.path().join("head.stream");
+        std::fs::write(
+            &blocks,
+            format!(
+                "H {} {:#x} {}\n",
+                header.number,
+                header.hash_slow(),
+                hex::encode(alloy_rlp::encode(header.clone())),
+            ),
+        )?;
+
+        let error = import(SnapshotImportArgs {
+            state: temp.path().join("unused-state.stream"),
+            out: out.clone(),
+            expect: format!("{:#x}", arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT),
+            blocks,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match Classic export"));
+        assert!(!out.join("db/mdbx.dat").exists());
+        assert!(!out.join("static_files").exists());
+        assert!(!out.join("rocksdb").exists());
+        Ok(())
+    }
+
+    fn canonical_test_manifest() -> SlotPreimageManifest {
+        SlotPreimageManifest::new(
+            arb_reth_genesis::preimages::SlotPreimageStats {
+                next_block_number: arb_reth_genesis::arbitrum_one::GENESIS_BLOCK_NUMBER,
+                classic_accounts: 1_294_583,
+                classic_slots: 24_491_013,
+                arbos_accounts: 15,
+                arbos_slots: 1_410_458,
+                address_table_entries: 680_046,
+                retryables: 16_206,
+            },
+            18_784_532,
+        )
+        .unwrap()
+    }
+
+    fn canonical_test_head() -> (u64, B256, Header) {
+        let line = include_str!("../../tests/fixtures/arb1_nitro_genesis_head.stream")
+            .lines()
+            .next()
+            .unwrap();
+        parse_header_record(line, 1).unwrap().unwrap()
     }
 
     #[test]
