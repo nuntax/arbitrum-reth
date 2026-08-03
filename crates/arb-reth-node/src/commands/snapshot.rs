@@ -87,7 +87,7 @@ use reth_provider::{
     StaticFileWriter,
 };
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_stages::stages::slot_preimages::SlotPreimages;
+use reth_stages::stages::slot_preimages::{SlotPreimages, SlotPreimagesReader};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{HeaderProvider, PruneCheckpointReader, PruneCheckpointWriter};
 
@@ -267,6 +267,16 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     std::fs::create_dir_all(&static_files_path)?;
     std::fs::create_dir_all(&rocksdb_path)?;
 
+    let preimage_path = db_path.join("preimage");
+    if !preimage_path.join("mdbx.dat").is_file() {
+        eyre::bail!(
+            "slot-preimage sidecar is missing at {}; run `arb-reth snapshot build-preimages` first",
+            preimage_path.display()
+        );
+    }
+    let preimages = SlotPreimages::open(&preimage_path)?;
+    let preimage_reader = preimages.reader()?;
+
     tracing::info!(path = ?db_path, "opening MDBX");
     let db = init_db(&db_path, DatabaseArguments::new(ClientVersion::default()))?;
 
@@ -310,18 +320,17 @@ pub fn import(args: SnapshotImportArgs) -> eyre::Result<()> {
     }
 
     tracing::info!(path = ?args.state, "streaming state import (storage v2)");
-    stream_import(&factory, &args.state)?;
+    stream_import(&factory, &args.state, &preimage_reader)?;
 
     tracing::info!("computing state root (may take several minutes for large states)");
     let computed = compute_state_root_chunked(&factory)?;
 
     println!("computed  = {computed:#x}");
     println!("expected  = {expected:#x}");
-    if computed == expected {
-        println!("MATCH");
-    } else {
-        println!("MISMATCH");
+    if computed != expected {
+        eyre::bail!("state root mismatch: computed={computed:#x}, expected={expected:#x}");
     }
+    println!("MATCH");
 
     if let Some(blocks_path) = &args.blocks {
         tracing::info!(path = ?blocks_path, "writing head header + checkpoints");
@@ -659,7 +668,11 @@ fn verify_head(
     }
 }
 
-fn stream_import<PF>(factory: &PF, path: &PathBuf) -> eyre::Result<()>
+fn stream_import<PF>(
+    factory: &PF,
+    path: &PathBuf,
+    preimages: &SlotPreimagesReader,
+) -> eyre::Result<()>
 where
     PF: reth_provider::DatabaseProviderFactory<ProviderRW: DBProvider<Tx: DbTxMut>>,
 {
@@ -786,6 +799,9 @@ where
                     continue;
                 }
 
+                require_slot_preimage(preimages, slot_hash)
+                    .map_err(|e| eyre::eyre!("S: invalid slot preimage at line {line_no}: {e}"))?;
+
                 // Commit if threshold reached.
                 if storage_units >= COMMIT_THRESHOLD {
                     provider_rw.commit()?;
@@ -820,6 +836,22 @@ where
     tracing::info!(total_accounts, total_slots, total_bytecodes, "all data written to MDBX");
 
     Ok(())
+}
+
+fn require_slot_preimage(
+    preimages: &SlotPreimagesReader,
+    hashed_slot: B256,
+) -> eyre::Result<B256> {
+    let plain_slot = preimages
+        .get(&hashed_slot)?
+        .ok_or_else(|| eyre::eyre!("missing preimage for slot {hashed_slot:#x}"))?;
+    let actual_hash = keccak256(plain_slot);
+    if actual_hash != hashed_slot {
+        eyre::bail!(
+            "corrupt preimage for slot {hashed_slot:#x}: plain={plain_slot:#x}, hash={actual_hash:#x}"
+        );
+    }
+    Ok(plain_slot)
 }
 
 fn compute_state_root_chunked<PF>(factory: &PF) -> eyre::Result<B256>
@@ -996,6 +1028,24 @@ mod tests {
         let reader = store.reader()?;
         assert_eq!(reader.get(&keccak256(plain_a))?, Some(plain_a));
         assert_eq!(reader.get(&keccak256(plain_b))?, Some(plain_b));
+        Ok(())
+    }
+
+    #[test]
+    fn imported_slot_requires_a_matching_preimage() -> eyre::Result<()> {
+        let missing_temp = tempfile::tempdir()?;
+        let missing_store = SlotPreimages::open(missing_temp.path())?;
+        let plain = b256!("0000000000000000000000000000000000000000000000000000000000000042");
+        let hashed = keccak256(plain);
+        let error = require_slot_preimage(&missing_store.reader()?, hashed).unwrap_err();
+        assert!(error.to_string().contains("missing preimage"));
+
+        let corrupt_temp = tempfile::tempdir()?;
+        let corrupt_store = SlotPreimages::open(corrupt_temp.path())?;
+        let wrong_plain = b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        corrupt_store.insert_preimages(&[(hashed, wrong_plain)])?;
+        let error = require_slot_preimage(&corrupt_store.reader()?, hashed).unwrap_err();
+        assert!(error.to_string().contains("corrupt preimage"));
         Ok(())
     }
 
