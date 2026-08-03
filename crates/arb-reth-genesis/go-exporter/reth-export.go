@@ -4,7 +4,8 @@
 // into a reth MDBX database. Snapshot-height-agnostic.
 //
 // Usage:
-//   reth-export <l2chaindata-dir> [--ancient DIR] [--mode diag|accounts|blocks|all] [--max N]
+//
+//	reth-export <l2chaindata-dir> [--ancient DIR] [--mode diag|accounts|blocks|all] [--max N]
 //
 // diag (default): print head block / state scheme / preimage availability + a small account sample.
 // accounts: stream every account as one JSON object per line (see DumpAccount).
@@ -58,7 +59,7 @@ func partitionBoundary(i, n int) []byte {
 // backing triedb is read-concurrent). nAcc/nStor are incremented atomically for cross-goroutine
 // progress. Records are identical to a serial walk, so concatenating disjoint ranges in key order
 // reproduces the whole-state stream.
-func walkRange(w *bufio.Writer, sdb state.Database, root common.Hash, db ethdb.Database,
+func walkRange(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, root common.Hash, db ethdb.Database,
 	start, end []byte, maxAcc uint64, nAcc, nStor *uint64) error {
 	accTrie, err := sdb.OpenTrie(root)
 	if err != nil {
@@ -95,10 +96,12 @@ func walkRange(w *bufio.Writer, sdb state.Database, root common.Hash, db ethdb.D
 			fmt.Fprintf(w, "C %x %x\n", codeHash, rawdb.ReadCode(db, codeHash))
 		}
 		if acc.Root != types.EmptyRootHash {
-			// `addr` only derives the storage-trie owner for the PATH scheme; on a hash-scheme DB
-			// nodes are keyed purely by hash, so the zero address is correct here (there is no
-			// preimage to recover the real address, and none is needed).
-			storageTr, err := sdb.OpenStorageTrie(root, common.Address{}, acc.Root, accTrie)
+			// Open the storage trie with the account hash yielded by the trie iterator. Calling
+			// state.Database.OpenStorageTrie would hash an address preimage, but pruned Nitro
+			// snapshots commonly omit preimages. StorageTrieID accepts the hashed owner directly
+			// and therefore works for both path- and hash-scheme databases.
+			owner := common.BytesToHash(accIt.Key)
+			storageTr, err := trie.NewStateTrie(trie.StorageTrieID(root, owner, acc.Root), tdb)
 			if err != nil {
 				return fmt.Errorf("open storage trie: %w", err)
 			}
@@ -235,7 +238,7 @@ func main() {
 		var nAcc, nStor uint64
 		if *parallel <= 1 {
 			w := bufio.NewWriterSize(os.Stdout, 1<<20)
-			if err := walkRange(w, sdb, header.Root, db, nil, nil, *max, &nAcc, &nStor); err != nil {
+			if err := walkRange(w, sdb, tdb, header.Root, db, nil, nil, *max, &nAcc, &nStor); err != nil {
 				fatal("walk state", err)
 			}
 			if err := w.Flush(); err != nil {
@@ -280,7 +283,7 @@ func main() {
 					}
 					defer f.Close()
 					w := bufio.NewWriterSize(f, 1<<20)
-					if err := walkRange(w, sdb, header.Root, db, bounds[i], bounds[i+1], 0, &nAcc, &nStor); err != nil {
+					if err := walkRange(w, sdb, tdb, header.Root, db, bounds[i], bounds[i+1], 0, &nAcc, &nStor); err != nil {
 						errs[i] = err
 						return
 					}
