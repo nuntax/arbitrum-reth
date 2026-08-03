@@ -48,7 +48,7 @@ mod tests {
     async fn engine_tree_tier1_replay() {
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(testnode_spec());
         reth_db_common::init::init_genesis(&factory).expect("init ArbOS genesis block 0");
-        drive_replay_native(factory, 412346).await;
+        drive_replay_native(factory, 412346, ArbEngineTuning::reth_defaults()).await;
     }
 
     /// Gate (hashed-only / storage v2): the mainnet-shaped base where hashed-state tables are
@@ -57,11 +57,25 @@ mod tests {
     /// payload builder and engine-owned sparse trie task read the hashed tables correctly.
     #[tokio::test(flavor = "multi_thread")]
     async fn engine_tree_tier1_replay_v2_hashed() {
+        let factory = storage_v2_factory();
+        drive_replay_native(factory, 412346, ArbEngineTuning::reth_defaults()).await;
+    }
+
+    /// Gate the sparse state-root task over the same Storage V2 replay fixture.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engine_tree_tier1_replay_v2_hashed_sparse() {
+        let factory = storage_v2_factory();
+        let mut tuning = ArbEngineTuning::reth_defaults();
+        tuning.share_sparse_trie_with_payload_builder = true;
+        drive_replay_native(factory, 412346, tuning).await;
+    }
+
+    fn storage_v2_factory() -> TestFactory {
+        // Emit a storage-v2 DB (hashed-state canonical, `PackedKeyAdapter`), mirroring the importer.
         use reth_db_api::models::StorageSettings;
         use reth_provider::{MetadataWriter, StorageSettingsCache};
 
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(testnode_spec());
-        // Emit a storage-v2 DB (hashed-state canonical, `PackedKeyAdapter`), mirroring the importer.
         factory.set_storage_settings_cache(StorageSettings::v2());
         {
             let provider_rw = factory.provider_rw().expect("provider_rw");
@@ -76,10 +90,14 @@ mod tests {
             true,
         )
         .expect("init ArbOS genesis (v2 hashed-canonical)");
-        drive_replay_native(factory, 412346).await;
+        factory
     }
 
-    async fn drive_replay_native(factory: TestFactory, chain_id: u64) {
+    async fn drive_replay_native(
+        factory: TestFactory,
+        chain_id: u64,
+        tuning: ArbEngineTuning,
+    ) {
         const TARGET: u64 = 17;
         const FEED: &str = include_str!("../tests/fixtures/testnode_feed_seq0_17.ndjson");
         const BLOCKS: &str = include_str!("../tests/fixtures/testnode_blocks_0_17.json");
@@ -105,7 +123,7 @@ mod tests {
             0,
             canonical,
             Runtime::test(),
-            ArbEngineTuning::reth_defaults(),
+            tuning,
             None,
         )
         .expect("spawn native payload driver");
