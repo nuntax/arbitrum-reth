@@ -16,8 +16,9 @@ use reth_chain_state::ExecutedBlock;
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::providers::ProviderNodeTypes;
-use reth_provider::{ProviderFactory, SaveBlocksMode};
-use reth_storage_api::StateRootProvider;
+use reth_provider::{ProviderFactory, SaveBlocksInput};
+use reth_stages_types::StageId;
+use reth_storage_api::{StageCheckpointReader, StateRootProvider};
 use reth_trie_common::{ComputedTrieData, HashedPostState, KeccakKeyHasher};
 use revm_database::BundleState;
 
@@ -33,8 +34,7 @@ use revm_database::BundleState;
 ///    the **parent** (current latest committed) state.
 /// 3. Assert `root == block.header().state_root`.
 /// 4. Build [`ExecutedBlock`] wrapping the output and pre-computed [`ComputedTrieData`].
-/// 5. Write to MDBX + static files via `provider_rw.save_blocks(.., SaveBlocksMode::Full)` then
-///    `provider_rw.commit()`.
+/// 5. Write to MDBX + static files via `provider_rw.save_blocks(..)` then `provider_rw.commit()`.
 pub fn persist_executed_block<N>(
     factory: &ProviderFactory<N>,
     recovered_block: RecoveredBlock<ArbBlock>,
@@ -54,6 +54,7 @@ where
 
     // Assert consistency: the caller baked the root into the header.
     let expected_root = recovered_block.header().state_root;
+    let new_tip = recovered_block.header().number;
     if computed_root != expected_root {
         return Err(eyre!(
             "state root mismatch: computed {computed_root}, header has {expected_root}"
@@ -78,7 +79,24 @@ where
     let executed = ExecutedBlock::new(Arc::new(recovered_block), execution_output, trie_data);
 
     let provider_rw = factory.provider_rw()?;
-    provider_rw.save_blocks(vec![executed], SaveBlocksMode::Full)?;
+    let (db_tip, state_trie_tip) = provider_rw
+        .get_stage_checkpoint(StageId::Finish)?
+        .map(|checkpoint| {
+            let state_trie_tip = checkpoint
+                .finish_stage_checkpoint()
+                .and_then(|finish| finish.partial_state_trie())
+                .unwrap_or(checkpoint.block_number);
+            (checkpoint.block_number, state_trie_tip)
+        })
+        .unwrap_or_default();
+    if db_tip != state_trie_tip {
+        return Err(eyre!(
+            "cannot directly persist over a partial state/trie frontier: database tip {db_tip}, state/trie tip {state_trie_tip}"
+        ));
+    }
+
+    let input = SaveBlocksInput::new(vec![executed], db_tip, state_trie_tip, new_tip, new_tip);
+    provider_rw.save_blocks(&input)?;
     provider_rw.commit()?;
 
     Ok(())
@@ -93,11 +111,11 @@ mod tests {
     use alloy_consensus::Header;
     use alloy_primitives::{U256, address};
     use reth_chainspec::MAINNET;
-    use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
+    use reth_db_common::init::init_genesis;
     use reth_primitives_traits::SealedBlock;
     use reth_provider::{HeaderProvider, test_utils::create_test_provider_factory_with_node_types};
     use reth_storage_api::{AccountReader, BlockHashReader, StateRootProvider};
-    use reth_trie_common::{ComputedTrieData, HashedPostState, KeccakKeyHasher};
+    use reth_trie_common::{HashedPostState, KeccakKeyHasher};
     use revm_database::BundleState;
     use revm_state::AccountInfo;
 
@@ -112,35 +130,7 @@ mod tests {
         let chain_spec = MAINNET.clone();
         let factory = create_test_provider_factory_with_node_types::<ArbNode>(chain_spec.clone());
 
-        // Persist genesis (block 0) so static files are seeded; save_blocks requires
-        // contiguous static files starting from genesis before it accepts block 1.
-        {
-            let genesis_block = SealedBlock::<ArbBlock>::seal_slow(alloy_consensus::Block {
-                header: Header {
-                    number: 0,
-                    ..Default::default()
-                },
-                body: Default::default(),
-            });
-            let genesis_executed = ExecutedBlock::new(
-                Arc::new(genesis_block.try_recover().unwrap()),
-                Arc::new(BlockExecutionOutput {
-                    result: BlockExecutionResult {
-                        receipts: vec![],
-                        requests: Default::default(),
-                        gas_used: 0,
-                        blob_gas_used: 0,
-                    },
-                    state: BundleState::default(),
-                }),
-                ComputedTrieData::default(),
-            );
-            let provider_rw = factory.provider_rw().unwrap();
-            provider_rw
-                .save_blocks(vec![genesis_executed], SaveBlocksMode::Full)
-                .unwrap();
-            provider_rw.commit().unwrap();
-        }
+        init_genesis(&factory).expect("genesis must initialize");
 
         const BLOCK_NUM: u64 = 1;
         let known_addr = address!("0000000000000000000000000000000000001234");

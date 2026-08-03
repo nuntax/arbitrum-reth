@@ -12,7 +12,7 @@ authors.workspace = true
 
 [dependencies]
 arb-reth-l1 = { path = "../arb-reth-l1" }
-arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", default-features = false, features = ["std"] }
+arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", default-features = false, features = ["std"] }
 
 alloy-primitives = { version = "1", default-features = false }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
@@ -27,4 +27,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 tracing = "0.1"
 
 [dev-dependencies]
-reth-db = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f", features = ["test-utils"] }
+reth-db = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872", features = ["test-utils"] }

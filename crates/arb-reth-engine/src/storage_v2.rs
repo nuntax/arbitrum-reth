@@ -28,16 +28,19 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_engine_tree::persistence::{PersistenceAction, PersistenceHandle};
-use reth_provider::{DatabaseProviderFactory, ProviderFactory, providers::ProviderNodeTypes};
+use reth_provider::{
+    DatabaseProviderFactory, ProviderFactory, SaveBlocksInput, providers::ProviderNodeTypes,
+};
 use reth_prune::PrunerWithFactory;
 use reth_revm::revm::database::states::RevertToSlot;
 use reth_stages::stages::slot_preimages::{SlotPreimages, SlotPreimagesReader};
-use reth_stages_api::MetricEventsSender;
+use reth_stages_api::{MetricEventsSender, StageId};
 use reth_storage_api::{
-    BlockNumReader, DBProvider, HeaderProvider, StoragePath, StorageSettingsCache,
+    BlockNumReader, DBProvider, HeaderProvider, StageCheckpointReader, StoragePath,
+    StorageSettingsCache,
 };
 use reth_tasks::spawn_os_thread;
-use reth_trie::HashedPostStateSorted;
+use reth_trie::{ComputedTrieData, HashedPostStateSorted, HashedStorageSorted, LazyTrieData};
 
 /// Joins the persistence proxy after the engine-tree request sender has been dropped.
 pub(crate) struct PersistenceProxyGuard(Option<JoinHandle<()>>);
@@ -61,6 +64,7 @@ where
     <ProviderFactory<N> as DatabaseProviderFactory>::Provider: BlockNumReader
         + DBProvider
         + HeaderProvider<Header = Header>
+        + StageCheckpointReader
         + StoragePath
         + StorageSettingsCache,
 {
@@ -74,22 +78,23 @@ where
         let mut preimages = None;
         while let Ok(action) = receiver.recv() {
             match action {
-                PersistenceAction::SaveBlocks(mut blocks, response) => {
-                    if let Err(err) =
-                        prepare_storage_v2_batch(&factory, &mut blocks, &mut preimages)
-                    {
-                        tracing::error!(
-                            target: "arb-reth::persistence",
-                            %err,
-                            "failed to prepare Storage V2 persistence batch",
-                        );
-                        // Dropping the response sender makes the engine tree surface the failure
-                        // instead of persisting an unwind-unsafe batch.
-                        break;
-                    }
+                PersistenceAction::SaveBlocks(input, response) => {
+                    let input = match prepare_storage_v2_batch(&factory, input, &mut preimages) {
+                        Ok(input) => input,
+                        Err(err) => {
+                            tracing::error!(
+                                target: "arb-reth::persistence",
+                                %err,
+                                "failed to prepare Storage V2 persistence batch",
+                            );
+                            // Dropping the response sender makes the engine tree surface the
+                            // failure instead of persisting an unwind-unsafe batch.
+                            break;
+                        }
+                    };
 
                     let (delegate_tx, delegate_rx) = crossbeam_channel::bounded(1);
-                    if delegate.save_blocks(blocks, delegate_tx).is_err() {
+                    if delegate.save_blocks(input, delegate_tx).is_err() {
                         break;
                     }
                     let Ok(result) = delegate_rx.recv() else {
@@ -124,30 +129,38 @@ where
 
 fn prepare_storage_v2_batch<N>(
     factory: &ProviderFactory<N>,
-    blocks: &mut [ExecutedBlock<ArbPrimitives>],
+    input: SaveBlocksInput<ArbPrimitives>,
     preimages: &mut Option<SlotPreimages>,
-) -> eyre::Result<()>
+) -> eyre::Result<SaveBlocksInput<ArbPrimitives>>
 where
     N: ProviderNodeTypes<Primitives = ArbPrimitives>,
     <ProviderFactory<N> as DatabaseProviderFactory>::Provider: BlockNumReader
         + DBProvider
         + HeaderProvider<Header = Header>
+        + StageCheckpointReader
         + StoragePath
         + StorageSettingsCache,
 {
-    if blocks.is_empty() {
-        return Ok(());
-    }
+    let prev_db_tip = input.prev_db_tip();
+    let prev_partial_state_trie = input.prev_partial_state_trie();
+    let new_db_tip = input.new_db_tip();
+    let new_partial_state_trie = input.new_partial_state_trie();
+    let mut blocks = input
+        .state_trie_blocks()
+        .iter()
+        .chain(input.state_trie_masking_blocks())
+        .cloned()
+        .collect::<Vec<_>>();
 
     let provider = factory.database_provider_ro()?;
     if !provider.cached_storage_settings().use_hashed_state() {
-        return Ok(());
+        return Ok(input);
     }
 
-    validate_persistence_batch(&provider, blocks)?;
-    let legacy = legacy_block_flags(&provider, blocks)?;
+    validate_persistence_batch(&provider, &blocks, prev_db_tip, prev_partial_state_trie)?;
+    let legacy = legacy_block_flags(&provider, &blocks)?;
     if !legacy.iter().any(|legacy| *legacy) {
-        return Ok(());
+        return Ok(input);
     }
 
     let metrics = storage_v2_metrics();
@@ -157,7 +170,7 @@ where
         *preimages = Some(SlotPreimages::open(&preimage_path)?);
     }
     let preimages = preimages.as_ref().expect("initialized above");
-    let mut entries = collect_slot_preimages(blocks, &legacy);
+    let mut entries = collect_slot_preimages(&blocks, &legacy);
     let mut preimage_candidates = 0usize;
     let mut new_preimages = 0usize;
     let mut preimage_commit = None;
@@ -184,7 +197,7 @@ where
         }
     }
 
-    let wipe_addresses = collect_wipe_addresses(blocks, &legacy);
+    let wipe_addresses = collect_wipe_addresses(&blocks, &legacy);
     let wipe_accounts = wipe_addresses.len();
     if wipe_addresses.is_empty() {
         let elapsed = started_at.elapsed();
@@ -197,7 +210,13 @@ where
             wipe_accounts,
             0,
         );
-        return Ok(());
+        return Ok(SaveBlocksInput::new(
+            blocks,
+            prev_db_tip,
+            prev_partial_state_trie,
+            new_db_tip,
+            new_partial_state_trie,
+        ));
     }
 
     let mut tracked = load_wiped_account_storage(&provider, wipe_addresses)?;
@@ -211,6 +230,7 @@ where
                 &tracked,
                 &reader,
             )?;
+            mark_hashed_storage_wipes(block);
         }
         let trie_data = block.trie_data();
         apply_hashed_updates(&mut tracked, &trie_data.sorted.hashed_state);
@@ -226,7 +246,13 @@ where
         wipe_accounts,
         injected_slots,
     );
-    Ok(())
+    Ok(SaveBlocksInput::new(
+        blocks,
+        prev_db_tip,
+        prev_partial_state_trie,
+        new_db_tip,
+        new_partial_state_trie,
+    ))
 }
 
 fn missing_preimages(
@@ -298,17 +324,41 @@ fn record_storage_v2_metrics(
 fn validate_persistence_batch<P>(
     provider: &P,
     blocks: &[ExecutedBlock<ArbPrimitives>],
+    prev_db_tip: u64,
+    prev_partial_state_trie: u64,
 ) -> eyre::Result<()>
 where
-    P: BlockNumReader + HeaderProvider<Header = Header>,
+    P: BlockNumReader + HeaderProvider<Header = Header> + StageCheckpointReader,
 {
     let durable_tip = provider.last_block_number()?;
-    let mut expected_number = durable_tip
+    if durable_tip != prev_db_tip {
+        return Err(eyre!(
+            "persistence input database tip {prev_db_tip} does not match durable tip {durable_tip}"
+        ));
+    }
+    let (checkpoint_db_tip, checkpoint_state_trie_tip) = provider
+        .get_stage_checkpoint(StageId::Finish)?
+        .map(|checkpoint| {
+            let state_trie_tip = checkpoint
+                .finish_stage_checkpoint()
+                .and_then(|finish| finish.partial_state_trie())
+                .unwrap_or(checkpoint.block_number);
+            (checkpoint.block_number, state_trie_tip)
+        })
+        .unwrap_or_default();
+    if (checkpoint_db_tip, checkpoint_state_trie_tip)
+        != (prev_db_tip, prev_partial_state_trie)
+    {
+        return Err(eyre!(
+            "persistence input frontiers ({prev_db_tip}, {prev_partial_state_trie}) do not match Finish checkpoint ({checkpoint_db_tip}, {checkpoint_state_trie_tip})"
+        ));
+    }
+    let mut expected_number = prev_partial_state_trie
         .checked_add(1)
         .ok_or_else(|| eyre!("durable block number overflow"))?;
     let mut expected_parent = provider
-        .sealed_header(durable_tip)?
-        .ok_or_else(|| eyre!("missing durable tip header {durable_tip}"))?
+        .sealed_header(prev_partial_state_trie)?
+        .ok_or_else(|| eyre!("missing state/trie frontier header {prev_partial_state_trie}"))?
         .hash();
 
     for block in blocks {
@@ -317,7 +367,7 @@ where
                 "persistence batch starts or jumps at block {}, expected {} after durable tip {}",
                 block.block_number(),
                 expected_number,
-                durable_tip,
+                prev_partial_state_trie,
             ));
         }
         if block.recovered_block.header().parent_hash != expected_parent {
@@ -428,6 +478,37 @@ fn block_has_storage_wipe(block: &ExecutedBlock<ArbPrimitives>) -> bool {
         .reverts
         .iter()
         .any(|transition| transition.iter().any(|(_, revert)| revert.wipe_storage))
+}
+
+fn mark_hashed_storage_wipes(block: &mut ExecutedBlock<ArbPrimitives>) {
+    let wiped_addresses = block
+        .execution_outcome()
+        .state
+        .reverts
+        .iter()
+        .flat_map(|transition| transition.iter())
+        .filter_map(|(address, revert)| revert.wipe_storage.then_some(*address))
+        .collect::<HashSet<_>>();
+    if wiped_addresses.is_empty() {
+        return;
+    }
+
+    let trie_data = block.trie_data().clone();
+    let mut hashed_state = Arc::unwrap_or_clone(trie_data.sorted.hashed_state);
+    for address in wiped_addresses {
+        hashed_state
+            .storages
+            .entry(keccak256(address))
+            .and_modify(|storage| storage.wiped = true)
+            .or_insert_with(|| HashedStorageSorted {
+                wiped: true,
+                storage_slots: Vec::new(),
+            });
+    }
+    block.trie_data = LazyTrieData::ready(ComputedTrieData::new(
+        Arc::new(hashed_state),
+        trie_data.sorted.trie_updates,
+    ));
 }
 
 struct TrackedStorage {
@@ -541,13 +622,14 @@ mod tests {
         reth::{ArbBlock, ArbPrimitives},
     };
     use reth_chain_state::ExecutedBlock;
-    use reth_chainspec::MAINNET;
+    use reth_chainspec::{ChainSpec, MAINNET};
+    use reth_db_common::init::init_genesis_with_settings;
     use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
     use reth_exex_types::FinishedExExHeight;
     use reth_node_types::NodeTypes;
     use reth_primitives_traits::SealedBlock;
     use reth_provider::{
-        SaveBlocksMode, StaticFileProviderFactory, StorageSettings,
+        SaveBlocksInput, StaticFileProviderFactory, StorageSettings,
         test_utils::create_test_provider_factory_with_node_types,
     };
     use reth_prune::Pruner;
@@ -591,6 +673,17 @@ mod tests {
         }
         .update_header(&mut header);
         header
+    }
+
+    fn test_chain_spec() -> Arc<ChainSpec> {
+        let mut genesis = MAINNET.genesis.clone();
+        let info = ArbHeaderInfo {
+            arbos_format_version: 19,
+            ..Default::default()
+        };
+        genesis.extra_data = info.encode_extra_data();
+        genesis.mix_hash = info.encode_mix_hash();
+        Arc::new(ChainSpec::from_genesis(genesis))
     }
 
     fn executed_block(
@@ -760,19 +853,8 @@ mod tests {
 
     #[test]
     fn storage_v2_wipe_persists_plain_changeset_and_unwinds() -> eyre::Result<()> {
-        let factory = create_test_provider_factory_with_node_types::<TestArbNode>(MAINNET.clone());
-        factory.set_storage_settings_cache(StorageSettings::v2());
-
-        let genesis = executed_block(
-            arb_header(0, B256::ZERO, B256::ZERO),
-            BundleState::default(),
-            HashedPostState::default(),
-            TrieUpdates::default(),
-        );
-        let genesis_hash = genesis.recovered_block.hash();
-        let provider = factory.database_provider_rw()?;
-        provider.save_blocks(vec![genesis], SaveBlocksMode::Full)?;
-        provider.commit()?;
+        let factory = create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
+        let genesis_hash = init_genesis_with_settings(&factory, StorageSettings::v2())?;
 
         let (_finished_exex_height_tx, finished_exex_height_rx) =
             tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
@@ -819,7 +901,10 @@ mod tests {
         );
         let initial_hash = initial.recovered_block.hash();
         let (response_tx, response_rx) = crossbeam_channel::bounded(1);
-        persistence.save_blocks(vec![initial.clone()], response_tx)?;
+        persistence.save_blocks(
+            SaveBlocksInput::new(vec![initial.clone()], 0, 0, 1, 1),
+            response_tx,
+        )?;
         response_rx.recv_timeout(std::time::Duration::from_secs(10))?;
 
         let mut destroyed_state = BundleState::builder(2..=2)
@@ -859,7 +944,10 @@ mod tests {
         response_rx.recv_timeout(std::time::Duration::from_secs(10))?;
 
         let (response_tx, response_rx) = crossbeam_channel::bounded(1);
-        persistence.save_blocks(vec![initial, destroyed], response_tx)?;
+        persistence.save_blocks(
+            SaveBlocksInput::new(vec![initial, destroyed], 0, 0, 2, 2),
+            response_tx,
+        )?;
         response_rx.recv_timeout(std::time::Duration::from_secs(10))?;
 
         let changeset = factory.static_file_provider().storage_changeset(2)?;
@@ -912,19 +1000,8 @@ mod tests {
 
     #[test]
     fn storage_v2_wipe_fails_closed_when_snapshot_preimage_is_missing() -> eyre::Result<()> {
-        let factory = create_test_provider_factory_with_node_types::<TestArbNode>(MAINNET.clone());
-        factory.set_storage_settings_cache(StorageSettings::v2());
-
-        let genesis = executed_block(
-            arb_header(0, B256::ZERO, B256::ZERO),
-            BundleState::default(),
-            HashedPostState::default(),
-            TrieUpdates::default(),
-        );
-        let genesis_hash = genesis.recovered_block.hash();
-        let provider = factory.database_provider_rw()?;
-        provider.save_blocks(vec![genesis], SaveBlocksMode::Full)?;
-        provider.commit()?;
+        let factory = create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
+        let genesis_hash = init_genesis_with_settings(&factory, StorageSettings::v2())?;
 
         let address = address!("0000000000000000000000000000000000001234");
         let slot_a = U256::from(0x42);
@@ -965,7 +1042,8 @@ mod tests {
         // Persist the snapshot-like base state without the proxy, so its hashed slots exist while
         // the auxiliary plain-key sidecar remains empty.
         let provider = factory.database_provider_rw()?;
-        provider.save_blocks(vec![initial], SaveBlocksMode::Full)?;
+        let input = SaveBlocksInput::new(vec![initial], 0, 0, 1, 1);
+        provider.save_blocks(&input)?;
         provider.commit()?;
 
         let mut destroyed_state = BundleState::builder(2..=2)
@@ -1005,7 +1083,10 @@ mod tests {
             spawn_persistence(factory.clone(), pruner, metrics_tx);
 
         let (response_tx, response_rx) = crossbeam_channel::bounded(1);
-        persistence.save_blocks(vec![destroyed], response_tx)?;
+        persistence.save_blocks(
+            SaveBlocksInput::new(vec![destroyed], 1, 1, 2, 2),
+            response_tx,
+        )?;
         assert!(matches!(
             response_rx.recv_timeout(std::time::Duration::from_secs(10)),
             Err(crossbeam_channel::RecvTimeoutError::Disconnected)

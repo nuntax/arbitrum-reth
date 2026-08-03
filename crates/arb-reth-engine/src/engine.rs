@@ -37,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState, StateTrieOverlayManager};
+use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
 };
@@ -67,12 +67,12 @@ use reth_storage_api::{
     DBProvider, PruneCheckpointReader, StageCheckpointReader, StateProvider, StoragePath,
     StorageSettingsCache,
 };
+use reth_storage_overlay::OverlayManager;
 use reth_tasks::Runtime;
 use reth_trie::{
     AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput, updates::TrieUpdates,
 };
-use reth_trie_db::ChangesetCache;
 use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
@@ -381,7 +381,7 @@ pub(crate) fn produce_with_timing<'a>(
     let phase_started_at = Instant::now();
 
     let finish_state_timings = Arc::new(FinishStateTimings::default());
-    let (state_root_precomputed, changed_paths, state_root_task_wait, state_root_task_succeeded) =
+    let (state_root_precomputed, state_root_task_wait, state_root_task_succeeded) =
         if let Some(mut task) = state_root_task {
             // Dropping the hook signals that the task has received every ArbOS state transition,
             // including the EIP-2935 prelude and start-block transaction.
@@ -409,7 +409,7 @@ pub(crate) fn produce_with_timing<'a>(
                     created_empty = sparse_hazards & SPARSE_HAZARD_CREATED_EMPTY != 0,
                     "using synchronous state root for sparse-incompatible account lifecycle",
                 );
-                (None, None, Some(wait_started_at.elapsed()), false)
+                (None, Some(wait_started_at.elapsed()), false)
             } else {
                 match task.state_root() {
                     Ok(outcome) => (
@@ -417,7 +417,6 @@ pub(crate) fn produce_with_timing<'a>(
                             outcome.state_root,
                             Arc::unwrap_or_clone(outcome.trie_updates),
                         )),
-                        outcome.changed_paths,
                         Some(wait_started_at.elapsed()),
                         true,
                     ),
@@ -429,12 +428,12 @@ pub(crate) fn produce_with_timing<'a>(
                             %err,
                             "state-root task failed; falling back to synchronous state root",
                         );
-                        (None, None, Some(wait_started_at.elapsed()), false)
+                        (None, Some(wait_started_at.elapsed()), false)
                     }
                 }
             }
         } else {
-            (None, None, None, false)
+            (None, None, false)
         };
     let outcome = builder
         .finish(
@@ -479,7 +478,6 @@ pub(crate) fn produce_with_timing<'a>(
             execution_output,
             hashed_state: Arc::new(outcome.hashed_state),
             trie_updates: Arc::new(outcome.trie_updates),
-            changed_paths,
         },
         ArbBlockProductionTiming {
             total: started_at.elapsed(),
@@ -1168,9 +1166,7 @@ where
         // ---- engine-tree wiring (all reth components) ----
         let consensus: Arc<dyn reth_consensus::FullConsensus<ArbPrimitives>> =
             Arc::new(reth_consensus::noop::NoopConsensus::default());
-        let changeset_cache = ChangesetCache::new();
-        let state_trie_overlays =
-            StateTrieOverlayManager::new(runtime.state_trie_overlay_worker_pool());
+        let state_trie_overlays = OverlayManager::new(runtime.state_trie_overlay_worker_pool());
         let tree_config = tuning.to_tree_config();
         tracing::info!(
             target: "arb-reth::engine",
@@ -1189,7 +1185,6 @@ where
             ArbPayloadValidator,
             tree_config.clone(),
             Box::new(NoopInvalidBlockHook::default()),
-            changeset_cache.clone(),
             state_trie_overlays.clone(),
             runtime.clone(),
         );
@@ -1217,7 +1212,6 @@ where
             tree_config.clone(),
             EngineApiKind::Ethereum,
             evm_config.clone(),
-            changeset_cache.clone(),
             runtime.clone(),
         );
 

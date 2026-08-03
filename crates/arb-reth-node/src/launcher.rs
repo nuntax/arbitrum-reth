@@ -38,8 +38,8 @@ use reth_storage_api::{
     HeaderProvider, MetadataProvider, MetadataWriter, PruneCheckpointReader, StageCheckpointReader,
     StorageSettingsCache,
 };
+use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
-use reth_trie_db::ChangesetCache;
 use tokio::sync::oneshot;
 
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
@@ -236,7 +236,9 @@ impl ArbLauncher {
             config.rpc.disable_auth_server = true;
         }
 
-        let changeset_cache = ChangesetCache::new();
+        let overlay_manager = OverlayManager::<ArbPrimitives>::new(
+            ctx.task_executor.state_trie_overlay_worker_pool(),
+        );
         let disabled_stages = N::disabled_stages();
 
         let ctx = ctx
@@ -245,7 +247,7 @@ impl ArbLauncher {
             .attach(database.clone())
             .with_adjusted_configs()
             .with_provider_factory::<NodeTypesWithDBAdapter<N, DB>, <CB::Components as NodeComponents<T>>::Evm>(
-                changeset_cache.clone(),
+                overlay_manager.clone(),
                 rocksdb_provider,
                 disabled_stages,
             )

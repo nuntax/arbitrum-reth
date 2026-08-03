@@ -14,11 +14,11 @@ revm = { workspace = true }
 
 # Arbitrum consensus primitives (ArbTxEnvelope, ArbReceiptEnvelope, ArbHeaderInfo). reth-trait
 # impls live inside arb-alloy behind the `reth` feature (orphan rule).
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", default-features = false, features = ["reth"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", default-features = false, features = ["reth"] }
 
-reth-evm = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f" }
-alloy-evm = { version = "0.37", default-features = false }
-reth-primitives-traits = { version = "0.5.0", default-features = false }
+reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
+alloy-evm = { version = "0.38", default-features = false }
+reth-primitives-traits = { version = "0.6.0", default-features = false }
 metrics = "0.24"
 
 # alloy consensus traits used to lower ArbTxEnvelope into the revm tx env.
@@ -27,9 +27,9 @@ alloy-eips = { version = "2.0", default-features = false }
 alloy-primitives = { version = "1", default-features = false }
 
 # rpc feature: TryIntoTxEnv and BuildPendingEnv impls for Arbitrum RPC types.
-arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", optional = true }
+arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", optional = true }
 alloy-rpc-types-eth = { version = "2.0", default-features = false, optional = true }
-reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", rev = "ab273f171ad87248f0c3ea3e5f1d2600c581715f", optional = true }
+reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872", optional = true }
 
 [features]
 rpc = ["arbitrum-alloy-rpc-types", "alloy-rpc-types-eth", "alloy-evm/rpc", "reth-rpc-eth-api"]

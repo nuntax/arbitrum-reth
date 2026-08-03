@@ -169,16 +169,20 @@ where
         input: BuildNewPayload<ArbPayloadAttributes>,
         id: alloy_rpc_types_engine::PayloadId,
     ) -> Result<Self::Job, PayloadBuilderError> {
-        let parent_header = if input.parent_hash.is_zero() {
+        let BuildNewPayload {
+            attributes,
+            parent_hash,
+            mut resources,
+        } = input;
+        let parent_header = if parent_hash.is_zero() {
             self.provider
                 .latest_header()?
                 .ok_or(PayloadBuilderError::MissingParentHeader(B256::ZERO))?
         } else {
             self.provider
-                .sealed_header_by_hash(input.parent_hash)?
-                .ok_or(PayloadBuilderError::MissingParentHeader(input.parent_hash))?
+                .sealed_header_by_hash(parent_hash)?
+                .ok_or(PayloadBuilderError::MissingParentHeader(parent_hash))?
         };
-        let attributes = input.attributes;
         let config = PayloadConfig::new(Arc::new(parent_header), attributes.clone(), id);
         let (tx, rx) = oneshot::channel();
         let cancel = CancelOnDrop::default();
@@ -192,8 +196,8 @@ where
             .spawn_blocking_named_or_tokio(ARB_PAYLOAD_BUILDER_THREAD, move || {
                 let args = BuildArguments {
                     cached_reads: CachedReads::default(),
-                    execution_cache: input.cache,
-                    state_root_handle: input.state_root_handle,
+                    execution_cache: resources.take_execution_cache(),
+                    state_root_handle: resources.take_state_root_handle(),
                     config,
                     cancel,
                     best_payload: None,
