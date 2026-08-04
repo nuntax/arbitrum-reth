@@ -19,11 +19,12 @@ use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
+use arb_revm::ArbosState;
 use arb_revm::executor::{
     ArbExecCfg, ArbParentHeader, digest_message, is_redeem_scheduled_log,
     scheduled_retries_from_redeem_logs,
 };
-use arb_revm::{ArbSpecId, ArbosState};
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -32,7 +33,7 @@ use metrics::{Counter, Histogram};
 use std::{
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -43,9 +44,11 @@ use reth_engine_primitives::{
 };
 use reth_engine_tree::chain::FromOrchestrator;
 use reth_engine_tree::engine::{EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine};
-use reth_engine_tree::tree::state_root_strategy::PayloadStateRootHandle;
+use reth_engine_tree::tree::state_root_strategy::{
+    DefaultStateRootStrategy, PayloadStateRootHandle, PayloadStateRootJobContext,
+    PreparedStateRootJob, StateRootJobContext, StateRootStrategy,
+};
 use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler};
-use reth_evm::OnStateHook as _;
 use reth_evm::execute::BlockBuilder as _;
 use reth_evm::{ConfigureEvm as _, Evm as _};
 use reth_execution_cache::CacheStats;
@@ -83,20 +86,57 @@ type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
 >;
 
-const SPARSE_HAZARD_SELFDESTRUCT: u8 = 1 << 0;
-const SPARSE_HAZARD_CREATED_EMPTY: u8 = 1 << 1;
+/// First ArbOS version that stopped preserving the empty retryable escrow created by a zero-value
+/// transfer.
+const ARBOS_VERSION_STYLUS: u64 = 30;
 
-fn sparse_root_hazards(state: &revm::state::EvmState, preserve_created_empty_accounts: bool) -> u8 {
-    let mut hazards = 0;
-    for account in state.values() {
-        if account.is_selfdestructed() {
-            hazards |= SPARSE_HAZARD_SELFDESTRUCT;
-        }
-        if preserve_created_empty_accounts && account.is_created() && account.is_empty() {
-            hazards |= SPARSE_HAZARD_CREATED_EMPTY;
+/// Selects the account policy for the child of `parent`.
+fn preserves_created_empty_accounts(parent: &Header) -> bool {
+    ArbHeaderInfo::decode_header(parent)
+        .is_ok_and(|info| info.is_arbitrum() && info.arbos_format_version < ARBOS_VERSION_STYLUS)
+}
+
+/// Reth's state-root strategy with the historical ArbOS created-empty account exception.
+#[derive(Debug)]
+struct ArbStateRootStrategy {
+    pre_stylus: DefaultStateRootStrategy,
+    stylus_and_later: DefaultStateRootStrategy,
+}
+
+impl Default for ArbStateRootStrategy {
+    fn default() -> Self {
+        Self {
+            pre_stylus: DefaultStateRootStrategy::default().with_allow_create_empty_account(true),
+            stylus_and_later: DefaultStateRootStrategy::default(),
         }
     }
-    hazards
+}
+
+impl<P> StateRootStrategy<ArbPrimitives, P, ArbEvmConfig> for ArbStateRootStrategy
+where
+    DefaultStateRootStrategy: StateRootStrategy<ArbPrimitives, P, ArbEvmConfig>,
+{
+    fn prepare(
+        &self,
+        ctx: StateRootJobContext<'_, ArbPrimitives, P, ArbEvmConfig>,
+    ) -> ProviderResult<PreparedStateRootJob<ArbPrimitives>> {
+        if preserves_created_empty_accounts(ctx.parent_header().header()) {
+            self.pre_stylus.prepare(ctx)
+        } else {
+            self.stylus_and_later.prepare(ctx)
+        }
+    }
+
+    fn prepare_payload_builder(
+        &self,
+        ctx: PayloadStateRootJobContext<'_, ArbPrimitives, P>,
+    ) -> ProviderResult<Option<PayloadStateRootHandle>> {
+        if preserves_created_empty_accounts(ctx.parent_header()) {
+            self.pre_stylus.prepare_payload_builder(ctx)
+        } else {
+            self.stylus_and_later.prepare_payload_builder(ctx)
+        }
+    }
 }
 
 /// Ensures every driver exit asks the engine tree to flush and release persistence handles.
@@ -203,21 +243,11 @@ pub(crate) fn produce_with_timing<'a>(
     let mut builder = evm_config
         .builder_for_next_block(&mut state, parent, attrs)
         .map_err(|e| eyre!("builder_for_next_block: {e:?}"))?;
-    let sparse_hazards_seen = Arc::new(AtomicU8::new(0));
     if let Some(task) = state_root_task.as_mut() {
-        let mut sparse_hook = task.take_state_hook();
-        let hazards = Arc::clone(&sparse_hazards_seen);
-        let preserve_created_empty_accounts =
-            !ArbSpecId::from_arbos_version(version as u64).is_enabled_in(ArbSpecId::ARBOS_30);
-        builder.evm_mut().db_mut().set_state_hook(Some(Box::new(
-            move |update: revm::state::EvmState| {
-                let observed = sparse_root_hazards(&update, preserve_created_empty_accounts);
-                if observed != 0 {
-                    hazards.fetch_or(observed, Ordering::Relaxed);
-                }
-                sparse_hook.on_state(update);
-            },
-        )));
+        builder
+            .evm_mut()
+            .db_mut()
+            .set_state_hook(Some(Box::new(task.take_state_hook())));
     }
     builder
         .apply_pre_execution_changes()
@@ -381,66 +411,56 @@ pub(crate) fn produce_with_timing<'a>(
     let phase_started_at = Instant::now();
 
     let finish_state_timings = Arc::new(FinishStateTimings::default());
-    let (state_root_precomputed, state_root_task_wait, state_root_task_succeeded) =
-        if let Some(mut task) = state_root_task {
-            // Dropping the hook signals that the task has received every ArbOS state transition,
-            // including the EIP-2935 prelude and start-block transaction.
-            builder.evm_mut().db_mut().set_state_hook(None);
-            let wait_started_at = Instant::now();
-            let sparse_hazards = sparse_hazards_seen.load(Ordering::Relaxed);
-            if sparse_hazards != 0 {
-                // The pinned sparse converter cannot represent storage wipes and pre-ArbOS 30
-                // created-empty accounts faithfully. Wait for the task to release its proof
-                // workers and preserved-trie cache, discard its result, then let `finish` compute
-                // the authoritative root from the merged bundle state.
-                if let Err(err) = task.state_root() {
-                    tracing::debug!(
-                        target: "arb-reth::engine",
-                        block = parent_header.number + 1,
-                        job = task.name(),
-                        %err,
-                        "incompatible state-root task ended with an error before serial fallback",
-                    );
-                }
-                tracing::debug!(
+    let (
+        state_root_precomputed,
+        state_root_task_hashed_state,
+        state_root_task_wait,
+        state_root_task_succeeded,
+    ) = if let Some(mut task) = state_root_task {
+        // Dropping the hook signals that the task has received every ArbOS state transition,
+        // including the EIP-2935 prelude and start-block transaction.
+        builder.evm_mut().db_mut().set_state_hook(None);
+        let wait_started_at = Instant::now();
+        let task_name = task.name();
+        let result = task.state_root();
+        // Payload building does not consume the task's second hashed-state receiver. Drop the
+        // handle before unwrapping the outcome's Arc.
+        drop(task);
+        match result {
+            Ok(outcome) => (
+                Some((
+                    outcome.state_root,
+                    Arc::unwrap_or_clone(outcome.trie_updates),
+                )),
+                Some(Arc::unwrap_or_clone(outcome.hashed_state)),
+                Some(wait_started_at.elapsed()),
+                true,
+            ),
+            Err(err) => {
+                tracing::warn!(
                     target: "arb-reth::engine",
                     block = parent_header.number + 1,
-                    selfdestruct = sparse_hazards & SPARSE_HAZARD_SELFDESTRUCT != 0,
-                    created_empty = sparse_hazards & SPARSE_HAZARD_CREATED_EMPTY != 0,
-                    "using synchronous state root for sparse-incompatible account lifecycle",
+                    job = task_name,
+                    %err,
+                    "state-root task failed; falling back to synchronous state root",
                 );
-                (None, Some(wait_started_at.elapsed()), false)
-            } else {
-                match task.state_root() {
-                    Ok(outcome) => (
-                        Some((
-                            outcome.state_root,
-                            Arc::unwrap_or_clone(outcome.trie_updates),
-                        )),
-                        Some(wait_started_at.elapsed()),
-                        true,
-                    ),
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "arb-reth::engine",
-                            block = parent_header.number + 1,
-                            job = task.name(),
-                            %err,
-                            "state-root task failed; falling back to synchronous state root",
-                        );
-                        (None, Some(wait_started_at.elapsed()), false)
-                    }
-                }
+                (None, None, Some(wait_started_at.elapsed()), false)
             }
-        } else {
-            (None, None, false)
-        };
-    let outcome = builder
+        }
+    } else {
+        (None, None, None, false)
+    };
+    let mut outcome = builder
         .finish(
             FinishTimingStateProvider::new(trie_state_provider, Arc::clone(&finish_state_timings)),
             state_root_precomputed,
         )
         .wrap_err("BlockBuilder::finish failed")?;
+    // Persist the same policy-aware hashed state that produced the sparse root. The generic
+    // executor finish path does not know about the historical ArbOS created-empty exception.
+    if let Some(hashed_state) = state_root_task_hashed_state {
+        outcome.hashed_state = hashed_state;
+    }
 
     let finish = phase_started_at.elapsed();
     let finish_state_root = finish_state_timings.state_root();
@@ -687,9 +707,8 @@ pub struct ArbEngineTuning {
     pub share_execution_cache_with_payload_builder: bool,
     /// Share reth's sparse trie task with the native payload builder.
     ///
-    /// This overlaps state-root computation with ArbOS execution. It is disabled by default to
-    /// retain reth's conservative payload-builder behavior on hosts that may build payloads in
-    /// parallel.
+    /// This overlaps state-root computation with ArbOS execution. The Arbitrum producer builds one
+    /// payload at a time, so sharing is enabled by default.
     pub share_sparse_trie_with_payload_builder: bool,
 }
 
@@ -711,7 +730,7 @@ impl ArbEngineTuning {
             persistence_backpressure_threshold: 16,
             execution_cache_size: 256 * 1024 * 1024,
             share_execution_cache_with_payload_builder: true,
-            share_sparse_trie_with_payload_builder: false,
+            share_sparse_trie_with_payload_builder: true,
         }
     }
 
@@ -1187,7 +1206,8 @@ where
             Box::new(NoopInvalidBlockHook::default()),
             state_trie_overlays.clone(),
             runtime.clone(),
-        );
+        )
+        .with_state_root_strategy(Arc::new(ArbStateRootStrategy::default()));
 
         let builder = ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id);
         let generator = ArbPayloadJobGenerator::new(provider.clone(), runtime.clone(), builder);
@@ -1865,58 +1885,41 @@ mod termination_tests {
 }
 
 #[cfg(test)]
-mod sparse_compatibility_tests {
-    use alloy_primitives::{Address, U256};
-    use revm::state::{Account as RevmAccount, EvmState};
-
+mod state_root_policy_tests {
     use super::*;
 
-    #[test]
-    fn selfdestruct_always_requires_serial_root() {
-        let mut account = RevmAccount::default();
-        account.mark_touch();
-        account.mark_selfdestruct();
-        let mut state = EvmState::default();
-        state.insert(Address::ZERO, account);
-
-        assert_ne!(
-            sparse_root_hazards(&state, false) & SPARSE_HAZARD_SELFDESTRUCT,
-            0
-        );
-        assert_ne!(
-            sparse_root_hazards(&state, true) & SPARSE_HAZARD_SELFDESTRUCT,
-            0
-        );
+    fn header_with_arbos_version(arbos_format_version: u64) -> Header {
+        let mut header = Header::default();
+        ArbHeaderInfo {
+            arbos_format_version,
+            ..Default::default()
+        }
+        .update_header(&mut header);
+        header
     }
 
     #[test]
-    fn created_empty_requires_serial_root_only_when_preserved() {
-        let mut account = RevmAccount::default();
-        account.mark_touch();
-        account.mark_created();
-        let mut state = EvmState::default();
-        state.insert(Address::ZERO, account);
-
-        assert_eq!(sparse_root_hazards(&state, false), 0);
-        assert_ne!(
-            sparse_root_hazards(&state, true) & SPARSE_HAZARD_CREATED_EMPTY,
-            0
-        );
+    fn preserves_created_empty_accounts_before_stylus() {
+        assert!(preserves_created_empty_accounts(
+            &header_with_arbos_version(29)
+        ));
     }
 
     #[test]
-    fn ordinary_empty_and_created_nonempty_accounts_stay_sparse() {
-        let mut touched_empty = RevmAccount::default();
-        touched_empty.mark_touch();
+    fn prunes_created_empty_accounts_from_stylus() {
+        assert!(!preserves_created_empty_accounts(
+            &header_with_arbos_version(30)
+        ));
+        assert!(!preserves_created_empty_accounts(
+            &header_with_arbos_version(51)
+        ));
+    }
 
-        let mut created_nonempty = RevmAccount::default();
-        created_nonempty.mark_touch();
-        created_nonempty.mark_created();
-        created_nonempty.info.balance = U256::from(1);
-
-        let mut state = EvmState::default();
-        state.insert(Address::ZERO, touched_empty);
-        state.insert(Address::with_last_byte(1), created_nonempty);
-        assert_eq!(sparse_root_hazards(&state, true), 0);
+    #[test]
+    fn does_not_enable_exception_for_non_arbitrum_header() {
+        assert!(!preserves_created_empty_accounts(&Header::default()));
+        assert!(!preserves_created_empty_accounts(
+            &header_with_arbos_version(0)
+        ));
     }
 }
