@@ -19,11 +19,11 @@ use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, Log, StorageKey, StorageValue};
 use arb_reth_evm::ArbEvmConfig;
 use arb_reth_evm::config::ArbNextBlockEnvAttributes;
-use arb_revm::ArbosState;
 use arb_revm::executor::{
     ArbExecCfg, ArbParentHeader, digest_message, is_redeem_scheduled_log,
     scheduled_retries_from_redeem_logs,
 };
+use arb_revm::{ArbSpecId, ArbosState};
 use arbitrum_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -32,19 +32,20 @@ use metrics::{Counter, Histogram};
 use std::{
     sync::{
         OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState, StateTrieOverlayManager};
+use reth_chain_state::{CanonStateSubscriptions, CanonicalInMemoryState};
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineEvent, NoopInvalidBlockHook, TreeConfig,
 };
+use reth_engine_tree::chain::FromOrchestrator;
 use reth_engine_tree::engine::{EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine};
-use reth_engine_tree::persistence::PersistenceHandle;
 use reth_engine_tree::tree::state_root_strategy::PayloadStateRootHandle;
 use reth_engine_tree::tree::{BasicEngineValidator, EngineApiTreeHandler};
+use reth_evm::OnStateHook as _;
 use reth_evm::execute::BlockBuilder as _;
 use reth_evm::{ConfigureEvm as _, Evm as _};
 use reth_execution_cache::CacheStats;
@@ -63,14 +64,15 @@ use reth_prune::{Pruner, PrunerBuilder};
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
-    DBProvider, PruneCheckpointReader, StageCheckpointReader, StateProvider, StorageSettingsCache,
+    DBProvider, PruneCheckpointReader, StageCheckpointReader, StateProvider, StoragePath,
+    StorageSettingsCache,
 };
+use reth_storage_overlay::OverlayManager;
 use reth_tasks::Runtime;
 use reth_trie::{
     AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput, updates::TrieUpdates,
 };
-use reth_trie_db::ChangesetCache;
 use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
@@ -80,6 +82,57 @@ use crate::{ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayload
 type ToTree = crossbeam_channel::Sender<
     FromEngine<EngineApiRequest<ArbPayloadTypes, ArbPrimitives>, ArbBlock>,
 >;
+
+const SPARSE_HAZARD_SELFDESTRUCT: u8 = 1 << 0;
+const SPARSE_HAZARD_CREATED_EMPTY: u8 = 1 << 1;
+
+fn sparse_root_hazards(state: &revm::state::EvmState, preserve_created_empty_accounts: bool) -> u8 {
+    let mut hazards = 0;
+    for account in state.values() {
+        if account.is_selfdestructed() {
+            hazards |= SPARSE_HAZARD_SELFDESTRUCT;
+        }
+        if preserve_created_empty_accounts && account.is_created() && account.is_empty() {
+            hazards |= SPARSE_HAZARD_CREATED_EMPTY;
+        }
+    }
+    hazards
+}
+
+/// Ensures every driver exit asks the engine tree to flush and release persistence handles.
+struct EngineTerminationGuard {
+    to_tree: ToTree,
+    requested: AtomicBool,
+}
+
+impl EngineTerminationGuard {
+    fn new(to_tree: ToTree) -> Self {
+        Self {
+            to_tree,
+            requested: AtomicBool::new(false),
+        }
+    }
+
+    fn request(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        if self.requested.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+
+        let (terminated_tx, terminated_rx) = tokio::sync::oneshot::channel();
+        self.to_tree
+            .send(FromEngine::Event(FromOrchestrator::Terminate {
+                tx: terminated_tx,
+            }))
+            .ok()?;
+        Some(terminated_rx)
+    }
+}
+
+impl Drop for EngineTerminationGuard {
+    fn drop(&mut self) {
+        let _ = self.request();
+    }
+}
 
 /// Produce one block and retain a breakdown of the local block-production work.
 pub(crate) fn produce_with_timing<'a>(
@@ -150,11 +203,21 @@ pub(crate) fn produce_with_timing<'a>(
     let mut builder = evm_config
         .builder_for_next_block(&mut state, parent, attrs)
         .map_err(|e| eyre!("builder_for_next_block: {e:?}"))?;
+    let sparse_hazards_seen = Arc::new(AtomicU8::new(0));
     if let Some(task) = state_root_task.as_mut() {
-        builder
-            .evm_mut()
-            .db_mut()
-            .set_state_hook(Some(Box::new(task.take_state_hook())));
+        let mut sparse_hook = task.take_state_hook();
+        let hazards = Arc::clone(&sparse_hazards_seen);
+        let preserve_created_empty_accounts =
+            !ArbSpecId::from_arbos_version(version as u64).is_enabled_in(ArbSpecId::ARBOS_30);
+        builder.evm_mut().db_mut().set_state_hook(Some(Box::new(
+            move |update: revm::state::EvmState| {
+                let observed = sparse_root_hazards(&update, preserve_created_empty_accounts);
+                if observed != 0 {
+                    hazards.fetch_or(observed, Ordering::Relaxed);
+                }
+                sparse_hook.on_state(update);
+            },
+        )));
     }
     builder
         .apply_pre_execution_changes()
@@ -318,35 +381,59 @@ pub(crate) fn produce_with_timing<'a>(
     let phase_started_at = Instant::now();
 
     let finish_state_timings = Arc::new(FinishStateTimings::default());
-    let (state_root_precomputed, changed_paths, state_root_task_wait, state_root_task_succeeded) =
+    let (state_root_precomputed, state_root_task_wait, state_root_task_succeeded) =
         if let Some(mut task) = state_root_task {
             // Dropping the hook signals that the task has received every ArbOS state transition,
             // including the EIP-2935 prelude and start-block transaction.
             builder.evm_mut().db_mut().set_state_hook(None);
             let wait_started_at = Instant::now();
-            match task.state_root() {
-                Ok(outcome) => (
-                    Some((
-                        outcome.state_root,
-                        Arc::unwrap_or_clone(outcome.trie_updates),
-                    )),
-                    outcome.changed_paths,
-                    Some(wait_started_at.elapsed()),
-                    true,
-                ),
-                Err(err) => {
-                    tracing::warn!(
+            let sparse_hazards = sparse_hazards_seen.load(Ordering::Relaxed);
+            if sparse_hazards != 0 {
+                // The pinned sparse converter cannot represent storage wipes and pre-ArbOS 30
+                // created-empty accounts faithfully. Wait for the task to release its proof
+                // workers and preserved-trie cache, discard its result, then let `finish` compute
+                // the authoritative root from the merged bundle state.
+                if let Err(err) = task.state_root() {
+                    tracing::debug!(
                         target: "arb-reth::engine",
                         block = parent_header.number + 1,
                         job = task.name(),
                         %err,
-                        "state-root task failed; falling back to synchronous state root",
+                        "incompatible state-root task ended with an error before serial fallback",
                     );
-                    (None, None, Some(wait_started_at.elapsed()), false)
+                }
+                tracing::debug!(
+                    target: "arb-reth::engine",
+                    block = parent_header.number + 1,
+                    selfdestruct = sparse_hazards & SPARSE_HAZARD_SELFDESTRUCT != 0,
+                    created_empty = sparse_hazards & SPARSE_HAZARD_CREATED_EMPTY != 0,
+                    "using synchronous state root for sparse-incompatible account lifecycle",
+                );
+                (None, Some(wait_started_at.elapsed()), false)
+            } else {
+                match task.state_root() {
+                    Ok(outcome) => (
+                        Some((
+                            outcome.state_root,
+                            Arc::unwrap_or_clone(outcome.trie_updates),
+                        )),
+                        Some(wait_started_at.elapsed()),
+                        true,
+                    ),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "arb-reth::engine",
+                            block = parent_header.number + 1,
+                            job = task.name(),
+                            %err,
+                            "state-root task failed; falling back to synchronous state root",
+                        );
+                        (None, Some(wait_started_at.elapsed()), false)
+                    }
                 }
             }
         } else {
-            (None, None, None, false)
+            (None, None, false)
         };
     let outcome = builder
         .finish(
@@ -391,7 +478,6 @@ pub(crate) fn produce_with_timing<'a>(
             execution_output,
             hashed_state: Arc::new(outcome.hashed_state),
             trie_updates: Arc::new(outcome.trie_updates),
-            changed_paths,
         },
         ArbBlockProductionTiming {
             total: started_at.elapsed(),
@@ -987,11 +1073,16 @@ where
         + StorageChangeSetReader
         + BlockNumReader
         + StorageSettingsCache
+        + StoragePath
         + DBProvider,
 {
     provider: BlockchainProvider<N>,
     tip: SealedHeader<Header>,
     to_tree: ToTree,
+    // Sends termination on error and panic paths before the persistence proxy is joined.
+    engine_termination_guard: EngineTerminationGuard,
+    // Declared after both tree senders so they drop before this joins the proxy thread.
+    _persistence_proxy_guard: crate::storage_v2::PersistenceProxyGuard,
     /// Reth's local payload-builder service for deterministic ArbOS message payloads.
     payload_builder: PayloadBuilderHandle<ArbPayloadTypes>,
     canonical: CanonicalInMemoryState<ArbPrimitives>,
@@ -1032,6 +1123,7 @@ where
         + StorageChangeSetReader
         + BlockNumReader
         + StorageSettingsCache
+        + StoragePath
         + DBProvider,
 {
     /// Stand up the engine tree over `factory`/`provider` and wire the event-drain task.
@@ -1068,18 +1160,13 @@ where
         };
         let (sync_metrics_tx, _sync_metrics_rx) =
             tokio::sync::mpsc::unbounded_channel::<reth_stages_api::MetricEvent>();
-        let persistence = PersistenceHandle::<ArbPrimitives>::spawn_service::<N>(
-            factory,
-            pruner,
-            sync_metrics_tx,
-        );
+        let (persistence, persistence_proxy_guard) =
+            crate::storage_v2::spawn_persistence(factory, pruner, sync_metrics_tx);
 
         // ---- engine-tree wiring (all reth components) ----
         let consensus: Arc<dyn reth_consensus::FullConsensus<ArbPrimitives>> =
             Arc::new(reth_consensus::noop::NoopConsensus::default());
-        let changeset_cache = ChangesetCache::new();
-        let state_trie_overlays =
-            StateTrieOverlayManager::new(runtime.state_trie_overlay_worker_pool());
+        let state_trie_overlays = OverlayManager::new(runtime.state_trie_overlay_worker_pool());
         let tree_config = tuning.to_tree_config();
         tracing::info!(
             target: "arb-reth::engine",
@@ -1098,7 +1185,6 @@ where
             ArbPayloadValidator,
             tree_config.clone(),
             Box::new(NoopInvalidBlockHook::default()),
-            changeset_cache.clone(),
             state_trie_overlays.clone(),
             runtime.clone(),
         );
@@ -1126,7 +1212,6 @@ where
             tree_config.clone(),
             EngineApiKind::Ethereum,
             evm_config.clone(),
-            changeset_cache.clone(),
             runtime.clone(),
         );
 
@@ -1151,7 +1236,9 @@ where
         Ok(Self {
             provider,
             tip: genesis_tip,
+            engine_termination_guard: EngineTerminationGuard::new(to_tree.clone()),
             to_tree,
+            _persistence_proxy_guard: persistence_proxy_guard,
             payload_builder,
             canonical,
             obs_rx,
@@ -1326,9 +1413,10 @@ where
         let payload_job = payload_job_started_at.elapsed();
         let production_timing = payload.production_timing();
         let execution_cache_stats = payload.execution_cache_stats();
-        let built = payload
+        let mut built = payload
             .executed_block()
             .ok_or_else(|| eyre!("native payload {payload_id:?} omitted execution output"))?;
+        crate::storage_v2::mark_live_hashed_storage_wipes(&mut built);
 
         let new_hash = self.queue_applied_block(
             sequence_number,
@@ -1730,23 +1818,105 @@ where
         self.canonical.clone()
     }
 
-    /// Best-effort wait until all produced blocks are durably persisted before exit.
-    ///
-    /// The tree persists asynchronously; on shutdown we give the persistence service a bounded
-    /// window (~10s) to flush pending blocks up to the current tip so nothing is lost.
+    /// Ask the engine tree to persist its in-memory tail and terminate.
     pub async fn shutdown(&self) {
-        let target = self.tip.number;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Ok(best) = self.provider.best_block_number()
-                && best >= target
-            {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let Some(terminated_rx) = self.engine_termination_guard.request() else {
+            tracing::warn!(
+                target: "arb-reth::engine",
+                "engine termination was already requested or the engine channel is closed",
+            );
+            return;
+        };
+
+        match tokio::time::timeout(Duration::from_secs(10), terminated_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(
+                target: "arb-reth::engine",
+                %err,
+                "engine termination response channel closed",
+            ),
+            Err(_) => tracing::warn!(
+                target: "arb-reth::engine",
+                target_block = self.tip.number,
+                "timed out waiting for engine termination",
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_driver_guard_requests_engine_termination() {
+        let (to_tree, from_driver) = crossbeam_channel::unbounded();
+        drop(EngineTerminationGuard::new(to_tree));
+
+        let message = from_driver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("termination event");
+        let FromEngine::Event(FromOrchestrator::Terminate { tx }) = message else {
+            panic!("unexpected engine message")
+        };
+        // The guard intentionally drops the acknowledgement receiver after requesting shutdown.
+        assert!(tx.send(()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sparse_compatibility_tests {
+    use alloy_primitives::{Address, U256};
+    use revm::state::{Account as RevmAccount, EvmState};
+
+    use super::*;
+
+    #[test]
+    fn selfdestruct_always_requires_serial_root() {
+        let mut account = RevmAccount::default();
+        account.mark_touch();
+        account.mark_selfdestruct();
+        let mut state = EvmState::default();
+        state.insert(Address::ZERO, account);
+
+        assert_ne!(
+            sparse_root_hazards(&state, false) & SPARSE_HAZARD_SELFDESTRUCT,
+            0
+        );
+        assert_ne!(
+            sparse_root_hazards(&state, true) & SPARSE_HAZARD_SELFDESTRUCT,
+            0
+        );
+    }
+
+    #[test]
+    fn created_empty_requires_serial_root_only_when_preserved() {
+        let mut account = RevmAccount::default();
+        account.mark_touch();
+        account.mark_created();
+        let mut state = EvmState::default();
+        state.insert(Address::ZERO, account);
+
+        assert_eq!(sparse_root_hazards(&state, false), 0);
+        assert_ne!(
+            sparse_root_hazards(&state, true) & SPARSE_HAZARD_CREATED_EMPTY,
+            0
+        );
+    }
+
+    #[test]
+    fn ordinary_empty_and_created_nonempty_accounts_stay_sparse() {
+        let mut touched_empty = RevmAccount::default();
+        touched_empty.mark_touch();
+
+        let mut created_nonempty = RevmAccount::default();
+        created_nonempty.mark_touch();
+        created_nonempty.mark_created();
+        created_nonempty.info.balance = U256::from(1);
+
+        let mut state = EvmState::default();
+        state.insert(Address::ZERO, touched_empty);
+        state.insert(Address::with_last_byte(1), created_nonempty);
+        assert_eq!(sparse_root_hazards(&state, true), 0);
     }
 }

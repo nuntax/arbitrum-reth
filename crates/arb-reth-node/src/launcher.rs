@@ -38,8 +38,8 @@ use reth_storage_api::{
     HeaderProvider, MetadataProvider, MetadataWriter, PruneCheckpointReader, StageCheckpointReader,
     StorageSettingsCache,
 };
+use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
-use reth_trie_db::ChangesetCache;
 use tokio::sync::oneshot;
 
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
@@ -236,7 +236,9 @@ impl ArbLauncher {
             config.rpc.disable_auth_server = true;
         }
 
-        let changeset_cache = ChangesetCache::new();
+        let overlay_manager = OverlayManager::<ArbPrimitives>::new(
+            ctx.task_executor.state_trie_overlay_worker_pool(),
+        );
         let disabled_stages = N::disabled_stages();
 
         let ctx = ctx
@@ -245,7 +247,7 @@ impl ArbLauncher {
             .attach(database.clone())
             .with_adjusted_configs()
             .with_provider_factory::<NodeTypesWithDBAdapter<N, DB>, <CB::Components as NodeComponents<T>>::Evm>(
-                changeset_cache.clone(),
+                overlay_manager.clone(),
                 rocksdb_provider,
                 disabled_stages,
             )
@@ -450,7 +452,10 @@ impl ArbLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use alloy_primitives::{U256, address};
+    use arb_revm::arbos_init::ArbosInitConfig;
     use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
     use reth_chainspec::MAINNET;
     use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
@@ -478,6 +483,21 @@ mod tests {
 
         let task_executor = Runtime::test();
 
+        let chain_id = 412346u64;
+        let init = ArbosInitConfig {
+            initial_arbos_version: 40,
+            initial_chain_owner: address!("5E1497dD1f08C87b2d8FE23e9AAB6c1De833D927"),
+            chain_id: U256::from(chain_id),
+            genesis_block_number: 0,
+            initial_l1_base_fee: U256::from(167u64),
+            serialized_chain_config: include_bytes!(
+                "../tests/fixtures/testnode_l2_chain_config.json"
+            )
+            .to_vec(),
+            debug_precompiles: true,
+        };
+        let chain_spec = Arc::new(crate::arb_chain_spec(&init).expect("build ArbOS chain spec"));
+
         // The driver dedups by sequence number, so messages must be sequential (a fresh genesis
         // DB has genesis_block 0, so the first digested message is index 1). Four messages with a
         // persistence threshold of two guarantee a second save after sender pruning has run.
@@ -493,7 +513,7 @@ mod tests {
             full: true,
             ..Default::default()
         }
-        .prune_config(MAINNET.as_ref())
+        .prune_config(chain_spec.as_ref())
         .expect("--full must resolve to a prune config");
         prune_config.block_interval = 1;
         prune_config.minimum_pruning_distance = 0;
@@ -507,18 +527,19 @@ mod tests {
                 datadir.clone(),
             );
         let config = NodeConfig::test()
-            .with_chain(MAINNET.clone())
+            .with_chain(chain_spec.clone())
             .with_datadir_args(reth_node_core::args::DatadirArgs {
                 datadir: maybe_path.clone(),
                 ..Default::default()
             });
-        let data_dir = maybe_path.unwrap_or_chain_default(MAINNET.chain(), config.datadir.clone());
+        let data_dir =
+            maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
 
         let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
         let launcher = ArbLauncher {
             ctx: LaunchContext::new(task_executor.clone(), data_dir),
-            chain_id: crate::ARB_ONE_CHAIN_ID,
+            chain_id,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: Some(prune_config),

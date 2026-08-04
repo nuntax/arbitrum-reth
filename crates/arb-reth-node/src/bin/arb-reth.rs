@@ -19,7 +19,10 @@ use arb_reth_node::commands::{
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
     node::NodeArgs,
     rewind::RewindArgs,
-    snapshot::{SnapshotImportArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs},
+    snapshot::{
+        SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs,
+        SnapshotRepairHistoryArgs,
+    },
 };
 use clap::{Args, Parser, Subcommand};
 use reth_cli_runner::CliRunner;
@@ -65,6 +68,8 @@ struct SnapshotCmd {
 
 #[derive(Debug, Subcommand)]
 enum SnapshotSub {
+    /// Build Reth's slot-preimage sidecar from a Nitro Classic export.
+    BuildPreimages(SnapshotBuildPreimagesArgs),
     /// Import a Nitro genesis state stream into reth MDBX and verify the state root.
     Import(SnapshotImportArgs),
     /// Read hashed-state from a converted Arbitrum reth MDBX snapshot.
@@ -105,6 +110,7 @@ fn main() -> eyre::Result<()> {
             runner.run_command_until_exit(|ctx| commands::node::run(ctx, args))
         }
         Command::Snapshot(cmd) => match cmd.command {
+            SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
             SnapshotSub::Import(args) => commands::snapshot::import(args),
             SnapshotSub::Read(args) => commands::snapshot::read(args),
             SnapshotSub::RepairHistory(args) => commands::snapshot::repair_history(args),
