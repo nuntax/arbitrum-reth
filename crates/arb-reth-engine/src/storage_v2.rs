@@ -28,6 +28,8 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_engine_tree::persistence::{PersistenceAction, PersistenceHandle};
+use reth_execution_types::BlockExecutionOutput;
+use reth_payload_primitives::BuiltPayloadExecutedBlock;
 use reth_provider::{
     DatabaseProviderFactory, ProviderFactory, SaveBlocksInput, providers::ProviderNodeTypes,
 };
@@ -40,7 +42,9 @@ use reth_storage_api::{
     StorageSettingsCache,
 };
 use reth_tasks::spawn_os_thread;
-use reth_trie::{ComputedTrieData, HashedPostStateSorted, HashedStorageSorted, LazyTrieData};
+use reth_trie::{
+    ComputedTrieData, HashedPostStateSorted, HashedStorage, HashedStorageSorted, LazyTrieData,
+};
 
 /// Joins the persistence proxy after the engine-tree request sender has been dropped.
 pub(crate) struct PersistenceProxyGuard(Option<JoinHandle<()>>);
@@ -472,22 +476,45 @@ fn collect_wipe_addresses(
 }
 
 fn block_has_storage_wipe(block: &ExecutedBlock<ArbPrimitives>) -> bool {
-    block
-        .execution_outcome()
-        .state
-        .reverts
-        .iter()
-        .any(|transition| transition.iter().any(|(_, revert)| revert.wipe_storage))
+    wiped_storage_addresses(block.execution_outcome()).next().is_some()
 }
 
-fn mark_hashed_storage_wipes(block: &mut ExecutedBlock<ArbPrimitives>) {
-    let wiped_addresses = block
-        .execution_outcome()
+fn wiped_storage_addresses<R>(
+    output: &BlockExecutionOutput<R>,
+) -> impl Iterator<Item = Address> + '_ {
+    output
         .state
         .reverts
         .iter()
         .flat_map(|transition| transition.iter())
         .filter_map(|(address, revert)| revert.wipe_storage.then_some(*address))
+}
+
+/// Preserve full storage wipes in the hashed state handed to the engine tree.
+///
+/// Reth's Ethereum-oriented sparse state converter omits storage for destroyed accounts. ArbOS
+/// can delete an existing account, so the live overlay needs an explicit wipe marker until the
+/// block reaches durable storage. The execution revert is the source of truth: it is only set when
+/// this transition actually wipes the account's complete storage.
+pub(crate) fn mark_live_hashed_storage_wipes(block: &mut BuiltPayloadExecutedBlock<ArbPrimitives>) {
+    let wiped_addresses = wiped_storage_addresses(&block.execution_output)
+        .collect::<HashSet<_>>();
+    if wiped_addresses.is_empty() {
+        return;
+    }
+
+    let hashed_state = Arc::make_mut(&mut block.hashed_state);
+    for address in wiped_addresses {
+        hashed_state
+            .storages
+            .entry(keccak256(address))
+            .and_modify(|storage| storage.wiped = true)
+            .or_insert_with(|| HashedStorage::new(true));
+    }
+}
+
+fn mark_hashed_storage_wipes(block: &mut ExecutedBlock<ArbPrimitives>) {
+    let wiped_addresses = wiped_storage_addresses(block.execution_outcome())
         .collect::<HashSet<_>>();
     if wiped_addresses.is_empty() {
         return;
@@ -844,6 +871,39 @@ mod tests {
             .expect("wipe marker must exist even without changed slots");
         assert!(storage.wiped);
         assert!(storage.storage_slots.is_empty());
+    }
+
+    #[test]
+    fn live_storage_wipe_marks_payload_hashed_state_before_engine_handoff() {
+        let address = address!("0000000000000000000000000000000000001234");
+        let mut revert = AccountRevert::default();
+        revert.wipe_storage = true;
+        let mut state = BundleState::default();
+        state.reverts = Reverts::new(vec![vec![(address, revert)]]);
+        let hashed_state = HashedPostState::default();
+        let trie_updates = TrieUpdates::default();
+        let block = executed_block(
+            arb_header(1, B256::ZERO, B256::ZERO),
+            state,
+            hashed_state.clone(),
+            trie_updates.clone(),
+        );
+        let mut built = BuiltPayloadExecutedBlock {
+            recovered_block: block.recovered_block,
+            execution_output: block.execution_output,
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
+        };
+
+        mark_live_hashed_storage_wipes(&mut built);
+
+        let storage = built
+            .hashed_state
+            .storages
+            .get(&keccak256(address))
+            .expect("live wipe marker must exist even when the sparse converter omitted storage");
+        assert!(storage.wiped);
+        assert!(storage.storage.is_empty());
     }
 
     #[test]

@@ -1413,9 +1413,10 @@ where
         let payload_job = payload_job_started_at.elapsed();
         let production_timing = payload.production_timing();
         let execution_cache_stats = payload.execution_cache_stats();
-        let built = payload
+        let mut built = payload
             .executed_block()
             .ok_or_else(|| eyre!("native payload {payload_id:?} omitted execution output"))?;
+        crate::storage_v2::mark_live_hashed_storage_wipes(&mut built);
 
         let new_hash = self.queue_applied_block(
             sequence_number,
