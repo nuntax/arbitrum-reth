@@ -133,7 +133,7 @@ func walkRange(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, root c
 
 func main() {
 	ancient := flag.String("ancient", "", "ancients/freezer directory (default <dir>/ancient)")
-	mode := flag.String("mode", "diag", "diag|state|blocks|history|accounts|addr")
+	mode := flag.String("mode", "diag", "diag|state|blocks|history|full-snapshot|diskroot|accounts|addr")
 	max := flag.Uint64("max", 0, "max accounts to dump (0 = all)")
 	addr := flag.String("addr", "", "for --mode addr: a 0x address to dump (storage key form check)")
 	from := flag.Int64("from", -1, "for --mode blocks: first block; for --mode history: first state id (default = earliest)")
@@ -336,6 +336,19 @@ func main() {
 			nBlk++
 		}
 		fmt.Fprintf(os.Stderr, "exported %d blocks [%d..%d]\n", nBlk, lo, hi)
+	case "full-snapshot":
+		fullSnapshot(db, anc, sdb, tdb)
+	case "diskroot":
+		// The path-scheme disk layer: the persisted trie, before any journalled diff layers.
+		// pathdb derives it the same way in loadLayers(). Its root is the post root of the most
+		// recent state history object, which is what makes it the point where state and history
+		// agree.
+		node := rawdb.ReadAccountTrieNode(db, nil)
+		if len(node) == 0 {
+			fatal("read disk-layer root node", fmt.Errorf("no account trie node at the empty path"))
+		}
+		fmt.Printf("diskRoot=%s persistentStateID=%d\n",
+			crypto.Keccak256Hash(node).Hex(), rawdb.ReadPersistentStateID(db))
 	case "history":
 		exportHistory(anc, uint64Flag(*from), uint64Flag(*to))
 	case "addr":
@@ -360,8 +373,8 @@ func main() {
 // Encoded sizes of the fixed-width records inside a state history object.
 // Mirrors triedb/pathdb/history_state.go, which keeps these unexported.
 const (
-	histMetaSize     = 73 // version(1) parentRoot(32) postRoot(32) block(8)
-	histAccIndexSize = 33 // address(20) len(1) offset(4) storageOffset(4) storageSlots(4)
+	histMetaSize      = 73 // version(1) parentRoot(32) postRoot(32) block(8)
+	histAccIndexSize  = 33 // address(20) len(1) offset(4) storageOffset(4) storageSlots(4)
 	histSlotIndexSize = 37 // slotKey(32) len(1) offset(4)
 
 	histVersionHashedSlots = 0 // storage slot keys are hashed
@@ -572,5 +585,286 @@ func writeUvarint(w *bufio.Writer, v uint64) {
 // (balance, code hash, slot value) is bounded at 32.
 func writeShortBytes(w *bufio.Writer, b []byte) {
 	w.WriteByte(byte(len(b)))
+	w.Write(b)
+}
+
+// ---------------------------------------------------------------------------
+// --mode full-snapshot: one stream holding state, blocks and history up to P
+// ---------------------------------------------------------------------------
+
+// Stream framing. Sections appear in this order and each is self-terminating.
+const (
+	snapStreamMagic = "ARBSNAP1"
+
+	snapSectionManifest = 0x01
+	snapSectionBlocks   = 0x02
+	snapSectionHistory  = 0x03
+	snapSectionState    = 0x04
+	snapSectionEnd      = 0xff
+
+	snapRecEnd     = 0x00
+	snapRecHeader  = 0x01 // block header
+	snapRecBody    = 0x02 // block body
+	snapRecReceipt = 0x03 // block receipts
+	snapRecAccount = 0x04 // account, at the exported state root
+	snapRecStorage = 0x05 // storage slot, belongs to the preceding account
+	snapRecCode    = 0x06 // contract code, keyed by hash
+)
+
+// convertPoint is where state, blocks and history all agree: the block of the persisted state trie.
+//
+// State above it lives only in the pathdb journal (the disk layer's unflushed write buffer, and diff
+// layers on top), so it is not in the trie on disk. Converting up to this point and letting the node
+// re-derive the rest avoids needing any of that, and avoids a range whose state we would have to
+// reconstruct in order to generate its own changesets.
+type convertPoint struct {
+	block   uint64      // P
+	root    common.Hash // R_P
+	stateID uint64      // persistent state id, which is P's history object
+}
+
+// resolveConvertPoint reads P two independent ways and requires them to agree (ADR-004 P3).
+//
+// The root comes from hashing the persisted root account trie node. The block comes from the history
+// object at the persistent state id. If a snapshot were captured mid-write these would disagree, and
+// the resulting conversion would silently pair one block's state with another block's history.
+func resolveConvertPoint(db ethdb.Database, ancientDir string) convertPoint {
+	node := rawdb.ReadAccountTrieNode(db, nil)
+	if len(node) == 0 {
+		fatal("read persisted state root", fmt.Errorf("no account trie node at the empty path; is this a path-scheme database?"))
+	}
+	root := crypto.Keccak256Hash(node)
+	id := rawdb.ReadPersistentStateID(db)
+	if id == 0 {
+		fatal("read persistent state id", fmt.Errorf("no persistent state id; nothing has been flattened to disk"))
+	}
+
+	store, err := rawdb.NewStateFreezer(ancientDir, false, true)
+	if err != nil {
+		fatal("open state freezer", err)
+	}
+	defer store.Close()
+
+	meta, _, _, _, _, err := rawdb.ReadStateHistory(store, id)
+	if err != nil {
+		fatal(fmt.Sprintf("read state history %d", id), err)
+	}
+	if len(meta) != histMetaSize {
+		fatal("decode state history meta", fmt.Errorf("meta is %d bytes, want %d", len(meta), histMetaSize))
+	}
+	postRoot := common.BytesToHash(meta[33:65])
+	if postRoot != root {
+		fatal("resolve convert point", fmt.Errorf(
+			"persisted trie root %s does not match the post root %s of history %d; snapshot looks torn",
+			root.Hex(), postRoot.Hex(), id))
+	}
+	return convertPoint{
+		block:   binary.BigEndian.Uint64(meta[65:histMetaSize]),
+		root:    root,
+		stateID: id,
+	}
+}
+
+// fullSnapshot writes one stream that an importer can turn into a complete reth datadir.
+//
+// Sections are ordered so the importer can write append-only: blocks ascending, then history
+// ascending, then the state bulk load. Everything stops at P, so the three agree.
+func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database) {
+	point := resolveConvertPoint(db, ancientDir)
+	fmt.Fprintf(os.Stderr, "convert point: block=%d root=%s stateID=%d\n",
+		point.block, point.root.Hex(), point.stateID)
+
+	w := bufio.NewWriterSize(os.Stdout, 1<<22)
+	defer w.Flush()
+	w.WriteString(snapStreamMagic)
+
+	writeManifestSection(w, db, point)
+	writeBlocksSection(w, db, point)
+	writeHistorySection(w, ancientDir, point)
+	writeStateSection(w, sdb, tdb, db, point)
+	w.WriteByte(snapSectionEnd)
+}
+
+func writeManifestSection(w *bufio.Writer, db ethdb.Database, point convertPoint) {
+	w.WriteByte(snapSectionManifest)
+	writeUvarint(w, point.block)
+	w.Write(point.root.Bytes())
+	writeUvarint(w, point.stateID)
+	hash := rawdb.ReadCanonicalHash(db, point.block)
+	if hash == (common.Hash{}) {
+		fatal("read convert-point hash", fmt.Errorf("no canonical hash at block %d", point.block))
+	}
+	w.Write(hash.Bytes())
+}
+
+// writeBlocksSection streams headers, bodies and receipts for [0, P] as raw RLP.
+//
+// The importer recomputes transactionsRoot and receiptsRoot from these and compares them against the
+// header, so a truncated or misaligned body is caught per block rather than at the end (ADR-004 B2).
+func writeBlocksSection(w *bufio.Writer, db ethdb.Database, point convertPoint) {
+	w.WriteByte(snapSectionBlocks)
+	var blocks, bodies, receipts uint64
+	started := time.Now()
+	for n := uint64(0); n <= point.block; n++ {
+		hash := rawdb.ReadCanonicalHash(db, n)
+		if hash == (common.Hash{}) {
+			fatal("read canonical hash", fmt.Errorf("gap at block %d", n))
+		}
+		header := rawdb.ReadHeaderRLP(db, hash, n)
+		if len(header) == 0 {
+			fatal("read header", fmt.Errorf("missing header at block %d", n))
+		}
+		w.WriteByte(snapRecHeader)
+		writeUvarint(w, n)
+		w.Write(hash.Bytes())
+		writeBlob(w, header)
+		blocks++
+
+		if body := rawdb.ReadBodyRLP(db, hash, n); len(body) > 0 {
+			w.WriteByte(snapRecBody)
+			writeUvarint(w, n)
+			writeBlob(w, body)
+			bodies++
+		}
+		if r := rawdb.ReadReceiptsRLP(db, hash, n); len(r) > 0 {
+			w.WriteByte(snapRecReceipt)
+			writeUvarint(w, n)
+			writeBlob(w, r)
+			receipts++
+		}
+		if n%1000000 == 0 {
+			fmt.Fprintf(os.Stderr, "blocks %d/%d (%s)\n", n, point.block, time.Since(started).Truncate(time.Second))
+		}
+	}
+	w.WriteByte(snapRecEnd)
+	fmt.Fprintf(os.Stderr, "blocks section: %d headers, %d bodies, %d receipt sets in %s\n",
+		blocks, bodies, receipts, time.Since(started).Truncate(time.Second))
+}
+
+// writeHistorySection streams every state history object up to and including P's.
+func writeHistorySection(w *bufio.Writer, ancientDir string, point convertPoint) {
+	w.WriteByte(snapSectionHistory)
+	store, err := rawdb.NewStateFreezer(ancientDir, false, true)
+	if err != nil {
+		fatal("open state freezer", err)
+	}
+	defer store.Close()
+
+	var accounts, slots uint64
+	started := time.Now()
+	// State history ids are 1-based. Ids below the freezer tail have been pruned away; the importer
+	// records whatever range it receives rather than assuming full coverage.
+	for id := uint64(1); id <= point.stateID; id++ {
+		meta, accIndex, slotIndex, accData, slotData, err := rawdb.ReadStateHistory(store, id)
+		if err != nil {
+			fatal(fmt.Sprintf("read state history %d", id), err)
+		}
+		na, ns, err := writeHistoryObject(w, id, meta, accIndex, slotIndex, accData, slotData)
+		if err != nil {
+			fatal(fmt.Sprintf("encode state history %d", id), err)
+		}
+		accounts += na
+		slots += ns
+		if id%1000000 == 0 {
+			fmt.Fprintf(os.Stderr, "history %d/%d (%s)\n", id, point.stateID, time.Since(started).Truncate(time.Second))
+		}
+	}
+	w.WriteByte(snapRecEnd)
+	fmt.Fprintf(os.Stderr, "history section: %d objects, %d accounts, %d slots in %s\n",
+		point.stateID, accounts, slots, time.Since(started).Truncate(time.Second))
+}
+
+// writeStateSection walks the account and storage tries at R_P.
+//
+// This is the same walk --mode state performs, at the persisted root rather than the head root, and
+// emitting binary rather than hex. Storage tries are opened by hashed owner, since a pruned snapshot
+// carries no address preimages.
+func writeStateSection(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, db ethdb.Database, point convertPoint) {
+	w.WriteByte(snapSectionState)
+	accTrie, err := sdb.OpenTrie(point.root)
+	if err != nil {
+		fatal("open account trie at the persisted root", err)
+	}
+	nodeIt, err := accTrie.NodeIterator(nil)
+	if err != nil {
+		fatal("account node iterator", err)
+	}
+	accIt := trie.NewIterator(nodeIt)
+
+	seenCode := make(map[common.Hash]struct{})
+	var accounts, slots, codes uint64
+	started := time.Now()
+	for accIt.Next() {
+		var acc types.StateAccount
+		if err := rlp.DecodeBytes(accIt.Value, &acc); err != nil {
+			fatal("decode account", err)
+		}
+		owner := common.BytesToHash(accIt.Key)
+		w.WriteByte(snapRecAccount)
+		w.Write(owner.Bytes()) // hashed address; the source has no preimage for it
+		writeUvarint(w, acc.Nonce)
+		writeShortBytes(w, acc.Balance.Bytes())
+		if bytes.Equal(acc.CodeHash, types.EmptyCodeHash[:]) {
+			w.WriteByte(0)
+		} else {
+			writeShortBytes(w, acc.CodeHash)
+		}
+		accounts++
+
+		codeHash := common.BytesToHash(acc.CodeHash)
+		if !bytes.Equal(acc.CodeHash, types.EmptyCodeHash[:]) {
+			if _, ok := seenCode[codeHash]; !ok {
+				seenCode[codeHash] = struct{}{}
+				code := rawdb.ReadCode(db, codeHash)
+				if len(code) == 0 {
+					fatal("read contract code", fmt.Errorf("no code for hash %s", codeHash.Hex()))
+				}
+				w.WriteByte(snapRecCode)
+				w.Write(codeHash.Bytes())
+				writeBlob(w, code)
+				codes++
+			}
+		}
+
+		if acc.Root == types.EmptyRootHash {
+			continue
+		}
+		stTrie, err := trie.NewStateTrie(trie.StorageTrieID(point.root, owner, acc.Root), tdb)
+		if err != nil {
+			fatal("open storage trie", err)
+		}
+		stNodeIt, err := stTrie.NodeIterator(nil)
+		if err != nil {
+			fatal("storage node iterator", err)
+		}
+		stIt := trie.NewIterator(stNodeIt)
+		for stIt.Next() {
+			var val []byte
+			if err := rlp.DecodeBytes(stIt.Value, &val); err != nil {
+				fatal("decode storage value", err)
+			}
+			w.WriteByte(snapRecStorage)
+			w.Write(common.BytesToHash(stIt.Key).Bytes()) // hashed slot key
+			writeShortBytes(w, val)
+			slots++
+		}
+		if err := stIt.Err; err != nil {
+			fatal("storage iterator", err)
+		}
+		if accounts%1000000 == 0 {
+			fmt.Fprintf(os.Stderr, "state %d accounts, %d slots (%s)\n", accounts, slots, time.Since(started).Truncate(time.Second))
+		}
+	}
+	if err := accIt.Err; err != nil {
+		fatal("account iterator", err)
+	}
+	w.WriteByte(snapRecEnd)
+	fmt.Fprintf(os.Stderr, "state section: %d accounts, %d slots, %d code blobs in %s\n",
+		accounts, slots, codes, time.Since(started).Truncate(time.Second))
+}
+
+// writeBlob writes a varint-prefixed byte slice, for payloads that exceed 255 bytes.
+func writeBlob(w *bufio.Writer, b []byte) {
+	writeUvarint(w, uint64(len(b)))
 	w.Write(b)
 }
