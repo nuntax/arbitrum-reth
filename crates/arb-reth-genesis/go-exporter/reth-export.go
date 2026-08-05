@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"sync"
@@ -147,7 +148,7 @@ func main() {
 	// headroom. `--parallel N` splits the account-key space into N disjoint ranges walked
 	// concurrently, each writing `<outbase>.partNNN`; concatenating the parts in index order yields
 	// the same stream a serial walk would. `--outbase` is required when N > 1.
-	parallel := flag.Int("parallel", 1, "for --mode state: number of concurrent key-range walkers")
+	parallel := flag.Int("parallel", 1, "for --mode state and --mode full-snapshot: number of concurrent key-range walkers")
 	outbase := flag.String("outbase", "", "for --mode state --parallel N: output path prefix for part files")
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -337,7 +338,7 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "exported %d blocks [%d..%d]\n", nBlk, lo, hi)
 	case "full-snapshot":
-		fullSnapshot(db, anc, sdb, tdb)
+		fullSnapshot(db, anc, sdb, tdb, *parallel, dir)
 	case "diskroot":
 		// The path-scheme disk layer: the persisted trie, before any journalled diff layers.
 		// pathdb derives it the same way in loadLayers(). Its root is the post root of the most
@@ -665,7 +666,7 @@ func resolveConvertPoint(db ethdb.Database, ancientDir string, sdb state.Databas
 //
 // Sections are ordered so the importer can write append-only: blocks ascending, then history
 // ascending, then the state bulk load. Everything stops at P, so the three agree.
-func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database) {
+func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database, parallel int, tmpDir string) {
 	point := resolveConvertPoint(db, ancientDir, sdb)
 	fmt.Fprintf(os.Stderr, "convert point: block=%d root=%s stateID=%d\n",
 		point.block, point.root.Hex(), point.stateID)
@@ -677,7 +678,7 @@ func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb 
 	writeManifestSection(w, db, point)
 	writeBlocksSection(w, db, point)
 	writeHistorySection(w, ancientDir, point)
-	writeStateSection(w, sdb, tdb, db, point)
+	writeStateSection(w, sdb, tdb, db, point, parallel, tmpDir)
 	w.WriteByte(snapSectionEnd)
 }
 
@@ -755,91 +756,174 @@ func writeHistorySection(w *bufio.Writer, ancientDir string, point convertPoint)
 
 // writeStateSection walks the account and storage tries at R_P.
 //
-// This is the same walk --mode state performs, at the persisted root rather than the head root, and
-// emitting binary rather than hex. Storage tries are opened by hashed owner, since a pruned snapshot
-// carries no address preimages.
-func writeStateSection(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, db ethdb.Database, point convertPoint) {
+// The serial walk is random-read bound at iodepth 1 and measured at a few MB per minute on a real
+// snapshot, which is unusable. `--parallel N` splits the account key space into N disjoint ranges
+// walked concurrently, each into a temporary file, then appends them in index order. Records land in
+// key order either way, so the result is byte-identical to a serial walk.
+func writeStateSection(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, db ethdb.Database, point convertPoint, parallel int, tmpDir string) {
 	w.WriteByte(snapSectionState)
-	accTrie, err := sdb.OpenTrie(point.root)
-	if err != nil {
-		fatal("open account trie at the persisted root", err)
+	var accounts, slots, codes uint64
+	started := time.Now()
+	// Code is shared across partitions: proxies mean one bytecode backs many accounts. Deduplicating
+	// globally keeps a partitioned run from emitting the same blob once per partition.
+	var seenCode sync.Map
+
+	if parallel <= 1 {
+		if err := walkStateRange(w, sdb, tdb, db, point.root, nil, nil, &seenCode, &accounts, &slots, &codes); err != nil {
+			fatal("walk state", err)
+		}
+	} else {
+		parts := make([]string, parallel)
+		errs := make([]error, parallel)
+		var wg sync.WaitGroup
+		for i := 0; i < parallel; i++ {
+			parts[i] = fmt.Sprintf("%s/state-part-%03d.bin", tmpDir, i)
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				f, err := os.Create(parts[i])
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				defer f.Close()
+				pw := bufio.NewWriterSize(f, 1<<22)
+				var lo, hi []byte
+				if i > 0 {
+					lo = partitionBoundary(i, parallel)
+				}
+				if i < parallel-1 {
+					hi = partitionBoundary(i+1, parallel)
+				}
+				if err := walkStateRange(pw, sdb, tdb, db, point.root, lo, hi, &seenCode, &accounts, &slots, &codes); err != nil {
+					errs[i] = err
+					return
+				}
+				errs[i] = pw.Flush()
+			}(i)
+		}
+
+		done := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					fmt.Fprintf(os.Stderr, "state %d accounts, %d slots, %d code (%s)\n",
+						atomic.LoadUint64(&accounts), atomic.LoadUint64(&slots),
+						atomic.LoadUint64(&codes), time.Since(started).Truncate(time.Second))
+				}
+			}
+		}()
+		wg.Wait()
+		close(done)
+		for i, err := range errs {
+			if err != nil {
+				fatal(fmt.Sprintf("state partition %d", i), err)
+			}
+		}
+
+		// Append in index order. Partition boundaries are ascending key ranges, so this is the same
+		// sequence a serial walk would have produced.
+		for i, name := range parts {
+			f, err := os.Open(name)
+			if err != nil {
+				fatal(fmt.Sprintf("open state part %d", i), err)
+			}
+			if _, err := io.Copy(w, bufio.NewReaderSize(f, 1<<22)); err != nil {
+				fatal(fmt.Sprintf("append state part %d", i), err)
+			}
+			f.Close()
+			os.Remove(name)
+		}
 	}
-	nodeIt, err := accTrie.NodeIterator(nil)
+
+	w.WriteByte(snapRecEnd)
+	fmt.Fprintf(os.Stderr, "state section: %d accounts, %d slots, %d code blobs in %s\n",
+		accounts, slots, codes, time.Since(started).Truncate(time.Second))
+}
+
+// walkStateRange emits accounts in [lo, hi) with their storage and code.
+//
+// Storage tries open by hashed owner: a pruned snapshot carries no address preimages, so the owner
+// must come from the account iterator's key rather than from hashing an address.
+func walkStateRange(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, db ethdb.Database,
+	root common.Hash, lo, hi []byte, seenCode *sync.Map, accounts, slots, codes *uint64) error {
+	accTrie, err := sdb.OpenTrie(root)
 	if err != nil {
-		fatal("account node iterator", err)
+		return fmt.Errorf("open account trie: %w", err)
+	}
+	nodeIt, err := accTrie.NodeIterator(lo)
+	if err != nil {
+		return fmt.Errorf("account node iterator: %w", err)
 	}
 	accIt := trie.NewIterator(nodeIt)
 
-	seenCode := make(map[common.Hash]struct{})
-	var accounts, slots, codes uint64
-	started := time.Now()
 	for accIt.Next() {
+		if hi != nil && bytes.Compare(accIt.Key, hi) >= 0 {
+			break
+		}
 		var acc types.StateAccount
 		if err := rlp.DecodeBytes(accIt.Value, &acc); err != nil {
-			fatal("decode account", err)
+			return fmt.Errorf("decode account %x: %w", accIt.Key, err)
 		}
 		owner := common.BytesToHash(accIt.Key)
 		w.WriteByte(snapRecAccount)
-		w.Write(owner.Bytes()) // hashed address; the source has no preimage for it
+		w.Write(owner.Bytes())
 		writeUvarint(w, acc.Nonce)
 		writeShortBytes(w, acc.Balance.Bytes())
-		if bytes.Equal(acc.CodeHash, types.EmptyCodeHash[:]) {
-			w.WriteByte(0)
-		} else {
+		hasCode := !bytes.Equal(acc.CodeHash, types.EmptyCodeHash[:])
+		if hasCode {
 			writeShortBytes(w, acc.CodeHash)
+		} else {
+			w.WriteByte(0)
 		}
-		accounts++
+		atomic.AddUint64(accounts, 1)
 
-		codeHash := common.BytesToHash(acc.CodeHash)
-		if !bytes.Equal(acc.CodeHash, types.EmptyCodeHash[:]) {
-			if _, ok := seenCode[codeHash]; !ok {
-				seenCode[codeHash] = struct{}{}
+		if hasCode {
+			codeHash := common.BytesToHash(acc.CodeHash)
+			if _, loaded := seenCode.LoadOrStore(codeHash, struct{}{}); !loaded {
 				code := rawdb.ReadCode(db, codeHash)
 				if len(code) == 0 {
-					fatal("read contract code", fmt.Errorf("no code for hash %s", codeHash.Hex()))
+					return fmt.Errorf("no code for hash %s", codeHash.Hex())
 				}
 				w.WriteByte(snapRecCode)
 				w.Write(codeHash.Bytes())
 				writeBlob(w, code)
-				codes++
+				atomic.AddUint64(codes, 1)
 			}
 		}
 
 		if acc.Root == types.EmptyRootHash {
 			continue
 		}
-		stTrie, err := trie.NewStateTrie(trie.StorageTrieID(point.root, owner, acc.Root), tdb)
+		stTrie, err := trie.NewStateTrie(trie.StorageTrieID(root, owner, acc.Root), tdb)
 		if err != nil {
-			fatal("open storage trie", err)
+			return fmt.Errorf("open storage trie for %x: %w", owner, err)
 		}
 		stNodeIt, err := stTrie.NodeIterator(nil)
 		if err != nil {
-			fatal("storage node iterator", err)
+			return fmt.Errorf("storage node iterator for %x: %w", owner, err)
 		}
 		stIt := trie.NewIterator(stNodeIt)
 		for stIt.Next() {
 			var val []byte
 			if err := rlp.DecodeBytes(stIt.Value, &val); err != nil {
-				fatal("decode storage value", err)
+				return fmt.Errorf("decode storage value for %x: %w", owner, err)
 			}
 			w.WriteByte(snapRecStorage)
-			w.Write(common.BytesToHash(stIt.Key).Bytes()) // hashed slot key
+			w.Write(common.BytesToHash(stIt.Key).Bytes())
 			writeShortBytes(w, val)
-			slots++
+			atomic.AddUint64(slots, 1)
 		}
 		if err := stIt.Err; err != nil {
-			fatal("storage iterator", err)
-		}
-		if accounts%1000000 == 0 {
-			fmt.Fprintf(os.Stderr, "state %d accounts, %d slots (%s)\n", accounts, slots, time.Since(started).Truncate(time.Second))
+			return fmt.Errorf("storage iterator for %x: %w", owner, err)
 		}
 	}
-	if err := accIt.Err; err != nil {
-		fatal("account iterator", err)
-	}
-	w.WriteByte(snapRecEnd)
-	fmt.Fprintf(os.Stderr, "state section: %d accounts, %d slots, %d code blobs in %s\n",
-		accounts, slots, codes, time.Since(started).Truncate(time.Second))
+	return accIt.Err
 }
 
 // writeBlob writes a varint-prefixed byte slice, for payloads that exceed 255 bytes.
