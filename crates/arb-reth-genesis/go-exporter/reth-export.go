@@ -596,10 +596,13 @@ func writeShortBytes(w *bufio.Writer, b []byte) {
 const (
 	snapStreamMagic = "ARBSNAP1"
 
-	snapSectionManifest = 0x01
-	snapSectionBlocks   = 0x02
-	snapSectionHistory  = 0x03
-	snapSectionState    = 0x04
+	// Section tags live above the record tags on purpose. They shared a range in the first draft,
+	// which made a receipts record inside the blocks section indistinguishable from the start of
+	// the history section.
+	snapSectionManifest = 0xf1
+	snapSectionBlocks   = 0xf2
+	snapSectionHistory  = 0xf3
+	snapSectionState    = 0xf4
 	snapSectionEnd      = 0xff
 
 	snapRecEnd     = 0x00
