@@ -595,58 +595,70 @@ const (
 	snapRecCode    = 0x06 // contract code, keyed by hash
 )
 
-// convertPoint is where state, blocks and history all agree: the block of the persisted state trie.
+// convertPoint is where state, blocks and history all agree: the deepest state the trie database can
+// still serve, which is pathdb's disk layer.
 //
-// State above it lives only in the pathdb journal (the disk layer's unflushed write buffer, and diff
-// layers on top), so it is not in the trie on disk. Converting up to this point and letting the node
-// re-derive the rest avoids needing any of that, and avoids a range whose state we would have to
-// reconstruct in order to generate its own changesets.
+// It is not the persisted state id. That tracks how far trie node writes have been flushed, while
+// the disk layer aggregates further transitions in its journal buffer, so the persisted root is not
+// a root the layer tree can serve. Asking for it fails with "state is not available".
+//
+// The disk layer's root is the post root of the most recently flattened history object, because
+// history is written at flatten time. Diff layers above it have no history yet, which is why the
+// conversion stops here and lets the node re-derive the rest.
 type convertPoint struct {
 	block   uint64      // P
 	root    common.Hash // R_P
-	stateID uint64      // persistent state id, which is P's history object
+	stateID uint64      // P's history object
 }
 
-// resolveConvertPoint reads P two independent ways and requires them to agree (ADR-004 P3).
+// resolveConvertPoint finds the deepest servable state that also has history.
 //
-// The root comes from hashing the persisted root account trie node. The block comes from the history
-// object at the persistent state id. If a snapshot were captured mid-write these would disagree, and
-// the resulting conversion would silently pair one block's state with another block's history.
-func resolveConvertPoint(db ethdb.Database, ancientDir string) convertPoint {
-	node := rawdb.ReadAccountTrieNode(db, nil)
-	if len(node) == 0 {
-		fatal("read persisted state root", fmt.Errorf("no account trie node at the empty path; is this a path-scheme database?"))
-	}
-	root := crypto.Keccak256Hash(node)
-	id := rawdb.ReadPersistentStateID(db)
-	if id == 0 {
-		fatal("read persistent state id", fmt.Errorf("no persistent state id; nothing has been flattened to disk"))
-	}
-
+// Rather than deriving the disk layer's identity from pathdb internals, it walks history objects
+// back from the newest and takes the first whose post root the trie database can actually open.
+// That is the property the exporter needs, checked directly, and it self-corrects if the disk layer
+// sits a few transitions below the newest history.
+func resolveConvertPoint(db ethdb.Database, ancientDir string, sdb state.Database) convertPoint {
 	store, err := rawdb.NewStateFreezer(ancientDir, false, true)
 	if err != nil {
 		fatal("open state freezer", err)
 	}
 	defer store.Close()
 
-	meta, _, _, _, _, err := rawdb.ReadStateHistory(store, id)
+	count, err := store.Ancients()
 	if err != nil {
-		fatal(fmt.Sprintf("read state history %d", id), err)
+		fatal("read state history count", err)
 	}
-	if len(meta) != histMetaSize {
-		fatal("decode state history meta", fmt.Errorf("meta is %d bytes, want %d", len(meta), histMetaSize))
+	if count == 0 {
+		fatal("resolve convert point", fmt.Errorf("state freezer holds no history"))
 	}
-	postRoot := common.BytesToHash(meta[33:65])
-	if postRoot != root {
-		fatal("resolve convert point", fmt.Errorf(
-			"persisted trie root %s does not match the post root %s of history %d; snapshot looks torn",
-			root.Hex(), postRoot.Hex(), id))
+
+	// Bounded: the disk layer is at most maxDiffLayers behind the newest history in a healthy
+	// database. Scanning far past that would mean something is wrong, and silently converting an
+	// ancient state is worse than stopping.
+	const maxProbe = 512
+	for probe := uint64(0); probe < maxProbe && probe < count; probe++ {
+		id := count - probe
+		meta, _, _, _, _, err := rawdb.ReadStateHistory(store, id)
+		if err != nil {
+			fatal(fmt.Sprintf("read state history %d", id), err)
+		}
+		if len(meta) != histMetaSize {
+			fatal("decode state history meta", fmt.Errorf("meta is %d bytes, want %d", len(meta), histMetaSize))
+		}
+		root := common.BytesToHash(meta[33:65])
+		if _, err := sdb.OpenTrie(root); err != nil {
+			continue
+		}
+		block := binary.BigEndian.Uint64(meta[65:histMetaSize])
+		if probe > 0 {
+			fmt.Fprintf(os.Stderr,
+				"note: newest history is %d ids above the servable state; converting at id %d\n", probe, id)
+		}
+		return convertPoint{block: block, root: root, stateID: id}
 	}
-	return convertPoint{
-		block:   binary.BigEndian.Uint64(meta[65:histMetaSize]),
-		root:    root,
-		stateID: id,
-	}
+	fatal("resolve convert point", fmt.Errorf(
+		"no state root among the newest %d history objects can be opened; the snapshot's trie and its history do not meet", maxProbe))
+	panic("unreachable")
 }
 
 // fullSnapshot writes one stream that an importer can turn into a complete reth datadir.
@@ -654,7 +666,7 @@ func resolveConvertPoint(db ethdb.Database, ancientDir string) convertPoint {
 // Sections are ordered so the importer can write append-only: blocks ascending, then history
 // ascending, then the state bulk load. Everything stops at P, so the three agree.
 func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database) {
-	point := resolveConvertPoint(db, ancientDir)
+	point := resolveConvertPoint(db, ancientDir, sdb)
 	fmt.Fprintf(os.Stderr, "convert point: block=%d root=%s stateID=%d\n",
 		point.block, point.root.Hex(), point.stateID)
 
