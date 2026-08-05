@@ -433,30 +433,11 @@ func exportHistory(ancientDir string, from, to uint64) {
 	defer w.Flush()
 	w.WriteString(histStreamMagic)
 
-	var (
-		accounts uint64
-		slots    uint64
-		started  = time.Now()
-	)
-	for id := first; id <= last; id++ {
-		meta, accIndex, slotIndex, accData, slotData, err := rawdb.ReadStateHistory(store, id)
-		if err != nil {
-			fatal(fmt.Sprintf("read state history %d", id), err)
-		}
-		na, ns, err := writeHistoryObject(w, id, meta, accIndex, slotIndex, accData, slotData)
-		if err != nil {
-			fatal(fmt.Sprintf("encode state history %d", id), err)
-		}
-		accounts += na
-		slots += ns
-		if (id-first)%500000 == 0 {
-			fmt.Fprintf(os.Stderr, "history id %d/%d (%d accounts, %d slots, %s)\n",
-				id, last, accounts, slots, time.Since(started).Truncate(time.Second))
-		}
-	}
+	started := time.Now()
+	emitted, skipped, accounts, slots := streamHistoryRange(w, store, first, last, "history id")
 	w.WriteByte(histTagStreamEnd)
-	fmt.Fprintf(os.Stderr, "exported history ids [%d..%d]: %d accounts, %d slots in %s\n",
-		first, last, accounts, slots, time.Since(started).Truncate(time.Second))
+	fmt.Fprintf(os.Stderr, "exported history ids [%d..%d]: %d objects (%d genesis v0 skipped), %d accounts, %d slots in %s\n",
+		first, last, emitted, skipped, accounts, slots, time.Since(started).Truncate(time.Second))
 }
 
 // writeHistoryObject decodes one history object and writes its neutral form.
@@ -753,28 +734,11 @@ func writeHistorySection(w *bufio.Writer, ancientDir string, point convertPoint)
 	}
 	defer store.Close()
 
-	var accounts, slots uint64
 	started := time.Now()
-	// State history ids are 1-based. Ids below the freezer tail have been pruned away; the importer
-	// records whatever range it receives rather than assuming full coverage.
-	for id := uint64(1); id <= point.stateID; id++ {
-		meta, accIndex, slotIndex, accData, slotData, err := rawdb.ReadStateHistory(store, id)
-		if err != nil {
-			fatal(fmt.Sprintf("read state history %d", id), err)
-		}
-		na, ns, err := writeHistoryObject(w, id, meta, accIndex, slotIndex, accData, slotData)
-		if err != nil {
-			fatal(fmt.Sprintf("encode state history %d", id), err)
-		}
-		accounts += na
-		slots += ns
-		if id%1000000 == 0 {
-			fmt.Fprintf(os.Stderr, "history %d/%d (%s)\n", id, point.stateID, time.Since(started).Truncate(time.Second))
-		}
-	}
+	emitted, skipped, accounts, slots := streamHistoryRange(w, store, 1, point.stateID, "history")
 	w.WriteByte(snapRecEnd)
-	fmt.Fprintf(os.Stderr, "history section: %d objects, %d accounts, %d slots in %s\n",
-		point.stateID, accounts, slots, time.Since(started).Truncate(time.Second))
+	fmt.Fprintf(os.Stderr, "history section: %d objects (%d genesis v0 skipped), %d accounts, %d slots in %s\n",
+		emitted, skipped, accounts, slots, time.Since(started).Truncate(time.Second))
 }
 
 // writeStateSection walks the account and storage tries at R_P.
@@ -870,4 +834,41 @@ func writeStateSection(w *bufio.Writer, sdb state.Database, tdb *triedb.Database
 func writeBlob(w *bufio.Writer, b []byte) {
 	writeUvarint(w, uint64(len(b)))
 	w.Write(b)
+}
+
+// streamHistoryRange writes history objects [first, last] and reports what it emitted.
+//
+// A leading run of v0 objects is the genesis state materialisation, which identifies slots by hash.
+// It is skipped rather than refused: block 0 needs no changeset, since there is nothing below it to
+// unwind into, and the first v1 object still chains to the genesis state root. A v0 object after
+// real history has started is a different thing and is fatal.
+func streamHistoryRange(w *bufio.Writer, store ethdb.AncientStore, first, last uint64, label string) (emitted, skipped, accounts, slots uint64) {
+	started := time.Now()
+	for id := first; id <= last; id++ {
+		meta, accIndex, slotIndex, accData, slotData, err := rawdb.ReadStateHistory(store, id)
+		if err != nil {
+			fatal(fmt.Sprintf("read state history %d", id), err)
+		}
+		if len(meta) == histMetaSize && meta[0] == histVersionHashedSlots && emitted == 0 {
+			block := binary.BigEndian.Uint64(meta[65:histMetaSize])
+			if block != 0 {
+				fatal("export history", fmt.Errorf(
+					"state history %d uses hashed slot keys at block %d; only a genesis-block v0 object can be skipped", id, block))
+			}
+			skipped++
+			continue
+		}
+		na, ns, err := writeHistoryObject(w, id, meta, accIndex, slotIndex, accData, slotData)
+		if err != nil {
+			fatal(fmt.Sprintf("encode state history %d", id), err)
+		}
+		emitted++
+		accounts += na
+		slots += ns
+		if emitted%1000000 == 0 {
+			fmt.Fprintf(os.Stderr, "%s %d/%d (%d accounts, %d slots, %s)\n",
+				label, id, last, accounts, slots, time.Since(started).Truncate(time.Second))
+		}
+	}
+	return emitted, skipped, accounts, slots
 }
