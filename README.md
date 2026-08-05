@@ -77,6 +77,7 @@ For a complete Robinhood mainnet invocation, see the [Robinhood chain guide](doc
 | [`genesis verify`](docs/commands/genesis.md) | Verify genesis or a `reth-export` state stream. |
 | [`rewind`](docs/commands/rewind.md) | Remove a local suffix after a confirmed divergence. |
 | [`dump-blocks`](docs/commands/dump-blocks.md) | Print headers, transaction hashes, and receipt status from a datadir. |
+| [`arb-reth-replica`](docs/commands/replica.md) | Experimental: monitor replay parity of a live replica against a canonical endpoint. |
 
 The command index is in [docs](docs/README.md). The CLI is the source of truth for flags: `arbitrum-reth <command> --help`.
 

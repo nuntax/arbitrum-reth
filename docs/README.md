@@ -7,6 +7,7 @@ Use the release binary in the examples below. Replace paths and endpoints with v
 - [genesis](commands/genesis.md): verify state roots before import.
 - [rewind](commands/rewind.md): remove a bad local suffix.
 - [dump-blocks](commands/dump-blocks.md): inspect persisted blocks.
+- [arb-reth-replica](commands/replica.md): experimental parity monitor for replica replay against a canonical endpoint.
 - [chains](chains/README.md): chain-specific operator notes.
 - [observability](observability/README.md): Prometheus metrics for the execute and persist loop.
 

@@ -1,0 +1,27 @@
+[package]
+name = "arb-reth-replica"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Replica replay adaptor (experimental): supervises an `arb-reth node` that replays a live
+# Arbitrum chain (L1 derivation catch-up + sequencer feed tail) and continuously verifies
+# parity against a canonical upstream RPC (e.g. the chain's hosted Nitro endpoint). It talks
+# to both nodes over plain JSON-RPC, so it needs no reth deps and stays decoupled from the
+# node internals. See docs/commands/replica.md.
+
+[dependencies]
+alloy-primitives = { version = "1", default-features = false }
+alloy-rpc-client = { version = "2.1", default-features = false, features = ["reqwest"] }
+alloy-transport = { version = "2.1", default-features = false }
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6.12"
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "test-util"] }
