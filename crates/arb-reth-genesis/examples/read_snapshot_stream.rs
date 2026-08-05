@@ -77,6 +77,7 @@ fn main() -> eyre::Result<()> {
     stream.check_history_meets_state()?;
 
     println!("\nblocks   {headers} headers, {bodies} bodies, {receipts} receipt sets");
+    println!("         {tx_roots_checked} transactions roots verified against their header");
     println!("history  {histories} objects, {hist_accounts} accounts, {hist_slots} slots");
     println!("state    {accounts} accounts, {slots} slots, {codes} code blobs");
     println!("first history block: {first_history_block:?}");
