@@ -10,7 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      RUSTFLAGS: -D warnings
+      # `--allow-multiple-definition` works around a duplicate `__rust_probestack`: Nitro's Wasmer
+      # fork vendors its own copy alongside the one in Rust's compiler_builtins. GNU ld accepted
+      # that, rust-lld (default from the 1.97 toolchain) does not. See .cargo/config.toml, which
+      # carries the same flag for local Linux builds; setting RUSTFLAGS here overrides that file
+      # entirely, so the flag has to be repeated.
+      RUSTFLAGS: -D warnings -C link-arg=-Wl,--allow-multiple-definition
       RUSTDOCFLAGS: -D warnings
 
     steps:
