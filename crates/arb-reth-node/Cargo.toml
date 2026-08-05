@@ -54,6 +54,7 @@ arb-reth-l1 = { path = "../arb-reth-l1" }
 arb-reth-sync = { path = "../arb-reth-sync" }
 arb-reth-genesis = { path = "../arb-reth-genesis" }
 alloy-provider = { version = "2.0", default-features = false, features = ["reqwest", "reqwest-default-tls"] }
+url = "2.5"
 
 # D.3b: NodeBuilder integration (Node<N> + noop components + custom LaunchNode)
 reth-node-builder = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }

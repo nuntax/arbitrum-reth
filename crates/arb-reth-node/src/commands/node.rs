@@ -363,6 +363,20 @@ fn resolve_rollup_deployment(args: &NodeArgs) -> eyre::Result<RollupDeployment> 
 /// those need to be supplied by hand. Used for fresh chains (a nitro-testnode or a new Orbit
 /// chain) that start at L2 block 0; Arbitrum One instead boots from a snapshot, because its
 /// genesis is the classic-state migration block, not an Initialize message.
+/// Reject a malformed `--l1-rpc` before any task is spawned.
+///
+/// Only the genesis resume path builds a provider up front, and it does so incidentally, to
+/// resolve batch 0. Without this check, whether an operator gets a clear error or a node that
+/// boots and then silently stops depends on which resume path the flags happened to select. The
+/// sync runtime parses the same string again inside its task, where the failure is not recoverable
+/// and reaches only a log line.
+fn validate_l1_rpc(l1_rpc: &str) -> eyre::Result<()> {
+    l1_rpc
+        .parse::<url::Url>()
+        .map_err(|e| eyre::eyre!("invalid --l1-rpc URL: {e}"))?;
+    Ok(())
+}
+
 async fn derive_genesis_from_l1(
     l1_rpc: &str,
     bridge: Address,
@@ -742,7 +756,14 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     // STF path. The held sender keeps the node alive even after a bounded run finishes.
     // Skipped under --no-l1-derive so --feed-url is the sole producer (genesis already bootstrapped
     // from --l1-rpc above; the derivation loop and the feed must not both feed the channel).
+    // Carries a terminal L1 derivation failure out of its task. Declared unconditionally so the
+    // wait below can select on it even when derivation never starts; in that case the sender is
+    // dropped here and the branch simply never fires.
+    let (l1_fatal_tx, l1_fatal_rx) = tokio::sync::oneshot::channel::<crate::L1SyncError>();
+
     if let Some(l1_rpc) = args.l1_rpc.filter(|_| !args.no_l1_derive) {
+        validate_l1_rpc(&l1_rpc)?;
+
         // The current durable L2 tip (`last_block_number` = the persisted DB head, not the
         // in-memory canonical head). The driver already boots its production tip from this block
         // (via reth's `lookup_head`), so L1 derivation must resume so that its first NEW block is
@@ -871,6 +892,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         let persisted_tip = move || tip_provider.last_block_number().unwrap_or(0);
 
         let tx = feed_tx.clone();
+        let fatal_tx = l1_fatal_tx;
         task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
             if let Err(e) =
                 crate::supervise_l1_sync(sync_cfg, tx, persisted_tip, shutdown).await
@@ -880,6 +902,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                     err = %e,
                     "L1 sync stopped after a non-retryable failure",
                 );
+                // The supervisor already retried everything it treats as transient, so the chain
+                // cannot advance from here. Report it rather than leaving the node serving a tip
+                // that will never move: to a health check that looks like a live RPC reporting
+                // `eth_syncing: false`, which reads as fully synced.
+                let _ = fatal_tx.send(e);
             }
         });
         info!(target: "arb-reth", start_block, start_delayed, start_l2_block, db_tip, "L1-derivation catch-up started");
@@ -887,7 +914,15 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
     // Hold feed_tx alive so the driver parks on the channel rather than exiting.
     let _feed_tx = feed_tx;
-    handle.wait_for_node_exit().await
+
+    // Park until the node exits normally, or until L1 derivation gives up. Returning `Err` here
+    // produces a non-zero exit, so a supervisor can restart or alert. When derivation never
+    // started the sender was dropped above, the receiver resolves to `Err(RecvError)`, the pattern
+    // fails to match, and that branch is disabled for the rest of the select.
+    tokio::select! {
+        result = handle.wait_for_node_exit() => result,
+        Ok(err) = l1_fatal_rx => Err(eyre::eyre!("L1 derivation stopped and cannot resume: {err}")),
+    }
 }
 
 #[cfg(test)]
@@ -900,6 +935,29 @@ mod tests {
     const ROBINHOOD_CHAIN_INFO: &[u8] =
         include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
     const ROBINHOOD_GENESIS: &[u8] = include_bytes!("../../tests/fixtures/robinhood-genesis.json");
+
+    /// A bad `--l1-rpc` used to be caught only on the genesis resume path, which parses it to
+    /// resolve batch 0. The `--l1-start-block` and checkpoint paths never built a provider, so the
+    /// same input booted a node that logged one error and then served a tip that never advanced.
+    #[test]
+    fn a_malformed_l1_rpc_is_rejected_before_anything_is_spawned() {
+        for bad in ["not-a-url", "", "://missing-scheme", "   "] {
+            let err = validate_l1_rpc(bad)
+                .expect_err("a URL without a base must not reach the sync task");
+            assert!(
+                err.to_string().contains("invalid --l1-rpc URL"),
+                "unexpected message for {bad:?}: {err}"
+            );
+        }
+
+        for good in [
+            "http://localhost:8545",
+            "https://example.invalid/rpc",
+            "https://user:pass@example.invalid:8545/path?query=1",
+        ] {
+            validate_l1_rpc(good).unwrap_or_else(|e| panic!("{good:?} should parse: {e}"));
+        }
+    }
 
     #[test]
     fn robinhood_genesis_delayed_cursor_comes_from_header_nonce() {

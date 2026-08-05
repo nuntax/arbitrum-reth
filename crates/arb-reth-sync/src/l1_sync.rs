@@ -689,6 +689,27 @@ mod tests {
         L1ResumeCheckpoint { l1_block, delayed_count: 0, l2_block }
     }
 
+    /// Covers the variants that reach the caller directly rather than through `L1SyncError::l1`,
+    /// which `only_provider_errors_are_retryable_and_their_details_are_redacted` already exercises.
+    ///
+    /// The node now stops on any non-retryable failure instead of parking, so this predicate is
+    /// what decides between "restart from the last checkpoint" and "give up". Widening it would
+    /// turn a terminal failure back into an endless retry against a tip that can never advance.
+    #[test]
+    fn url_and_prefetch_failures_are_terminal() {
+        assert!(L1SyncError::provider("read batches").is_retryable());
+
+        for err in [
+            L1SyncError::InvalidRpcUrl,
+            L1SyncError::PrefetchTask { from: 1, to: 2 },
+        ] {
+            assert!(
+                !err.is_retryable(),
+                "{err} must reach the caller instead of being retried",
+            );
+        }
+    }
+
     struct MockRpc {
         url: String,
         requests: Arc<AtomicUsize>,
