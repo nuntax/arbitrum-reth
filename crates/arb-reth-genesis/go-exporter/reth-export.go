@@ -150,6 +150,9 @@ func main() {
 	// the same stream a serial walk would. `--outbase` is required when N > 1.
 	parallel := flag.Int("parallel", 1, "for --mode state and --mode full-snapshot: number of concurrent key-range walkers")
 	outbase := flag.String("outbase", "", "for --mode state --parallel N: output path prefix for part files")
+	// Never defaults to the source directory: that is a live pebble database, and scattering part
+	// files through it risks confusing a later open.
+	tmpdir := flag.String("tmpdir", os.TempDir(), "for --mode full-snapshot --parallel N: scratch directory for state part files")
 	flag.Parse()
 	if flag.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: reth-export <l2chaindata-dir> [--ancient DIR] [--mode diag|accounts] [--max N]")
@@ -338,7 +341,7 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "exported %d blocks [%d..%d]\n", nBlk, lo, hi)
 	case "full-snapshot":
-		fullSnapshot(db, anc, sdb, tdb, *parallel, dir)
+		fullSnapshot(db, anc, sdb, tdb, *parallel, *tmpdir)
 	case "diskroot":
 		// The path-scheme disk layer: the persisted trie, before any journalled diff layers.
 		// pathdb derives it the same way in loadLayers(). Its root is the post root of the most
