@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -132,11 +133,11 @@ func walkRange(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, root c
 
 func main() {
 	ancient := flag.String("ancient", "", "ancients/freezer directory (default <dir>/ancient)")
-	mode := flag.String("mode", "diag", "diag|state|blocks|accounts|addr")
+	mode := flag.String("mode", "diag", "diag|state|blocks|history|accounts|addr")
 	max := flag.Uint64("max", 0, "max accounts to dump (0 = all)")
 	addr := flag.String("addr", "", "for --mode addr: a 0x address to dump (storage key form check)")
-	from := flag.Int64("from", -1, "for --mode blocks: first block (default = head)")
-	to := flag.Int64("to", -1, "for --mode blocks: last block (default = head)")
+	from := flag.Int64("from", -1, "for --mode blocks: first block; for --mode history: first state id (default = earliest)")
+	to := flag.Int64("to", -1, "for --mode blocks: last block; for --mode history: last state id (default = latest)")
 	// A large pebble block cache is critical for `--mode state`: the trie walk is random-read
 	// bound, and the default 16 MiB cache makes almost every node a cold disk read. Sizing this
 	// to hold the hot upper-trie nodes turns most reads into RAM hits (orders of magnitude faster).
@@ -335,6 +336,8 @@ func main() {
 			nBlk++
 		}
 		fmt.Fprintf(os.Stderr, "exported %d blocks [%d..%d]\n", nBlk, lo, hi)
+	case "history":
+		exportHistory(anc, uint64Flag(*from), uint64Flag(*to))
 	case "addr":
 		a := common.HexToAddress(*addr)
 		h := crypto.Keccak256Hash(a.Bytes())
@@ -348,4 +351,226 @@ func main() {
 	default:
 		fatal("mode", fmt.Errorf("unknown mode %q", *mode))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// --mode history: geth pathdb state history -> neutral change records
+// ---------------------------------------------------------------------------
+
+// Encoded sizes of the fixed-width records inside a state history object.
+// Mirrors triedb/pathdb/history_state.go, which keeps these unexported.
+const (
+	histMetaSize     = 73 // version(1) parentRoot(32) postRoot(32) block(8)
+	histAccIndexSize = 33 // address(20) len(1) offset(4) storageOffset(4) storageSlots(4)
+	histSlotIndexSize = 37 // slotKey(32) len(1) offset(4)
+
+	histVersionHashedSlots = 0 // storage slot keys are hashed
+	histVersionRawSlots    = 1 // storage slot keys are raw
+
+	// Stream framing. The importer rejects anything else.
+	histStreamMagic  = "ARBHIST1"
+	histTagObject    = 0x01
+	histTagStreamEnd = 0x00
+)
+
+func uint64Flag(v int64) uint64 {
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
+}
+
+// exportHistory streams pathdb state history as neutral pre-state records.
+//
+// Each history object holds the values a block overwrote, which is what reth changesets store, so
+// the conversion needs no re-execution. Output is binary rather than the hex-per-line form the
+// state and block modes use: this chain has 27M objects and roughly 1.6B slot entries, where hex
+// would more than double an already 100 GB stream.
+//
+// `from` and `to` are state ids, not block numbers, because that is how the freezer is addressed.
+// Zero means "the whole available range". Each record carries its block number, so the importer
+// never has to infer the mapping (ids 0 and 1 are both block 0 on a chain built from genesis).
+func exportHistory(ancientDir string, from, to uint64) {
+	store, err := rawdb.NewStateFreezer(ancientDir, false, true)
+	if err != nil {
+		fatal("open state freezer", err)
+	}
+	defer store.Close()
+
+	// Ancients() counts items; state history ids are 1-based, so id i lives at position i-1.
+	count, err := store.Ancients()
+	if err != nil {
+		fatal("read state history count", err)
+	}
+	if count == 0 {
+		fatal("state freezer holds no history", fmt.Errorf("nothing to export from %s", ancientDir))
+	}
+	first, last := uint64(1), count
+	if from != 0 {
+		first = from
+	}
+	if to != 0 && to < last {
+		last = to
+	}
+	if first > last {
+		fatal("empty history range", fmt.Errorf("from %d > to %d", first, last))
+	}
+
+	w := bufio.NewWriterSize(os.Stdout, 1<<22)
+	defer w.Flush()
+	w.WriteString(histStreamMagic)
+
+	var (
+		accounts uint64
+		slots    uint64
+		started  = time.Now()
+	)
+	for id := first; id <= last; id++ {
+		meta, accIndex, slotIndex, accData, slotData, err := rawdb.ReadStateHistory(store, id)
+		if err != nil {
+			fatal(fmt.Sprintf("read state history %d", id), err)
+		}
+		na, ns, err := writeHistoryObject(w, id, meta, accIndex, slotIndex, accData, slotData)
+		if err != nil {
+			fatal(fmt.Sprintf("encode state history %d", id), err)
+		}
+		accounts += na
+		slots += ns
+		if (id-first)%500000 == 0 {
+			fmt.Fprintf(os.Stderr, "history id %d/%d (%d accounts, %d slots, %s)\n",
+				id, last, accounts, slots, time.Since(started).Truncate(time.Second))
+		}
+	}
+	w.WriteByte(histTagStreamEnd)
+	fmt.Fprintf(os.Stderr, "exported history ids [%d..%d]: %d accounts, %d slots in %s\n",
+		first, last, accounts, slots, time.Since(started).Truncate(time.Second))
+}
+
+// writeHistoryObject decodes one history object and writes its neutral form.
+//
+// Record layout, all integers unsigned varint unless stated:
+//
+//	tag(1)=0x01 stateID block version(1) parentRoot(32) postRoot(32) accountCount
+//	  per account: address(20) present(1)
+//	               if present: nonce, balanceLen(1) balance, codeHashLen(1) codeHash
+//	               slotCount
+//	    per slot:  key(32) valueLen(1) value
+//
+// A zero-length value means the slot was unset, and present=0 means the account did not exist
+// before the block. Balances and slot values are minimal big-endian, so they cost a byte each when
+// small, which most are.
+func writeHistoryObject(w *bufio.Writer, id uint64, meta, accIndex, slotIndex, accData, slotData []byte) (uint64, uint64, error) {
+	if len(meta) != histMetaSize {
+		return 0, 0, fmt.Errorf("meta is %d bytes, want %d", len(meta), histMetaSize)
+	}
+	version := meta[0]
+	if version > histVersionRawSlots {
+		return 0, 0, fmt.Errorf("unknown state history version %d", version)
+	}
+	// A v0 object identifies storage slots by hash. Converting those to reth changesets needs a
+	// preimage source the importer does not have, so refuse rather than emit unusable keys.
+	// Chains built under a v1 geth carry at most a couple of v0 objects at genesis.
+	if version == histVersionHashedSlots {
+		return 0, 0, fmt.Errorf("state history %d uses hashed slot keys (v0); re-export from a range that excludes it", id)
+	}
+	if len(accIndex)%histAccIndexSize != 0 {
+		return 0, 0, fmt.Errorf("account index is %d bytes, not a multiple of %d", len(accIndex), histAccIndexSize)
+	}
+	if len(slotIndex)%histSlotIndexSize != 0 {
+		return 0, 0, fmt.Errorf("storage index is %d bytes, not a multiple of %d", len(slotIndex), histSlotIndexSize)
+	}
+
+	block := binary.BigEndian.Uint64(meta[65:histMetaSize])
+	nAccounts := uint64(len(accIndex) / histAccIndexSize)
+
+	w.WriteByte(histTagObject)
+	writeUvarint(w, id)
+	writeUvarint(w, block)
+	w.WriteByte(version)
+	w.Write(meta[1:33])  // parent root
+	w.Write(meta[33:65]) // post root
+	writeUvarint(w, nAccounts)
+
+	var slotTotal uint64
+	for i := uint64(0); i < nAccounts; i++ {
+		rec := accIndex[i*histAccIndexSize : (i+1)*histAccIndexSize]
+		addr := rec[0:20]
+		length := int(rec[20])
+		offset := int(binary.BigEndian.Uint32(rec[21:25]))
+		storageOffset := int(binary.BigEndian.Uint32(rec[25:29]))
+		storageSlots := int(binary.BigEndian.Uint32(rec[29:33]))
+
+		if offset+length > len(accData) {
+			return 0, 0, fmt.Errorf("account data range [%d,%d) exceeds %d bytes", offset, offset+length, len(accData))
+		}
+		w.Write(addr)
+
+		blob := accData[offset : offset+length]
+		if len(blob) == 0 {
+			w.WriteByte(0) // did not exist before this block
+		} else {
+			acct, err := types.FullAccount(blob)
+			if err != nil {
+				return 0, 0, fmt.Errorf("decode previous account %x: %w", addr, err)
+			}
+			w.WriteByte(1)
+			writeUvarint(w, acct.Nonce)
+			writeShortBytes(w, acct.Balance.Bytes())
+			// The storage root is a trie artefact reth recomputes, so it is not emitted. An empty
+			// code hash is emitted as zero bytes rather than the empty-hash constant.
+			if bytes.Equal(acct.CodeHash, types.EmptyCodeHash[:]) {
+				w.WriteByte(0)
+			} else {
+				writeShortBytes(w, acct.CodeHash)
+			}
+		}
+
+		writeUvarint(w, uint64(storageSlots))
+		for s := 0; s < storageSlots; s++ {
+			at := (storageOffset + s) * histSlotIndexSize
+			if at+histSlotIndexSize > len(slotIndex) {
+				return 0, 0, fmt.Errorf("storage index entry %d for %x out of range", storageOffset+s, addr)
+			}
+			entry := slotIndex[at : at+histSlotIndexSize]
+			vlen := int(entry[32])
+			voff := int(binary.BigEndian.Uint32(entry[33:37]))
+			if voff+vlen > len(slotData) {
+				return 0, 0, fmt.Errorf("storage data range [%d,%d) exceeds %d bytes", voff, voff+vlen, len(slotData))
+			}
+			w.Write(entry[0:32]) // raw slot key, guaranteed by the v1 check above
+			// Stored values are RLP byte strings; strip the header so the importer gets the
+			// integer bytes directly.
+			val, err := rlpStringPayload(slotData[voff : voff+vlen])
+			if err != nil {
+				return 0, 0, fmt.Errorf("decode slot value for %x: %w", addr, err)
+			}
+			writeShortBytes(w, val)
+		}
+		slotTotal += uint64(storageSlots)
+	}
+	return nAccounts, slotTotal, nil
+}
+
+// rlpStringPayload strips the RLP header from a storage value. An empty input is a zero slot.
+func rlpStringPayload(b []byte) ([]byte, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	var out []byte
+	if err := rlp.DecodeBytes(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func writeUvarint(w *bufio.Writer, v uint64) {
+	var buf [binary.MaxVarintLen64]byte
+	w.Write(buf[:binary.PutUvarint(buf[:], v)])
+}
+
+// writeShortBytes writes a length-prefixed blob of at most 255 bytes. Every field using it
+// (balance, code hash, slot value) is bounded at 32.
+func writeShortBytes(w *bufio.Writer, b []byte) {
+	w.WriteByte(byte(len(b)))
+	w.Write(b)
 }
