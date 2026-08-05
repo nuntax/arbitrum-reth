@@ -91,6 +91,11 @@ The command index is in [docs](docs/README.md). The CLI is the source of truth f
 - `arbitrum-reth-rpc`: Arbitrum RPC conversion and reth RPC integration.
 - `arbitrum-reth-genesis`: genesis import and verification helpers.
 
+## Acknowledgements
+
+[Chainstack](https://chainstack.com) generously provided six months of their Growth plan, which supplies the L1
+archive RPC this node derives from.
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. The vendored Nitro `brotli` dependency is BUSL-1.1. See [NOTICE](NOTICE).
