@@ -365,6 +365,40 @@ impl<R: Read> SnapshotStream<R> {
     }
 }
 
+/// Transactions trie root over a block body, for checking against `header.transactionsRoot`.
+///
+/// The body is `[transactions, uncles, ...]`. A leaf's value is the transaction's encoded form: the
+/// full RLP list for a legacy transaction, and the bare `type || payload` for a typed one, which the
+/// body carries wrapped in an RLP byte string. So a list item contributes its whole encoding and a
+/// string item contributes only its payload.
+pub fn transactions_root(body_rlp: &[u8]) -> eyre::Result<B256> {
+    let (body, rest) = rlp_split(body_rlp, true)?;
+    if !rest.is_empty() {
+        return Err(eyre!("trailing bytes after the body"));
+    }
+    let (txs, _) = rlp_split(body, true).wrap_err("body has no transactions list")?;
+
+    let mut encoded: Vec<&[u8]> = Vec::new();
+    let mut cursor = txs;
+    while !cursor.is_empty() {
+        let is_list = cursor[0] >= 0xc0;
+        let consumed_before = cursor.len();
+        let (payload, next) = rlp_split(cursor, is_list)?;
+        if is_list {
+            // Legacy: the leaf is the entire RLP list, header included.
+            encoded.push(&cursor[..consumed_before - next.len()]);
+        } else {
+            // Typed: the leaf is the envelope the string wraps, without the string header.
+            encoded.push(payload);
+        }
+        cursor = next;
+    }
+    Ok(alloy_trie::root::ordered_trie_root_with_encoder(
+        &encoded,
+        |item, out| out.extend_from_slice(item),
+    ))
+}
+
 /// Payload of the `i`th top-level field of an RLP-encoded header.
 ///
 /// Avoids decoding the whole header, which lets this work regardless of any chain-specific trailing
@@ -742,6 +776,49 @@ mod tests {
         let mut s = SnapshotStream::open(bytes.as_slice()).unwrap();
         let err = s.next_record().unwrap_err().to_string();
         assert!(err.contains("does not hash to"), "{err}");
+    }
+
+    /// An empty body must produce the empty trie root, which is what a header with no transactions
+    /// commits to.
+    #[test]
+    fn empty_body_has_the_empty_transactions_root() {
+        // [[], []] : no transactions, no uncles.
+        let body = [0xc2u8, 0xc0, 0xc0];
+        assert_eq!(
+            transactions_root(&body).unwrap(),
+            alloy_trie::EMPTY_ROOT_HASH,
+        );
+    }
+
+    /// A legacy transaction contributes its whole RLP list; a typed one contributes only the
+    /// envelope the body wraps in a string. Getting that backwards yields a wrong but plausible
+    /// root, so the two shapes must produce different results.
+    #[test]
+    fn legacy_and_typed_transactions_encode_differently() {
+        let legacy: &[u8] = &[0xc3, 0x01, 0x02, 0x03]; // list [1,2,3]
+        let typed_payload: &[u8] = &[0x02, 0x01, 0x02, 0x03]; // type 2 envelope
+        let mut typed = vec![0x80 + typed_payload.len() as u8];
+        typed.extend_from_slice(typed_payload);
+
+        let mut body_a = vec![];
+        body_a.extend_from_slice(legacy);
+        let mut body_b = vec![];
+        body_b.extend_from_slice(&typed);
+
+        let wrap = |txs: &[u8]| {
+            let mut inner = vec![0xc0 + txs.len() as u8];
+            inner.extend_from_slice(txs);
+            inner.push(0xc0); // empty uncles
+            let mut out = vec![0xc0 + inner.len() as u8];
+            out.extend_from_slice(&inner);
+            out
+        };
+
+        let root_a = transactions_root(&wrap(&body_a)).unwrap();
+        let root_b = transactions_root(&wrap(&body_b)).unwrap();
+        assert_ne!(root_a, root_b);
+        assert_ne!(root_a, alloy_trie::EMPTY_ROOT_HASH);
+        assert_ne!(root_b, alloy_trie::EMPTY_ROOT_HASH);
     }
 
     #[test]

@@ -8,7 +8,8 @@
 
 use std::time::Instant;
 
-use arb_reth_genesis::snapshot_stream::{Record, SnapshotStream};
+use alloy_primitives::B256;
+use arb_reth_genesis::snapshot_stream::{header_field, transactions_root, Record, SnapshotStream};
 
 fn main() -> eyre::Result<()> {
     let path = std::env::args()
@@ -28,11 +29,35 @@ fn main() -> eyre::Result<()> {
     let (mut histories, mut hist_accounts, mut hist_slots) = (0u64, 0u64, 0u64);
     let (mut accounts, mut slots, mut codes) = (0u64, 0u64, 0u64);
     let mut first_history_block = None;
+    // Header by block, so a body can be checked against the header that precedes it.
+    let mut pending_header: Option<(u64, B256)> = None;
+    let mut tx_roots_checked = 0u64;
 
     while let Some(rec) = stream.next_record()? {
         match rec {
-            Record::Header { .. } => headers += 1,
-            Record::Body { .. } => bodies += 1,
+            Record::Header { block, rlp, .. } => {
+                headers += 1;
+                pending_header = Some((block, B256::from_slice(header_field(&rlp, 4)?)));
+            }
+            Record::Body { block, rlp } => {
+                bodies += 1;
+                match pending_header {
+                    Some((n, want)) if n == block => {
+                        let got = transactions_root(&rlp)?;
+                        if got != want {
+                            return Err(eyre::eyre!(
+                                "block {block}: transactions root {got:#x}, header says {want:#x}"
+                            ));
+                        }
+                        tx_roots_checked += 1;
+                    }
+                    other => {
+                        return Err(eyre::eyre!(
+                            "block {block}: body without its header (pending {other:?})"
+                        ));
+                    }
+                }
+            }
             Record::Receipts { .. } => receipts += 1,
             Record::History(h) => {
                 first_history_block.get_or_insert(h.block);
