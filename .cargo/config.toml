@@ -1,0 +1,20 @@
+# Linking the Stylus runtime on Linux hits a duplicate `__rust_probestack`.
+#
+# Nitro's Wasmer fork vendors its own copy of that intrinsic
+# (`wasmer/lib/vm/src/probestack/compiler_builtins.rs`, added upstream in wasmerio/wasmer#5690 to
+# fix an *undefined* symbol in some build configurations). Rust's own compiler_builtins defines it
+# as well, so a static link sees two definitions.
+#
+# GNU ld resolved that silently, which is why this never surfaced before. From the 1.97 toolchain
+# `rust-lld` is the default linker on x86_64-unknown-linux-gnu, and it treats a duplicate symbol as
+# an error. The two definitions are the same standard probestack implementation, so taking either
+# is correct.
+#
+# Note that setting the RUSTFLAGS environment variable makes Cargo ignore this file's rustflags
+# completely; CI therefore repeats the flag in its own RUSTFLAGS.
+#
+# Better fixes, neither of them local to this repository: gate the vendored probestack in
+# nitro-rust-runtime so it is only built where the intrinsic is actually missing, or get that gate
+# upstream into Wasmer.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]

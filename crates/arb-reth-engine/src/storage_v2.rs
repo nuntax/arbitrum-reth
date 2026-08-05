@@ -350,9 +350,7 @@ where
             (checkpoint.block_number, state_trie_tip)
         })
         .unwrap_or_default();
-    if (checkpoint_db_tip, checkpoint_state_trie_tip)
-        != (prev_db_tip, prev_partial_state_trie)
-    {
+    if (checkpoint_db_tip, checkpoint_state_trie_tip) != (prev_db_tip, prev_partial_state_trie) {
         return Err(eyre!(
             "persistence input frontiers ({prev_db_tip}, {prev_partial_state_trie}) do not match Finish checkpoint ({checkpoint_db_tip}, {checkpoint_state_trie_tip})"
         ));
@@ -476,7 +474,9 @@ fn collect_wipe_addresses(
 }
 
 fn block_has_storage_wipe(block: &ExecutedBlock<ArbPrimitives>) -> bool {
-    wiped_storage_addresses(block.execution_outcome()).next().is_some()
+    wiped_storage_addresses(block.execution_outcome())
+        .next()
+        .is_some()
 }
 
 fn wiped_storage_addresses<R>(
@@ -497,8 +497,7 @@ fn wiped_storage_addresses<R>(
 /// block reaches durable storage. The execution revert is the source of truth: it is only set when
 /// this transition actually wipes the account's complete storage.
 pub(crate) fn mark_live_hashed_storage_wipes(block: &mut BuiltPayloadExecutedBlock<ArbPrimitives>) {
-    let wiped_addresses = wiped_storage_addresses(&block.execution_output)
-        .collect::<HashSet<_>>();
+    let wiped_addresses = wiped_storage_addresses(&block.execution_output).collect::<HashSet<_>>();
     if wiped_addresses.is_empty() {
         return;
     }
@@ -514,8 +513,8 @@ pub(crate) fn mark_live_hashed_storage_wipes(block: &mut BuiltPayloadExecutedBlo
 }
 
 fn mark_hashed_storage_wipes(block: &mut ExecutedBlock<ArbPrimitives>) {
-    let wiped_addresses = wiped_storage_addresses(block.execution_outcome())
-        .collect::<HashSet<_>>();
+    let wiped_addresses =
+        wiped_storage_addresses(block.execution_outcome()).collect::<HashSet<_>>();
     if wiped_addresses.is_empty() {
         return;
     }
@@ -848,10 +847,14 @@ mod tests {
     #[test]
     fn storage_wipe_marks_an_empty_hashed_storage_update() {
         let address = address!("0000000000000000000000000000000000001234");
-        let mut revert = AccountRevert::default();
-        revert.wipe_storage = true;
-        let mut state = BundleState::default();
-        state.reverts = Reverts::new(vec![vec![(address, revert)]]);
+        let revert = AccountRevert {
+            wipe_storage: true,
+            ..Default::default()
+        };
+        let state = BundleState {
+            reverts: Reverts::new(vec![vec![(address, revert)]]),
+            ..Default::default()
+        };
         let mut block = executed_block(
             arb_header(1, B256::ZERO, B256::ZERO),
             state,
@@ -876,10 +879,14 @@ mod tests {
     #[test]
     fn live_storage_wipe_marks_payload_hashed_state_before_engine_handoff() {
         let address = address!("0000000000000000000000000000000000001234");
-        let mut revert = AccountRevert::default();
-        revert.wipe_storage = true;
-        let mut state = BundleState::default();
-        state.reverts = Reverts::new(vec![vec![(address, revert)]]);
+        let revert = AccountRevert {
+            wipe_storage: true,
+            ..Default::default()
+        };
+        let state = BundleState {
+            reverts: Reverts::new(vec![vec![(address, revert)]]),
+            ..Default::default()
+        };
         let hashed_state = HashedPostState::default();
         let trie_updates = TrieUpdates::default();
         let block = executed_block(
@@ -897,11 +904,10 @@ mod tests {
 
         mark_live_hashed_storage_wipes(&mut built);
 
-        let storage = built
-            .hashed_state
-            .storages
-            .get(&keccak256(address))
-            .expect("live wipe marker must exist even when the sparse converter omitted storage");
+        let storage =
+            built.hashed_state.storages.get(&keccak256(address)).expect(
+                "live wipe marker must exist even when the sparse converter omitted storage",
+            );
         assert!(storage.wiped);
         assert!(storage.storage.is_empty());
     }
@@ -941,7 +947,8 @@ mod tests {
 
     #[test]
     fn storage_v2_partial_frontier_masks_flushes_and_unwinds_a_wipe() -> eyre::Result<()> {
-        let factory = create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
+        let factory =
+            create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
         let genesis_hash = init_genesis_with_settings(&factory, StorageSettings::v2())?;
 
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1136,7 +1143,8 @@ mod tests {
 
     #[test]
     fn storage_v2_wipe_fails_closed_when_snapshot_preimage_is_missing() -> eyre::Result<()> {
-        let factory = create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
+        let factory =
+            create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
         let genesis_hash = init_genesis_with_settings(&factory, StorageSettings::v2())?;
 
         let address = address!("0000000000000000000000000000000000001234");
