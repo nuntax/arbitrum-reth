@@ -275,10 +275,14 @@ pub(crate) fn produce_with_timing<'a>(
         .get(builder.evm_mut().ctx_mut().journal_mut())
         .map_err(|e| eyre!("read L2 base fee for block env: {e}"))?;
     let block_base_fee = u64::try_from(block_base_fee).unwrap_or(u64::MAX);
-    builder
-        .evm_mut()
-        .ctx_mut()
-        .modify_block(|b| b.basefee = block_base_fee);
+    builder.evm_mut().ctx_mut().modify_block(|b| {
+        b.inner.basefee = block_base_fee;
+        b.base_fee_in_block = block_base_fee;
+    });
+    // Nitro's `BaseFeeInBlock`, kept equal to the base fee it shadows. `GasChargingHook` only reads
+    // it when the block env's base fee is zero, which cannot happen here, but leaving the two out of
+    // step would be a trap for anything that later does.
+    builder.evm_mut().ctx_mut().chain.base_fee_in_block = Some(block_base_fee);
 
     let execution_setup = phase_started_at.elapsed();
     let phase_started_at = Instant::now();
