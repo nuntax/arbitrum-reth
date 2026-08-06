@@ -114,6 +114,128 @@ pub struct SnapshotImportFullArgs {
     genesis_json: PathBuf,
 }
 
+/// Finish a datadir whose sections were imported but which never reached finalisation.
+#[derive(Debug, Parser)]
+#[command(
+    name = "arb-snapshot-finalize",
+    about = "Finish a converted datadir that stopped after its state root"
+)]
+pub struct SnapshotFinalizeArgs {
+    /// Datadir produced by an `import-full` run that did not complete.
+    #[arg(long, value_name = "DIR")]
+    datadir: PathBuf,
+
+    /// Nitro `chaininfo.json` for the chain the snapshot came from.
+    #[arg(long = "chain-info", value_name = "PATH")]
+    chain_info: PathBuf,
+
+    /// Nitro `genesis.json` for the same chain.
+    #[arg(long = "genesis", value_name = "PATH")]
+    genesis_json: PathBuf,
+}
+
+/// Finish a datadir that was imported up to its state root but never finalised.
+///
+/// The sections take most of an hour on a real chain and finalisation is the last and longest step,
+/// so making it re-runnable on its own is the difference between losing an afternoon and losing a
+/// few minutes. Everything it needs is recoverable from the datadir: the convert point is the
+/// highest header, its root and hash come from that header, and `S_lo` is where the changeset
+/// segments begin.
+pub fn finalize_datadir(args: SnapshotFinalizeArgs) -> eyre::Result<()> {
+    let manifest_path = args
+        .datadir
+        .join(super::snapshot::SNAPSHOT_IMPORT_MANIFEST_FILE);
+    if manifest_path.exists() {
+        return Err(eyre::eyre!(
+            "{} is already finished; its completion manifest is at {}",
+            args.datadir.display(),
+            manifest_path.display()
+        ));
+    }
+
+    let static_files_path = args.datadir.join("static_files");
+    let history_from = lowest_changeset_block(&static_files_path)?;
+
+    let chain_info = std::fs::read(&args.chain_info)
+        .map_err(|error| eyre::eyre!("read {}: {error}", args.chain_info.display()))?;
+    let genesis = std::fs::read(&args.genesis_json)
+        .map_err(|error| eyre::eyre!("read {}: {error}", args.genesis_json.display()))?;
+    let (chain_spec, _init, _info) = crate::orbit_chain_from_files(&chain_info, &genesis)?;
+
+    let factory = open_factory(
+        &args.datadir.join("db"),
+        &static_files_path,
+        &args.datadir.join("rocksdb"),
+        Arc::new(chain_spec),
+    )?;
+
+    // The convert point is wherever the blocks section stopped, and its header carries the root the
+    // trie was already checked against.
+    let provider = factory.provider()?;
+    let block = provider
+        .static_file_provider()
+        .get_highest_static_file_block(StaticFileSegment::Headers)
+        .ok_or_else(|| eyre::eyre!("no headers in {}", args.datadir.display()))?;
+    let head = reth_storage_api::HeaderProvider::sealed_header(&provider, block)?
+        .ok_or_else(|| eyre::eyre!("block {block} is missing its header"))?;
+    let manifest = Manifest {
+        block,
+        root: head.state_root,
+        state_id: 0,
+        hash: head.hash(),
+    };
+    drop(provider);
+
+    info!(
+        target: "arb-snapshot",
+        block,
+        root = %manifest.root,
+        history_from,
+        "finishing a datadir that stopped after its state root"
+    );
+
+    finalize(&factory, &manifest, history_from, &args.datadir)?;
+    println!(
+        "finished {} at block {block} root {:#x}",
+        args.datadir.display(),
+        manifest.root
+    );
+    Ok(())
+}
+
+/// `S_lo`, read from where the account-changeset segments begin.
+///
+/// reth resolves a segment's path from the block range in its name, and the import renames those
+/// files to agree with their headers, so the lowest name is the lowest block with history.
+fn lowest_changeset_block(static_files: &std::path::Path) -> eyre::Result<u64> {
+    const PREFIX: &str = "static_file_account-change-sets_";
+    let mut lowest: Option<u64> = None;
+    for entry in std::fs::read_dir(static_files)
+        .map_err(|error| eyre::eyre!("read {}: {error}", static_files.display()))?
+    {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        let Some(range) = name.strip_prefix(PREFIX) else {
+            continue;
+        };
+        // Skip the sidecars, which share the prefix but carry an extension.
+        if range.contains('.') {
+            continue;
+        }
+        let Some((start, _)) = range.split_once('_') else {
+            continue;
+        };
+        if let Ok(start) = start.parse::<u64>() {
+            lowest = Some(lowest.map_or(start, |current: u64| current.min(start)));
+        }
+    }
+    lowest.ok_or_else(|| {
+        eyre::eyre!(
+            "no account-changeset segments in {}; this datadir has no state history to finish",
+            static_files.display()
+        )
+    })
+}
+
 /// What a section wrote, for the run's summary and for cross-checking against the exporter's own
 /// counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1495,6 +1617,30 @@ mod tests {
             .end_section()
             .finish();
         (bytes, manifest)
+    }
+
+    /// `S_lo` has to come back out of the datadir for finalisation to be re-runnable on its own,
+    /// and the sidecars share the segment prefix, so they must not be mistaken for segments.
+    #[test]
+    fn reads_the_history_floor_back_from_the_changeset_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "static_file_account-change-sets_1_499999",
+            "static_file_account-change-sets_1_499999.conf",
+            "static_file_account-change-sets_1_499999.csoff",
+            "static_file_account-change-sets_500000_999999",
+            "static_file_storage-change-sets_1_499999",
+            "static_file_headers_0_499999",
+        ] {
+            std::fs::write(dir.path().join(name), []).unwrap();
+        }
+        assert_eq!(lowest_changeset_block(dir.path()).unwrap(), 1);
+
+        let empty = tempfile::tempdir().unwrap();
+        let error = lowest_changeset_block(empty.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no state history to finish"), "{error}");
     }
 
     /// Finalisation on top of a converted datadir: reth's own stages build the indices from what

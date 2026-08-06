@@ -134,7 +134,7 @@ type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 /// Number of preimages sorted and inserted in one auxiliary MDBX transaction.
 const PREIMAGE_BATCH_SIZE: usize = 250_000;
 
-const SNAPSHOT_IMPORT_MANIFEST_FILE: &str = "snapshot-import.json";
+pub(crate) const SNAPSHOT_IMPORT_MANIFEST_FILE: &str = "snapshot-import.json";
 const SNAPSHOT_IMPORT_MANIFEST_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]

@@ -24,7 +24,7 @@ use arb_reth_node::commands::{
         SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs,
         SnapshotRepairHistoryArgs,
     },
-    snapshot_full::SnapshotImportFullArgs,
+    snapshot_full::{SnapshotFinalizeArgs, SnapshotImportFullArgs},
 };
 use clap::{Args, Parser, Subcommand};
 use reth_cli_runner::CliRunner;
@@ -76,6 +76,8 @@ enum SnapshotSub {
     Import(SnapshotImportArgs),
     /// Convert a `reth-export --mode full-snapshot` stream into a reth datadir.
     ImportFull(SnapshotImportFullArgs),
+    /// Finish a converted datadir that stopped after its state root.
+    Finalize(SnapshotFinalizeArgs),
     /// Read hashed-state from a converted Arbitrum reth MDBX snapshot.
     Read(SnapshotReadArgs),
     /// Add missing history-boundary metadata to an existing snapshot import.
@@ -117,6 +119,7 @@ fn main() -> eyre::Result<()> {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
             SnapshotSub::Import(args) => commands::snapshot::import(args),
             SnapshotSub::ImportFull(args) => commands::snapshot_full::import_full(args),
+            SnapshotSub::Finalize(args) => commands::snapshot_full::finalize_datadir(args),
             SnapshotSub::Read(args) => commands::snapshot::read(args),
             SnapshotSub::RepairHistory(args) => commands::snapshot::repair_history(args),
         },
