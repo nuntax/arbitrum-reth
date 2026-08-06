@@ -183,8 +183,9 @@ fn build_arb_receipt<H>(
     receipt_envelope_for_type(tx_type, rwb)
 }
 
+/// Wraps a receipt body in the envelope variant its transaction type calls for.
 #[inline]
-fn receipt_envelope_for_type(
+pub fn receipt_envelope_for_type(
     tx_type: u8,
     rwb: ReceiptWithBloom<ArbReceipt<Log>>,
 ) -> ArbReceiptEnvelope<Log> {
