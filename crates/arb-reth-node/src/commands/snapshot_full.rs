@@ -24,13 +24,19 @@ use alloy_consensus::{
 };
 use alloy_primitives::B256;
 use alloy_rlp::Decodable;
-use arb_reth_genesis::snapshot_stream::{Manifest, Record, SnapshotStream};
+use arb_reth_genesis::snapshot_stream::{HistoryObject, Manifest, Record, SnapshotStream};
 use arbitrum_alloy_consensus::reth::ArbBlockBody;
 use clap::Parser;
 use reth_chainspec::ChainSpec;
 use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
-use reth_db_api::{database::Database, models::StorageSettings, tables, transaction::DbTxMut};
+use reth_db_api::{
+    database::Database,
+    models::{AccountBeforeTx, StorageBeforeTx, StorageSettings},
+    tables,
+    transaction::DbTxMut,
+};
 use reth_node_types::NodeTypesWithDBAdapter;
+use reth_primitives_traits::Account;
 use reth_provider::{
     BlockWriter, DBProvider, DatabaseProviderFactory, EitherWriter, MetadataWriter,
     ProviderFactory, StaticFileProviderFactory, StaticFileWriter, StorageSettingsCache,
@@ -68,6 +74,10 @@ const BLOCK_BATCH: usize = 4_000;
 /// Transactions accumulated before committing early, for chains whose blocks are much fuller than
 /// Arbitrum's average of roughly one transaction each.
 const TX_BATCH: usize = 50_000;
+
+/// Changeset entries (accounts plus slots) accumulated before a commit. Blocks are batched by
+/// entries rather than by count because a single block's diff can be very large.
+const CHANGESET_BATCH: usize = 250_000;
 
 /// Convert a full-snapshot stream into a reth datadir.
 #[derive(Debug, Parser)]
@@ -146,10 +156,33 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
         "blocks section imported"
     );
 
+    let history = write_history(&factory, &mut stream, &manifest)?;
+    info!(
+        target: "arb-snapshot",
+        objects = history.objects,
+        accounts = history.accounts,
+        slots = history.slots,
+        range = format!("{}..={}", history.first_block, history.last_block),
+        "state history imported"
+    );
+
+    if history.first_block < blocks.first_block {
+        return Err(eyre::eyre!(
+            "history starts at {} but blocks start at {}; there would be changesets for blocks the \
+             datadir has no header for",
+            history.first_block,
+            blocks.first_block
+        ));
+    }
+
+    drop(factory);
+    rename_changeset_files_to_header(&static_files_path)?;
+
     Err(eyre::eyre!(
-        "the history and state sections are not implemented yet; {} blocks were written but the \
-         datadir is incomplete and has no completion manifest, so it will not boot",
-        blocks.blocks
+        "the state section is not implemented yet; {} blocks and {} history objects were written \
+         but the datadir is incomplete and has no completion manifest, so it will not boot",
+        blocks.blocks,
+        history.objects
     ))
 }
 
@@ -380,7 +413,8 @@ fn flush_blocks<DB: SnapshotDb>(
             }
             *first = false;
         }
-        writer.commit()?;
+        // Not committed here: dropping the writer returns it to the pool, and `provider.commit()`
+        // finalizes static files before RocksDB and MDBX, which is the order reth recovers from.
     }
 
     for block in batch.iter() {
@@ -460,6 +494,218 @@ fn flush_blocks<DB: SnapshotDb>(
     Ok(())
 }
 
+/// What the history section wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistorySectionStats {
+    /// History objects, which is the number of blocks that actually changed state.
+    pub objects: u64,
+    /// Blocks given a changeset entry, including the empty ones for blocks that changed nothing.
+    pub blocks: u64,
+    pub accounts: u64,
+    pub slots: u64,
+    /// `S_lo`, the first block with history. Below it, historical state is unavailable.
+    pub first_block: u64,
+    pub last_block: u64,
+}
+
+/// Write the state-history section as reth changesets.
+///
+/// geth's reverse diffs and reth's changesets mean the same thing, the values from before the block,
+/// and this snapshot's history identifies both accounts and storage slots by raw key, so the mapping
+/// is direct.
+///
+/// A block that changed nothing produces no history object, but the changeset segments are indexed
+/// by `block - block_range.start()`, so every block from `S_lo` to `P` still needs an entry. Those
+/// blocks get an empty one, which is also what they mean (ADR-004 D1, S6).
+fn write_history<R: Read, DB: SnapshotDb>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+    stream: &mut SnapshotStream<R>,
+    manifest: &Manifest,
+) -> eyre::Result<HistorySectionStats> {
+    let mut stats = HistorySectionStats::default();
+    let mut batch: Vec<HistoryObject> = Vec::new();
+    let mut batch_entries = 0usize;
+    // The next block the changeset segments expect, so gaps can be filled across batches.
+    let mut cursor: Option<u64> = None;
+
+    loop {
+        match stream.next_record()? {
+            Some(Record::History(object)) => {
+                batch_entries += object
+                    .accounts
+                    .iter()
+                    .map(|a| 1 + a.storage.len())
+                    .sum::<usize>();
+                batch.push(object);
+                if batch_entries >= CHANGESET_BATCH {
+                    flush_history(factory, &mut batch, &mut cursor, &mut stats)?;
+                    batch_entries = 0;
+                }
+            }
+            other => {
+                flush_history(factory, &mut batch, &mut cursor, &mut stats)?;
+                if let Some(record) = other {
+                    stream.unread(record);
+                }
+                break;
+            }
+        }
+    }
+
+    if stats.objects == 0 {
+        return Err(eyre::eyre!("the stream's history section is empty"));
+    }
+    // The last object's post root is the state the state section is about to describe, and the
+    // reader has already checked the chain of roots that leads to it (ADR-004 S2, S3).
+    stream.check_history_meets_state()?;
+
+    // Nothing above `P` may carry a changeset, or an unwind would walk into a block whose state the
+    // datadir does not have.
+    if stats.last_block != manifest.block {
+        return Err(eyre::eyre!(
+            "history ends at {}, but the convert point is {}",
+            stats.last_block,
+            manifest.block
+        ));
+    }
+    Ok(stats)
+}
+
+fn flush_history<DB: SnapshotDb>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+    batch: &mut Vec<HistoryObject>,
+    cursor: &mut Option<u64>,
+    stats: &mut HistorySectionStats,
+) -> eyre::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let provider = factory.database_provider_rw()?;
+    let from_block = cursor.unwrap_or(batch[0].block);
+
+    if cursor.is_none() {
+        // The segments would otherwise start at their 500k file boundary, so the first block with
+        // history would be written at the wrong offset and every read after it shifted. The files
+        // are renamed to match once the import is done, since reth resolves their path from this.
+        stats.first_block = from_block;
+        let sfp = provider.static_file_provider();
+        for segment in [
+            StaticFileSegment::AccountChangeSets,
+            StaticFileSegment::StorageChangeSets,
+        ] {
+            sfp.get_writer(from_block, segment)?
+                .user_header_mut()
+                .set_expected_block_start(from_block);
+        }
+    }
+
+    let mut accounts_writer = EitherWriter::new_account_changesets(&provider, from_block)?;
+    let mut storage_writer = EitherWriter::new_storage_changesets(&provider, from_block)?;
+    let mut at = from_block;
+
+    for object in batch.iter() {
+        if object.block < at {
+            return Err(eyre::eyre!(
+                "history object at block {} is at or below the previous one ({})",
+                object.block,
+                at.saturating_sub(1)
+            ));
+        }
+        // Blocks between two objects changed no state, so their changeset is empty.
+        for empty in at..object.block {
+            accounts_writer.append_account_changeset(empty, Vec::new())?;
+            storage_writer.append_storage_changeset(empty, Vec::new())?;
+            stats.blocks += 1;
+        }
+
+        let mut accounts = Vec::with_capacity(object.accounts.len());
+        let mut slots = Vec::new();
+        for account in &object.accounts {
+            accounts.push(AccountBeforeTx {
+                address: account.address,
+                info: account
+                    .previous
+                    .map(|(nonce, balance, bytecode_hash)| Account {
+                        nonce,
+                        balance,
+                        bytecode_hash,
+                    }),
+            });
+            for (key, value) in &account.storage {
+                slots.push(StorageBeforeTx {
+                    address: account.address,
+                    key: *key,
+                    value: *value,
+                });
+            }
+        }
+        stats.accounts += accounts.len() as u64;
+        stats.slots += slots.len() as u64;
+        accounts_writer.append_account_changeset(object.block, accounts)?;
+        storage_writer.append_storage_changeset(object.block, slots)?;
+
+        stats.objects += 1;
+        stats.blocks += 1;
+        stats.last_block = object.block;
+        at = object.block + 1;
+    }
+
+    drop(accounts_writer);
+    drop(storage_writer);
+    *cursor = Some(at);
+    provider
+        .commit()
+        .map_err(|error| eyre::eyre!("commit history up to {}: {error}", at - 1))?;
+    batch.clear();
+    info!(
+        target: "arb-snapshot",
+        objects = stats.objects,
+        accounts = stats.accounts,
+        slots = stats.slots,
+        at = at - 1,
+        "wrote state history"
+    );
+    Ok(())
+}
+
+/// Rename changeset static files whose name disagrees with the expected range in their header.
+///
+/// reth resolves a segment file's path from that range, and the first changeset file's start was
+/// moved to `S_lo` after it was created in its fixed 500k slot, so its name is stale. Every other
+/// file already agrees; this checks them all rather than assuming which one moved.
+fn rename_changeset_files_to_header(static_files: &std::path::Path) -> eyre::Result<()> {
+    for segment in ["account-change-sets", "storage-change-sets"] {
+        let prefix = format!("static_file_{segment}_");
+        let names: Vec<String> = std::fs::read_dir(static_files)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&prefix) && !name.contains('.'))
+            .collect();
+
+        for name in names {
+            let conf = std::fs::read(static_files.join(format!("{name}.conf")))?;
+            if conf.len() < 24 {
+                continue;
+            }
+            let start = u64::from_le_bytes(conf[8..16].try_into().expect("8 bytes"));
+            let end = u64::from_le_bytes(conf[16..24].try_into().expect("8 bytes"));
+            let want = format!("static_file_{segment}_{start}_{end}");
+            if name == want {
+                continue;
+            }
+            for extension in ["", ".conf", ".off", ".csoff"] {
+                let from = static_files.join(format!("{name}{extension}"));
+                let to = static_files.join(format!("{want}{extension}"));
+                if from.exists() && from != to {
+                    std::fs::rename(&from, &to)?;
+                }
+            }
+            info!(target: "arb-snapshot", segment, from = %name, to = %want, "renamed changeset file to match its header");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom, TxEip1559};
@@ -468,15 +714,35 @@ mod tests {
         Bytes, Log, LogData, Signature, TxKind, U256, address, b256, logs_bloom,
     };
     use alloy_rlp::Encodable;
+    use arb_reth_genesis::snapshot_stream::{HistoryAccount, HistoryObject};
     use arb_reth_genesis::snapshot_stream::{Manifest, StreamBuilder};
     use arbitrum_alloy_consensus::{
         receipt::{ArbReceipt, ArbReceiptEnvelope},
         transactions::{ArbTxEnvelope, deposit::TxDeposit},
     };
     use reth_provider::test_utils::create_test_provider_factory_with_node_types;
-    use reth_storage_api::{ReceiptProvider, TransactionsProvider};
+    use reth_storage_api::{
+        ChangeSetReader, ReceiptProvider, StorageChangeSetReader, TransactionsProvider,
+    };
 
     use super::*;
+
+    /// A factory over a temporary MDBX, static files and RocksDB, in storage v2 like the import.
+    fn v2_factory() -> reth_provider::ProviderFactory<
+        NodeTypesWithDBAdapter<
+            ArbNode,
+            Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>,
+        >,
+    > {
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(spec());
+        factory.set_storage_settings_cache(StorageSettings::v2());
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .write_storage_settings(StorageSettings::v2())
+            .unwrap();
+        provider.commit().unwrap();
+        factory
+    }
 
     fn spec() -> Arc<ChainSpec> {
         use arb_revm::arbos_init::ArbosInitConfig;
@@ -741,6 +1007,237 @@ mod tests {
                 .is_empty(),
             "an empty block keeps an empty receipt list, not a missing one"
         );
+    }
+
+    const ACCOUNT_A: alloy_primitives::Address =
+        address!("00000000000000000000000000000000000000a1");
+    const ACCOUNT_B: alloy_primitives::Address =
+        address!("00000000000000000000000000000000000000b2");
+
+    /// Blocks 0..=4 with history at 2 and 4 only. That covers the three cases the writer has to get
+    /// right: history starting above the chain's first block, a block in between that changed
+    /// nothing, and history ending exactly at the convert point.
+    fn history_stream(root: B256) -> (Vec<u8>, Manifest, Vec<HistoryObject>) {
+        let mut builder = StreamBuilder::new(&Manifest {
+            block: 4,
+            root,
+            state_id: 5,
+            hash: B256::repeat_byte(0xaa),
+        })
+        .blocks();
+        let mut parent = B256::ZERO;
+        for number in 0..=4u64 {
+            let h = header(number, parent, &[], &[]);
+            parent = h.hash_slow();
+            builder = builder
+                .header(number, &alloy_rlp::encode(&h))
+                .body(number, &body_rlp(&[]));
+        }
+        let manifest = Manifest {
+            block: 4,
+            root,
+            state_id: 5,
+            hash: parent,
+        };
+
+        let objects = vec![
+            HistoryObject {
+                state_id: 3,
+                block: 2,
+                parent_root: B256::repeat_byte(0x11),
+                post_root: B256::repeat_byte(0x22),
+                accounts: vec![
+                    HistoryAccount {
+                        address: ACCOUNT_A,
+                        previous: Some((7, U256::from(1234u64), Some(B256::repeat_byte(0x9)))),
+                        storage: vec![
+                            (B256::repeat_byte(0x01), U256::from(5u64)),
+                            (B256::repeat_byte(0x02), U256::ZERO),
+                        ],
+                    },
+                    // Did not exist before this block.
+                    HistoryAccount {
+                        address: ACCOUNT_B,
+                        previous: None,
+                        storage: vec![],
+                    },
+                ],
+            },
+            HistoryObject {
+                state_id: 5,
+                block: 4,
+                parent_root: B256::repeat_byte(0x22),
+                post_root: root,
+                accounts: vec![HistoryAccount {
+                    address: ACCOUNT_B,
+                    previous: Some((1, U256::from(9u64), None)),
+                    storage: vec![(B256::repeat_byte(0x03), U256::from(77u64))],
+                }],
+            },
+        ];
+
+        let mut builder = builder.end_section().history_section();
+        for object in &objects {
+            builder = builder.history(object);
+        }
+        let bytes = builder.end_section().state().end_section().finish();
+        (bytes, manifest, objects)
+    }
+
+    #[test]
+    fn writes_state_history_as_changesets_reth_can_read() {
+        let factory = v2_factory();
+        let root = B256::repeat_byte(0xee);
+        let (bytes, manifest, objects) = history_stream(root);
+
+        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
+        write_blocks(&factory, &mut stream, &manifest).unwrap();
+        let stats = write_history(&factory, &mut stream, &manifest).unwrap();
+
+        assert_eq!(stats.objects, 2);
+        assert_eq!(stats.accounts, 3);
+        assert_eq!(stats.slots, 3);
+        // Blocks 2, 3 and 4 all get an entry; block 3 changed nothing so its entry is empty.
+        assert_eq!(stats.blocks, 3);
+        assert_eq!((stats.first_block, stats.last_block), (2, 4));
+
+        let provider = factory.provider().unwrap();
+
+        let changed = provider.account_block_changeset(2).unwrap();
+        assert_eq!(
+            changed,
+            vec![
+                AccountBeforeTx {
+                    address: ACCOUNT_A,
+                    info: Some(Account {
+                        nonce: 7,
+                        balance: U256::from(1234u64),
+                        bytecode_hash: Some(B256::repeat_byte(0x9)),
+                    }),
+                },
+                AccountBeforeTx {
+                    address: ACCOUNT_B,
+                    info: None,
+                },
+            ],
+            "pre-block values, with a missing account kept as missing"
+        );
+
+        let slots = provider.storage_changeset(2).unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].0.address(), ACCOUNT_A);
+        assert_eq!(slots[0].1.key, B256::repeat_byte(0x01));
+        assert_eq!(slots[0].1.value, U256::from(5u64));
+        // A slot that was zero before the block is still a change, and has to stay in the set.
+        assert_eq!(slots[1].1.key, B256::repeat_byte(0x02));
+        assert_eq!(slots[1].1.value, U256::ZERO);
+
+        assert!(
+            provider.account_block_changeset(3).unwrap().is_empty(),
+            "a block that changed nothing has an empty changeset, not a missing one"
+        );
+        assert!(provider.storage_changeset(3).unwrap().is_empty());
+
+        assert_eq!(
+            provider.account_block_changeset(4).unwrap(),
+            vec![AccountBeforeTx {
+                address: ACCOUNT_B,
+                info: Some(Account {
+                    nonce: 1,
+                    balance: U256::from(9u64),
+                    bytecode_hash: None,
+                }),
+            }]
+        );
+        assert_eq!(objects[1].post_root, root);
+    }
+
+    /// The first changeset file is created in its fixed 500k slot and then has its expected start
+    /// moved to `S_lo`, so its name no longer matches the range reth resolves paths from. Until it
+    /// is renamed, a freshly opened provider cannot find it at all.
+    #[test]
+    fn renaming_makes_the_changeset_files_findable_by_a_fresh_provider() {
+        let factory = v2_factory();
+        let root = B256::repeat_byte(0xee);
+        let (bytes, manifest, _) = history_stream(root);
+
+        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
+        write_blocks(&factory, &mut stream, &manifest).unwrap();
+        write_history(&factory, &mut stream, &manifest).unwrap();
+
+        let directory = factory.static_file_provider().directory().to_path_buf();
+        let names = |dir: &std::path::Path| -> Vec<String> {
+            let mut found: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("static_file_account-change-sets_") && !n.contains('.'))
+                .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(
+            names(&directory),
+            vec!["static_file_account-change-sets_0_499999".to_string()],
+            "created in the fixed slot, while its header now expects to start at 2"
+        );
+
+        rename_changeset_files_to_header(&directory).unwrap();
+        assert_eq!(
+            names(&directory),
+            vec!["static_file_account-change-sets_2_499999".to_string()],
+        );
+
+        // A provider that has just opened the directory reads the changesets back at the right
+        // blocks, which is the case the running node is in.
+        let reopened =
+            StaticFileProvider::<<ArbNode as reth_node_types::NodeTypes>::Primitives>::read_only(
+                &directory,
+            )
+            .unwrap();
+        assert_eq!(reopened.account_block_changeset(2).unwrap().len(), 2);
+        assert!(reopened.account_block_changeset(3).unwrap().is_empty());
+        assert_eq!(reopened.account_block_changeset(4).unwrap().len(), 1);
+    }
+
+    /// History has to reach the convert point, or the datadir would claim to unwind to a block
+    /// whose state it cannot reconstruct.
+    #[test]
+    fn rejects_history_that_stops_below_the_convert_point() {
+        let factory = v2_factory();
+        let root = B256::repeat_byte(0xee);
+        let (_, manifest, _) = history_stream(root);
+
+        let mut builder = StreamBuilder::new(&manifest).blocks();
+        let mut parent = B256::ZERO;
+        for number in 0..=4u64 {
+            let h = header(number, parent, &[], &[]);
+            parent = h.hash_slow();
+            builder = builder
+                .header(number, &alloy_rlp::encode(&h))
+                .body(number, &body_rlp(&[]));
+        }
+        let bytes = builder
+            .end_section()
+            .history_section()
+            .history(&HistoryObject {
+                state_id: 3,
+                block: 2,
+                parent_root: B256::repeat_byte(0x11),
+                post_root: root,
+                accounts: vec![],
+            })
+            .end_section()
+            .state()
+            .end_section()
+            .finish();
+
+        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
+        write_blocks(&factory, &mut stream, &manifest).unwrap();
+        let error = write_history(&factory, &mut stream, &manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("history ends at block 2"), "{error}");
     }
 
     /// The transactions root is recomputed from the decoded transactions, so a body that does not
