@@ -6,9 +6,10 @@
 
 use std::fmt::Debug;
 
-use alloy_consensus::{Receipt, ReceiptWithBloom};
-use alloy_primitives::Log;
+use alloy_consensus::{Header, Receipt, ReceiptWithBloom};
+use alloy_primitives::{B256, Log};
 use alloy_rpc_types_eth::Log as RpcLog;
+use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use arbitrum_alloy_consensus::{ArbReceipt, ArbReceiptEnvelope, ArbTxEnvelope};
 use arbitrum_alloy_network::Arbitrum;
 use arbitrum_alloy_rpc_types::ArbTransactionReceipt;
@@ -17,6 +18,7 @@ use reth_node_api::NodePrimitives;
 use reth_primitives_traits::SealedBlock;
 use reth_rpc_convert::{RpcConverter, transaction::{ConvertReceiptInput, ReceiptConverter}};
 use reth_rpc_eth_types::{EthApiError, receipt::build_receipt};
+use reth_storage_api::HeaderProvider;
 
 /// Converts `ArbReceiptEnvelope<Log>` primitives into [`ArbTransactionReceipt`] RPC responses.
 ///
@@ -24,9 +26,8 @@ use reth_rpc_eth_types::{EthApiError, receipt::build_receipt};
 /// by the block executor, so no L1-fee hardfork math is needed here.
 #[derive(Debug, Clone)]
 pub struct ArbReceiptConverter<Provider> {
-    // reth's RPC builder constructs the converter with a provider, but Arbitrum stores
-    // gas_used_for_l1 on the receipt at execution time, so it is never read here.
-    #[allow(dead_code)]
+    // Read for `l1BlockNumber`: gas_used_for_l1 is on the receipt, but the L1 block number is only
+    // in the header, so the block has to be looked up.
     provider: Provider,
 }
 
@@ -37,13 +38,30 @@ impl<Provider> ArbReceiptConverter<Provider> {
     }
 }
 
+impl<Provider: HeaderProvider<Header = Header>> ArbReceiptConverter<Provider> {
+    /// The L1 block number a block observed, which Nitro reports on every receipt.
+    ///
+    /// It is not on the receipt: Nitro encodes it in the header (`extra_data` + `mix_hash`), so
+    /// read the header back. `None` for a block we cannot find or one that is not an Arbitrum
+    /// block, matching how the rest of the converter degrades.
+    fn l1_block_number(&self, block_hash: B256) -> Result<Option<u64>, EthApiError> {
+        let Some(header) = self.provider.header(block_hash)? else {
+            return Ok(None);
+        };
+        Ok(ArbHeaderInfo::decode_header(&header)
+            .ok()
+            .filter(ArbHeaderInfo::is_arbitrum)
+            .map(|info| info.l1_block_number))
+    }
+}
+
 impl<Provider, N> ReceiptConverter<N> for ArbReceiptConverter<Provider>
 where
     N: NodePrimitives<
         Receipt = ArbReceiptEnvelope<Log>,
         SignedTx = ArbTxEnvelope,
     >,
-    Provider: Debug + Clone + 'static,
+    Provider: HeaderProvider<Header = Header> + Debug + Clone + 'static,
 {
     type RpcReceipt = ArbTransactionReceipt;
     type Error = EthApiError;
@@ -52,7 +70,24 @@ where
         &self,
         inputs: Vec<ConvertReceiptInput<'_, N>>,
     ) -> Result<Vec<Self::RpcReceipt>, Self::Error> {
-        inputs.into_iter().map(build_arb_receipt).collect()
+        // Every receipt in one call comes from the same block in practice (eth_getBlockReceipts),
+        // so memoize the header lookup on the block hash rather than repeating it per receipt.
+        let mut memo: Option<(B256, Option<u64>)> = None;
+        inputs
+            .into_iter()
+            .map(|input| {
+                let block_hash = input.meta.block_hash;
+                let l1_block_number = match memo {
+                    Some((hash, l1)) if hash == block_hash => l1,
+                    _ => {
+                        let l1 = self.l1_block_number(block_hash)?;
+                        memo = Some((block_hash, l1));
+                        l1
+                    }
+                };
+                build_arb_receipt(input, l1_block_number)
+            })
+            .collect()
     }
 
     fn convert_receipts_with_block(
@@ -159,6 +194,7 @@ fn map_arb_receipt_envelope(
 /// Builds a single [`ArbTransactionReceipt`] from a [`ConvertReceiptInput`].
 fn build_arb_receipt<N>(
     input: ConvertReceiptInput<'_, N>,
+    l1_block_number: Option<u64>,
 ) -> Result<ArbTransactionReceipt, EthApiError>
 where
     N: NodePrimitives<Receipt = ArbReceiptEnvelope<Log>>,
@@ -183,9 +219,7 @@ where
     Ok(ArbTransactionReceipt {
         inner: core,
         gas_used_for_l1: gas_cell.get(),
-        // l1_block_number is not available at receipt-conversion time without reading
-        // block extra_data; it gets populated from block metadata elsewhere.
-        l1_block_number: None,
+        l1_block_number,
         timeboosted: None,
     })
 }
