@@ -15,7 +15,7 @@
 //! (typed internal tx `0x6a`), built via `arb_revm`'s [`DefaultArbExecutionHooks`].
 
 use crate::tx::ArbTx;
-use crate::{ArbEvm, ArbEvmFactory};
+use crate::{ArbEvm, ArbEvmContext, ArbEvmFactory};
 use alloc::vec::Vec;
 use alloy_consensus::{
     Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Eip658Value, Header, Receipt, ReceiptWithBloom,
@@ -30,7 +30,6 @@ use alloy_evm::{
     },
 };
 use alloy_primitives::{Address, B64, B256, Bytes, Log, U256, logs_bloom};
-use arb_revm::api::default_ctx::ArbContext;
 use arb_revm::constants::{BATCH_POSTER_ADDRESS, HISTORY_STORAGE_ADDRESS};
 use arb_revm::executor::hooks::{
     ArbExecutionHooks, ArbStartBlockDerived, DefaultArbExecutionHooks,
@@ -311,7 +310,7 @@ fn sample_transaction_metrics(tx_type: u8) -> bool {
 impl<DB, I, H> BlockExecutor for ArbBlockExecutor<ArbEvm<DB, I>, H>
 where
     DB: Database + DatabaseCommit + StateDB,
-    I: Inspector<ArbContext<DB>>,
+    I: Inspector<ArbEvmContext<DB>>,
     H: ArbExecutionHooks,
 {
     type Transaction = ArbTxEnvelope;
@@ -493,7 +492,7 @@ impl<E, H> ArbBlockExecutor<E, H> {
 impl<DB, I, H> ArbBlockExecutor<ArbEvm<DB, I>, H>
 where
     DB: Database + DatabaseCommit + StateDB,
-    I: Inspector<ArbContext<DB>>,
+    I: Inspector<ArbEvmContext<DB>>,
     H: ArbExecutionHooks,
 {
     /// Builds Nitro's `InternalTxStartBlock` (0x6a) for this block: the first transaction of every
@@ -575,7 +574,7 @@ where
     ) -> Self::Executor<'a, DB, I>
     where
         DB: StateDB,
-        I: Inspector<ArbContext<DB>>,
+        I: Inspector<ArbEvmContext<DB>>,
     {
         // Thread the L1 block number into the chain context so `NUMBER` (overridden by `arb_revm`
         // to read `chain().l1_block_number`) returns the correct value. Populated from `ArbHeaderInfo`

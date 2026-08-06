@@ -1,6 +1,6 @@
 //! RPC compatibility impls for `arb-reth-evm` types (gated behind the `rpc` feature).
 //!
-//! - `TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest`: satisfies the
+//! - `TryIntoTxEnv<ArbTx, ArbSpecId, ArbBlockEnv> for ArbTransactionRequest`: satisfies the
 //!   `TxEnvConverter<ArbTransactionRequest, ArbEvmConfig>` blanket.
 //! - `BuildPendingEnv<Header> for ArbNextBlockEnvAttributes`: satisfies the
 //!   `PendingEnvBuilder<ArbEvmConfig>` blanket so `EthApiBuilder::build()` compiles.
@@ -9,17 +9,16 @@ use alloy_evm::rpc::{EthTxEnvError, TryIntoTxEnv};
 use arb_revm::ArbTransaction;
 use arbitrum_alloy_rpc_types::ArbTransactionRequest;
 
-use crate::{ArbNextBlockEnvAttributes, ArbTx};
+use crate::{ArbBlockEnv, ArbNextBlockEnvAttributes, ArbTx};
 
 use arb_revm::ArbSpecId;
-use revm::context::BlockEnv;
 
-impl TryIntoTxEnv<ArbTx, ArbSpecId, BlockEnv> for ArbTransactionRequest {
+impl TryIntoTxEnv<ArbTx, ArbSpecId, ArbBlockEnv> for ArbTransactionRequest {
     type Err = EthTxEnvError;
 
     fn try_into_tx_env(
         self,
-        evm_env: &alloy_evm::EvmEnv<ArbSpecId, BlockEnv>,
+        evm_env: &alloy_evm::EvmEnv<ArbSpecId, ArbBlockEnv>,
     ) -> Result<ArbTx, EthTxEnvError> {
         let tx_env: revm::context::TxEnv = self.inner.try_into_tx_env(evm_env)?;
         // No retry_meta for RPC sim; encoded_2718 not needed.

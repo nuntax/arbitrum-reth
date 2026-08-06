@@ -3,6 +3,7 @@
 //! with `arb_revm` running the same tx directly (gas_used matches, balances update).
 
 use super::{ArbEvm, ArbEvmFactory, ArbTx};
+use crate::ArbBlockEnv;
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
 use arb_revm::api::default_ctx::ArbContext;
 use arb_revm::{ArbBuilder, ArbChainContext, ArbSpecId, ArbTransaction};
@@ -89,7 +90,7 @@ fn arb_evm_factory_transact_matches_arb_revm() {
 
     // Bridge path: build the EVM as reth would, then transact_raw an ArbTx.
     let db = funded_db();
-    let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
+    let evm_env = EvmEnv::new(cfg(), ArbBlockEnv::default());
     let mut evm: ArbEvm<_, _> = ArbEvmFactory.create_evm(db, evm_env);
 
     let out = evm
@@ -200,7 +201,7 @@ fn arbos_precompile_through_precompiles_map_matches_oracle() {
         .expect("oracle precompile call");
 
     // Bridge: ArbEvmFactory (node ArbPrecompilesMap provider path).
-    let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
+    let evm_env = EvmEnv::new(cfg(), ArbBlockEnv::default());
     let mut bridge_evm = ArbEvmFactory.create_evm(seed_db(), evm_env);
     let bridge = bridge_evm
         .transact_raw(ArbTx(call_tx()))
@@ -242,7 +243,7 @@ fn create_evm_with_inspector_runs_inspecting_path() {
     use revm::inspector::NoOpInspector;
 
     let db = funded_db();
-    let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
+    let evm_env = EvmEnv::new(cfg(), ArbBlockEnv::default());
     let mut evm = ArbEvmFactory.create_evm_with_inspector(db, evm_env, NoOpInspector {});
 
     let out = evm

@@ -9,7 +9,7 @@
 //! precompiles).
 //!
 //! Mirrors `alloy-op-evm`'s `OpEvm`/`OpEvmFactory`. `arb_revm` already exposes its EVM as a revm
-//! [`ExecuteEvm`]/[`InspectEvm`] impl over a concrete [`ArbContext`], so this crate is a thin
+//! [`ExecuteEvm`]/[`InspectEvm`] impl over a concrete [`ArbEvmContext`], so this crate is a thin
 //! adapter that owns the inner EVM and reconciles the result with the alloy-evm [`Evm`] trait.
 //!
 //! The `BlockExecutor`/`BlockAssembler` (block module) and `ConfigureEvm` (config module) build on
@@ -36,6 +36,9 @@ pub use block::{
 pub mod config;
 pub use config::{ARB_ONE_CHAIN_ID, ArbEvmConfig, ArbEvmConfigError, ArbNextBlockEnvAttributes};
 
+pub mod env;
+pub use env::{ArbBlockEnv, ArbEvmContext};
+
 /// RPC compatibility impls (TryIntoTxEnv for ArbTransactionRequest → ArbTx).
 #[cfg(feature = "rpc")]
 pub mod rpc;
@@ -43,11 +46,10 @@ pub mod rpc;
 use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory, IntoTxEnv};
 use alloy_primitives::{Address, Bytes};
-use arb_revm::api::default_ctx::ArbContext;
 use arb_revm::{ArbBuilder, ArbChainContext, ArbTransaction};
 use core::fmt::Debug;
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction, ResultAndState};
-use revm::context::{BlockEnv, CfgEnv, Context, DBErrorMarker, TxEnv};
+use revm::context::{CfgEnv, Context, DBErrorMarker, TxEnv};
 use revm::handler::instructions::EthInstructions;
 use revm::inspector::NoOpInspector;
 use revm::interpreter::interpreter::EthInterpreter;
@@ -55,12 +57,12 @@ use revm::{ExecuteEvm, InspectEvm, Inspector, MainContext, SystemCallEvm};
 
 use arb_revm::ArbSpecId;
 
-/// The `arb_revm` EVM type this owns: the ArbOS EVM over [`ArbContext<DB>`] with the Arbitrum
+/// The `arb_revm` EVM type this owns: the ArbOS EVM over [`ArbEvmContext<DB>`] with the Arbitrum
 /// precompile set.
 type ArbRethEvm<DB, I> = arb_revm::ArbEvm<
-    ArbContext<DB>,
+    ArbEvmContext<DB>,
     I,
-    EthInstructions<EthInterpreter, ArbContext<DB>>,
+    EthInstructions<EthInterpreter, ArbEvmContext<DB>>,
     ArbPrecompilesMap,
 >;
 
@@ -92,12 +94,12 @@ impl<DB: Database, I> ArbEvm<DB, I> {
     }
 
     /// Reference to the inner Arbitrum execution context.
-    pub fn ctx(&self) -> &ArbContext<DB> {
+    pub fn ctx(&self) -> &ArbEvmContext<DB> {
         &self.inner.0.ctx
     }
 
     /// Mutable reference to the inner Arbitrum execution context.
-    pub fn ctx_mut(&mut self) -> &mut ArbContext<DB> {
+    pub fn ctx_mut(&mut self) -> &mut ArbEvmContext<DB> {
         &mut self.inner.0.ctx
     }
 }
@@ -105,18 +107,18 @@ impl<DB: Database, I> ArbEvm<DB, I> {
 impl<DB, I> Evm for ArbEvm<DB, I>
 where
     DB: Database,
-    I: Inspector<ArbContext<DB>, EthInterpreter>,
+    I: Inspector<ArbEvmContext<DB>, EthInterpreter>,
 {
     type DB = DB;
     type Tx = ArbTx;
     type Error = ArbEvmError<DB::Error>;
     type HaltReason = HaltReason;
     type Spec = ArbSpecId;
-    type BlockEnv = BlockEnv;
+    type BlockEnv = ArbBlockEnv;
     type Precompiles = PrecompilesMap;
     type Inspector = I;
 
-    fn block(&self) -> &BlockEnv {
+    fn block(&self) -> &ArbBlockEnv {
         &self.inner.0.ctx.block
     }
 
@@ -190,15 +192,20 @@ where
 pub struct ArbEvmFactory;
 
 impl ArbEvmFactory {
-    /// Builds an [`ArbContext`] for the given database and EVM environment.
+    /// Builds an [`ArbEvmContext`] for the given database and EVM environment.
     ///
-    /// The [`ArbChainContext`] is defaulted here. Block-scoped inputs not representable in alloy's
-    /// [`EvmEnv`] (notably the L1 block number read by `NUMBER`) are populated from `ArbHeaderInfo`
-    /// by `ConfigureEvm`. A default chain context suffices for a bare transact (a value transfer
-    /// never reads `NUMBER`).
-    fn build_ctx<DB: Database>(db: DB, evm_env: EvmEnv<ArbSpecId, BlockEnv>) -> ArbContext<DB> {
+    /// Seeds [`ArbChainContext::l1_block_number`] (the value `arb_revm`'s `NUMBER` override reads)
+    /// from the block env, so every path that builds an EVM from an [`EvmEnv`] alone gets it: the
+    /// RPC simulation path (`eth_call`, `eth_estimateGas`, `debug_traceCall`) never goes through
+    /// the block executor, which sets it separately from `ArbBlockExecutionCtx`.
+    fn build_ctx<DB: Database>(
+        db: DB,
+        evm_env: EvmEnv<ArbSpecId, ArbBlockEnv>,
+    ) -> ArbEvmContext<DB> {
+        let chain =
+            ArbChainContext::default().with_l1_block_number(evm_env.block_env.l1_block_number);
         Context::mainnet()
-            .with_chain(ArbChainContext::default())
+            .with_chain(chain)
             .with_db(db)
             .with_block(evm_env.block_env)
             .with_cfg(evm_env.cfg_env)
@@ -208,23 +215,23 @@ impl ArbEvmFactory {
 
 impl EvmFactory for ArbEvmFactory {
     type Evm<DB: Database, I: Inspector<Self::Context<DB>>> = ArbEvm<DB, I>;
-    type Context<DB: Database> = ArbContext<DB>;
+    type Context<DB: Database> = ArbEvmContext<DB>;
     type Tx = ArbTx;
     type Error<DBError: core::error::Error + Send + Sync + 'static + DBErrorMarker> =
         ArbEvmError<DBError>;
     type HaltReason = HaltReason;
     type Spec = ArbSpecId;
-    type BlockEnv = BlockEnv;
+    type BlockEnv = ArbBlockEnv;
     type Precompiles = PrecompilesMap;
 
     fn create_evm<DB: Database>(
         &self,
         db: DB,
-        evm_env: EvmEnv<ArbSpecId, BlockEnv>,
+        evm_env: EvmEnv<ArbSpecId, ArbBlockEnv>,
     ) -> Self::Evm<DB, NoOpInspector> {
         // `create_evm` must return `Evm<DB, NoOpInspector>`, so pass an explicit `NoOpInspector`
         // rather than the `()` default of `build_arb`. Swap in the ArbOS precompile provider
-        // (dispatches ArbOS addresses with the full `ArbContext`; exposes a `PrecompilesMap` to
+        // (dispatches ArbOS addresses with the full `ArbEvmContext`; exposes a `PrecompilesMap` to
         // satisfy `ConfigureEvm`).
         let spec = evm_env.cfg_env.spec;
         let inner = Self::build_ctx(db, evm_env)
@@ -236,7 +243,7 @@ impl EvmFactory for ArbEvmFactory {
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
         &self,
         db: DB,
-        evm_env: EvmEnv<ArbSpecId, BlockEnv>,
+        evm_env: EvmEnv<ArbSpecId, ArbBlockEnv>,
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let spec = evm_env.cfg_env.spec;

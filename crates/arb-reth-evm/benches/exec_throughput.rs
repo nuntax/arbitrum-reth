@@ -12,7 +12,7 @@
 use alloy_consensus::transaction::Recovered;
 use alloy_evm::EvmFactory;
 use alloy_evm::block::{BlockExecutor, BlockExecutorFactory};
-use arb_reth_evm::ArbEvmFactory;
+use arb_reth_evm::{ArbBlockEnv, ArbEvmFactory};
 use arb_reth_evm::block::{ArbBlockExecutionCtx, ArbBlockExecutorFactory};
 use arb_revm::ArbSpecId;
 use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
@@ -78,7 +78,7 @@ fn transfer_train(n: u64) -> Vec<ArbTxEnvelope> {
         .collect()
 }
 
-fn evm_env() -> alloy_evm::EvmEnv<ArbSpecId> {
+fn evm_env() -> alloy_evm::EvmEnv<ArbSpecId, ArbBlockEnv> {
     let next_timestamp = L1_TIMESTAMP.max(PARENT_TIMESTAMP);
     let block = BlockEnv {
         number: U256::from(PARENT_NUMBER + 1),
@@ -96,7 +96,7 @@ fn evm_env() -> alloy_evm::EvmEnv<ArbSpecId> {
         .with_disable_priority_fee_check(true);
     cfg_env.disable_balance_check = false;
     cfg_env.disable_eip7623 = true;
-    alloy_evm::EvmEnv::new(cfg_env, block)
+    alloy_evm::EvmEnv::new(cfg_env, ArbBlockEnv::new(block, 0))
 }
 
 fn block_ctx() -> ArbBlockExecutionCtx {

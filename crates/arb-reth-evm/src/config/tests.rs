@@ -182,6 +182,48 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
     assert_ne!(returned, U256::ZERO, "must not be the defaulted 0");
 }
 
+/// The simulation path (`eth_call` / `eth_estimateGas` / `debug_traceCall`) builds its EVM from
+/// `evm_env(header)` alone, with no block executor to thread `ArbBlockExecutionCtx` through. It must
+/// still see the header's L1 block number, since `NUMBER` is what a called contract reads.
+#[test]
+fn simulation_through_evm_env_alone_reads_l1_block_number_for_number_opcode() {
+    use crate::ArbTx;
+    use arb_revm::ArbTransaction;
+    use revm::context::TxEnv;
+
+    let config = ArbEvmConfig::arbitrum_one();
+    let header = arb_header();
+
+    let mut state = State::builder()
+        .with_database(funded_db())
+        .with_bundle_update()
+        .build();
+    let mut evm = ArbEvmFactory.create_evm(&mut state, config.evm_env(&header));
+
+    let result = evm
+        .transact_raw(ArbTx(ArbTransaction::new(TxEnv {
+            tx_type: 2,
+            caller: SENDER,
+            gas_limit: 200_000,
+            gas_price: 0,
+            kind: TxKind::Call(NUMBER_READER),
+            value: U256::ZERO,
+            nonce: 0,
+            chain_id: Some(CHAIN_ID),
+            ..TxEnv::default()
+        })))
+        .expect("NUMBER-reader call executes")
+        .result;
+
+    assert!(result.is_success(), "call must succeed: {result:?}");
+    let returned = U256::from_be_slice(result.output().expect("RETURN output"));
+    assert_eq!(
+        returned,
+        U256::from(L1_BLOCK_NUMBER),
+        "NUMBER must return the header's L1 block number in the simulation path, got {returned}"
+    );
+}
+
 /// A whole block executes through reth's generic high-level executor
 /// (`ConfigureEvm::executor(db).execute(&RecoveredBlock)`), proving `impl ConfigureEvm` plugs into
 /// reth's block-execution machinery end-to-end, driven entirely from the header.
