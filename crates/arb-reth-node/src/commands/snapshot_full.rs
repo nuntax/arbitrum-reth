@@ -44,8 +44,14 @@ use reth_provider::{
     ProviderFactory, StaticFileProviderFactory, StaticFileWriter, StorageSettingsCache,
     providers::{RocksDBProvider, StaticFileProvider},
 };
+use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
+use reth_stages::stages::{
+    IndexAccountHistoryStage, IndexStorageHistoryStage, SenderRecoveryStage, TransactionLookupStage,
+};
+use reth_stages_api::{ExecInput, Stage};
+use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
-use reth_storage_api::BlockBodyIndicesProvider;
+use reth_storage_api::{BlockBodyIndicesProvider, StageCheckpointWriter};
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
 
@@ -198,17 +204,170 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
     }
     info!(target: "arb-snapshot", %root, "state root matches the convert point");
 
-    drop(factory);
+    // The changeset files have to carry their real names before anything reads them back, and the
+    // index stages below do exactly that.
+    factory.static_file_provider().commit()?;
     rename_changeset_files_to_header(&static_files_path)?;
 
-    Err(eyre::eyre!(
-        "the datadir is not finished: stage checkpoints, history indices and the completion \
-         manifest are still to come, so it will not boot ({} blocks, {} history objects, {} \
-         accounts)",
+    finalize(&factory, &manifest, history.first_block, &args.out)?;
+
+    println!(
+        "converted {} blocks ({} transactions, {} receipts), {} history objects, {} accounts at \
+         block {} root {root:#x}",
         blocks.blocks,
+        blocks.transactions,
+        blocks.receipts,
         history.objects,
-        state.accounts
-    ))
+        state.accounts,
+        manifest.block,
+    );
+    Ok(())
+}
+
+/// Everything the datadir needs beyond the data itself: the indices reth derives from what was
+/// imported, the checkpoints that say how far it is synced, the boundary below which historical
+/// state is unavailable, and the manifest that marks the conversion complete.
+///
+/// The indices are built by running reth's own stages rather than by hand. They read exactly the
+/// changesets, bodies and transactions just written, so what they produce is what a forward sync
+/// would have produced, which is the property the whole conversion is trying to hold.
+fn finalize<DB: SnapshotDb>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+    manifest: &Manifest,
+    history_from: u64,
+    out: &std::path::Path,
+) -> eyre::Result<()> {
+    run_stage(
+        factory,
+        SenderRecoveryStage::default(),
+        manifest.block,
+        "sender recovery",
+    )?;
+    run_stage(
+        factory,
+        TransactionLookupStage::default(),
+        manifest.block,
+        "transaction lookup",
+    )?;
+    run_stage(
+        factory,
+        IndexAccountHistoryStage::default(),
+        manifest.block,
+        "account history index",
+    )?;
+    run_stage(
+        factory,
+        IndexStorageHistoryStage::default(),
+        manifest.block,
+        "storage history index",
+    )?;
+
+    let provider = factory.database_provider_rw()?;
+
+    // Read the convert point's header back rather than carrying it here, which also proves the
+    // blocks section actually landed it.
+    let head = reth_storage_api::HeaderProvider::sealed_header(&provider, manifest.block)?
+        .ok_or_else(|| eyre::eyre!("block {} has no header after the import", manifest.block))?;
+    if head.hash() != manifest.hash {
+        return Err(eyre::eyre!(
+            "block {} hashes to {:#x}, but the manifest says {:#x}",
+            manifest.block,
+            head.hash(),
+            manifest.hash
+        ));
+    }
+
+    // Stages must all name the convert point, since reth treats the database as synced only as far
+    // as the lowest of them.
+    let checkpoint = StageCheckpoint::new(manifest.block);
+    for stage in StageId::ALL {
+        provider.save_stage_checkpoint(stage, checkpoint)?;
+    }
+
+    write_history_boundary(&provider, history_from)?;
+    provider
+        .commit()
+        .map_err(|error| eyre::eyre!("commit finalisation: {error}"))?;
+
+    // Last, and only once everything above held. Without it the node refuses to boot, so a run that
+    // dies anywhere earlier leaves a datadir that cannot be mistaken for a finished one.
+    super::snapshot::write_snapshot_import_manifest(
+        out,
+        &(manifest.block, head.hash(), head.header().clone()),
+    )?;
+    Ok(())
+}
+
+/// Drive one of reth's stages to completion over `[.., target]`.
+///
+/// A stage may return before reaching the target when it has done a batch's worth of work, so it is
+/// re-entered from its own checkpoint until it reports done.
+fn run_stage<DB, S>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+    mut stage: S,
+    target: u64,
+    what: &str,
+) -> eyre::Result<()>
+where
+    DB: SnapshotDb,
+    S: Stage<
+        reth_provider::DatabaseProvider<
+            <DB as Database>::TXMut,
+            NodeTypesWithDBAdapter<ArbNode, DB>,
+        >,
+    >,
+{
+    let started = std::time::Instant::now();
+    let mut checkpoint = None;
+    loop {
+        let provider = factory.database_provider_rw()?;
+        let output = stage
+            .execute(
+                &provider,
+                ExecInput {
+                    target: Some(target),
+                    checkpoint,
+                },
+            )
+            .map_err(|error| eyre::eyre!("{what}: {error}"))?;
+        provider
+            .commit()
+            .map_err(|error| eyre::eyre!("{what}: commit: {error}"))?;
+
+        checkpoint = Some(output.checkpoint);
+        if output.done {
+            break;
+        }
+        info!(target: "arb-snapshot", stage = what, at = output.checkpoint.block_number, "building index");
+    }
+    info!(target: "arb-snapshot", stage = what, elapsed = ?started.elapsed(), "index built");
+    Ok(())
+}
+
+/// Record that historical state below `history_from` is unavailable, and nothing else.
+///
+/// The converted datadir has changesets from `S_lo` upward, so a historical lookup below it has no
+/// answer. Marking the missing prefix pruned makes reth fall back rather than infer, for example
+/// reading an imported account as one first created after the snapshot. The existing head-state
+/// importer marks everything below its head, which for a full conversion would be a lie about the
+/// history that is actually present (ADR-004 D4).
+fn write_history_boundary(
+    provider: &impl reth_storage_api::PruneCheckpointWriter,
+    history_from: u64,
+) -> eyre::Result<()> {
+    let Some(last_missing) = history_from.checked_sub(1) else {
+        // History reaches the first block, so nothing is missing.
+        return Ok(());
+    };
+    let checkpoint = PruneCheckpoint {
+        block_number: Some(last_missing),
+        tx_number: None,
+        prune_mode: PruneMode::before_inclusive(last_missing),
+    };
+    for segment in [PruneSegment::AccountHistory, PruneSegment::StorageHistory] {
+        provider.save_prune_checkpoint(segment, checkpoint)?;
+    }
+    Ok(())
 }
 
 fn open_factory(
@@ -869,7 +1028,8 @@ mod tests {
     use reth_db_api::transaction::DbTx;
     use reth_provider::test_utils::create_test_provider_factory_with_node_types;
     use reth_storage_api::{
-        ChangeSetReader, ReceiptProvider, StorageChangeSetReader, TransactionsProvider,
+        ChangeSetReader, PruneCheckpointReader, ReceiptProvider, StageCheckpointReader,
+        StorageChangeSetReader, TransactionsProvider,
     };
 
     use super::*;
@@ -1331,10 +1491,88 @@ mod tests {
             .storage(keccak256(B256::repeat_byte(0x01)), U256::from(5u64))
             // A zero slot is absent from the trie, so it must not reach the database.
             .storage(keccak256(B256::repeat_byte(0x02)), U256::ZERO)
-            .account(keccak256(ACCOUNT_B), 1, U256::from(9u64), None)
+            .account(keccak256(ACCOUNT_B), 3, U256::from(42u64), None)
             .end_section()
             .finish();
         (bytes, manifest)
+    }
+
+    /// Finalisation on top of a converted datadir: reth's own stages build the indices from what
+    /// was imported, the checkpoints say how far it is synced, and the boundary says how far back
+    /// history goes.
+    #[test]
+    fn finalisation_builds_the_indices_and_marks_the_history_boundary() {
+        let factory = v2_factory();
+        let root = B256::repeat_byte(0xee);
+        let (bytes, manifest) = full_stream(root);
+        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
+        write_blocks(&factory, &mut stream, &manifest).unwrap();
+        let history = write_history(&factory, &mut stream, &manifest).unwrap();
+        write_state(&factory, &mut stream).unwrap();
+
+        factory.static_file_provider().commit().unwrap();
+        rename_changeset_files_to_header(factory.static_file_provider().directory()).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        finalize(&factory, &manifest, history.first_block, out.path()).unwrap();
+
+        let provider = factory.provider().unwrap();
+
+        // Every stage names the convert point, or reth reads the database as synced to the lowest.
+        for stage in StageId::ALL {
+            assert_eq!(
+                provider
+                    .get_stage_checkpoint(stage)
+                    .unwrap()
+                    .map(|c| c.block_number),
+                Some(manifest.block),
+                "{stage} checkpoint"
+            );
+        }
+
+        // History starts at S_lo = 2, so blocks 0 and 1 are the unavailable prefix and nothing else.
+        for segment in [PruneSegment::AccountHistory, PruneSegment::StorageHistory] {
+            assert_eq!(
+                provider
+                    .get_prune_checkpoint(segment)
+                    .unwrap()
+                    .and_then(|c| c.block_number),
+                Some(history.first_block - 1),
+                "{segment:?} boundary"
+            );
+        }
+
+        drop(provider);
+
+        // The query the whole feature exists for, and the one the head-state importer cannot
+        // answer: account B's balance as of block 3, which only the changesets know. The head
+        // state holds different values, so a lookup that quietly fell through to it would fail
+        // here rather than pass by coincidence.
+        use reth_storage_api::AccountReader;
+        let historical = factory.history_by_block_number(3).unwrap();
+        let before = historical
+            .basic_account(&ACCOUNT_B)
+            .unwrap()
+            .expect("account B at block 3");
+        assert_eq!(
+            (before.nonce, before.balance),
+            (1, U256::from(9u64)),
+            "pre-block-4 values, taken from the changeset"
+        );
+
+        let latest = factory.latest().unwrap();
+        let head = latest
+            .basic_account(&ACCOUNT_B)
+            .unwrap()
+            .expect("account B at head");
+        assert_eq!(
+            (head.nonce, head.balance),
+            (3, U256::from(42u64)),
+            "head state, taken from the state section"
+        );
+
+        // The completion manifest is written last and only on success.
+        assert!(out.path().join("snapshot-import.json").is_file());
     }
 
     /// The whole conversion, end to end: every section written, then the trie built over the

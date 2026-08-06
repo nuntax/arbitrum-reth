@@ -556,7 +556,7 @@ fn validate_snapshot_identity(
     Ok(SnapshotPreimagePolicy::CanonicalGenesisRequired)
 }
 
-fn write_snapshot_import_manifest(
+pub(crate) fn write_snapshot_import_manifest(
     out: &Path,
     head: &(u64, B256, Header),
 ) -> eyre::Result<()> {
