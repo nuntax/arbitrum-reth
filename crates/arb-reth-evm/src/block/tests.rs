@@ -6,7 +6,7 @@
 //! `ArbBlockExecutorFactory` -> `ArbBlockExecutor`.
 
 use super::*;
-use crate::ArbEvmFactory;
+use crate::{ArbBlockEnv, ArbEvmFactory};
 use alloy_consensus::transaction::Recovered;
 use alloy_evm::{EvmEnv, EvmFactory};
 use arb_revm::executor::{
@@ -127,7 +127,7 @@ fn oracle_poster_gas_per_tx() -> Vec<u64> {
     let ctx: ArbContext<&mut _> = Context::mainnet()
         .with_chain(ArbChainContext::default())
         .with_db(&mut db)
-        .with_block(env.block_env.clone())
+        .with_block(env.block_env.inner.clone())
         .with_cfg(env.cfg_env.clone())
         .with_tx(ArbTransaction::<TxEnv>::default());
     let mut evm = ctx.build_arb();
@@ -172,7 +172,7 @@ fn oracle() -> (arb_revm::executor::ArbExecOutcome, CacheDB<EmptyDB>) {
 }
 
 /// EVM env matching what `execute_message` builds for a fresh db at ArbOS v51.
-fn evm_env() -> EvmEnv<ArbSpecId> {
+fn evm_env() -> EvmEnv<ArbSpecId, ArbBlockEnv> {
     let next_timestamp = L1_TIMESTAMP.max(PARENT_TIMESTAMP);
     let mut block = BlockEnv::default();
     block.number = U256::from(PARENT_NUMBER + 1);
@@ -190,7 +190,7 @@ fn evm_env() -> EvmEnv<ArbSpecId> {
     cfg_env.disable_balance_check = false;
     cfg_env.disable_eip7623 = true;
 
-    EvmEnv::new(cfg_env, block)
+    EvmEnv::new(cfg_env, ArbBlockEnv::new(block, 0))
 }
 
 /// Block-execution context derived from the same message.

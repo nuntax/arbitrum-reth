@@ -182,6 +182,80 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
     assert_ne!(returned, U256::ZERO, "must not be the defaulted 0");
 }
 
+/// The simulation path (`eth_call` / `eth_estimateGas` / `debug_traceCall`) builds its EVM from
+/// `evm_env(header)` alone, with no block executor to thread `ArbBlockExecutionCtx` through. It must
+/// still see the header's L1 block number, since `NUMBER` is what a called contract reads.
+#[test]
+fn simulation_through_evm_env_alone_reads_l1_block_number_for_number_opcode() {
+    use crate::ArbTx;
+    use arb_revm::ArbTransaction;
+    use revm::context::TxEnv;
+
+    let config = ArbEvmConfig::arbitrum_one();
+    let header = arb_header();
+
+    let mut state = State::builder()
+        .with_database(funded_db())
+        .with_bundle_update()
+        .build();
+    let mut evm = ArbEvmFactory.create_evm(&mut state, config.evm_env(&header));
+
+    let result = evm
+        .transact_raw(ArbTx(ArbTransaction::new(TxEnv {
+            tx_type: 2,
+            caller: SENDER,
+            gas_limit: 200_000,
+            gas_price: 0,
+            kind: TxKind::Call(NUMBER_READER),
+            value: U256::ZERO,
+            nonce: 0,
+            chain_id: Some(CHAIN_ID),
+            ..TxEnv::default()
+        })))
+        .expect("NUMBER-reader call executes")
+        .result;
+
+    assert!(result.is_success(), "call must succeed: {result:?}");
+    let returned = U256::from_be_slice(result.output().expect("RETURN output"));
+    assert_eq!(
+        returned,
+        U256::from(L1_BLOCK_NUMBER),
+        "NUMBER must return the header's L1 block number in the simulation path, got {returned}"
+    );
+}
+
+/// For a call that names no gas price, reth lowers the block env's base fee to zero (geth's
+/// `NoBaseFee`), reaching through `BlockEnvironment::inner_mut`. ArbOS still has to price L1
+/// calldata at the real fee, so the real one must survive into `ArbChainContext::base_fee_in_block`
+/// (Nitro's `BlockContext.BaseFeeInBlock`).
+#[test]
+fn zeroing_the_block_base_fee_keeps_the_real_one_for_l1_pricing() {
+    use alloy_evm::env::BlockEnvironment;
+
+    const BASE_FEE: u64 = 100_000_000;
+
+    let config = ArbEvmConfig::arbitrum_one();
+    let header = Header {
+        base_fee_per_gas: Some(BASE_FEE),
+        ..arb_header()
+    };
+
+    let mut evm_env = config.evm_env(&header);
+    assert_eq!(evm_env.block_env.basefee, BASE_FEE);
+    assert_eq!(evm_env.block_env.base_fee_in_block, BASE_FEE);
+
+    // What reth's `prepare_call_env` does.
+    evm_env.block_env.inner_mut().basefee = 0;
+
+    let evm = ArbEvmFactory.create_evm(CacheDB::new(EmptyDB::default()), evm_env);
+    assert_eq!(evm.ctx().block.basefee, 0);
+    assert_eq!(
+        evm.ctx().chain.base_fee_in_block,
+        Some(BASE_FEE),
+        "the real base fee must reach the chain context for ArbOS L1 pricing"
+    );
+}
+
 /// A whole block executes through reth's generic high-level executor
 /// (`ConfigureEvm::executor(db).execute(&RecoveredBlock)`), proving `impl ConfigureEvm` plugs into
 /// reth's block-execution machinery end-to-end, driven entirely from the header.

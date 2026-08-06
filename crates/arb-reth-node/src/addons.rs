@@ -35,6 +35,8 @@ where
     >,
     EthApi<N, ArbRpcConverter<N::Provider>>:
         FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
+    // The receipt converter reads `l1BlockNumber` back out of the block header.
+    N::Provider: reth_storage_api::HeaderProvider<Header = alloy_consensus::Header>,
 {
     type EthApi = EthApi<N, ArbRpcConverter<N::Provider>>;
 

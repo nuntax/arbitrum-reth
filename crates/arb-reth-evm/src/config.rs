@@ -26,10 +26,10 @@
 //! [`ConfigureEvm`] impl is at the bottom of this file; per-header logic lives in the inherent
 //! methods below, which the trait methods delegate to.
 
-use crate::ArbEvmFactory;
 use crate::block::{
     ArbBlockAssembler, ArbBlockExecutionCtx, ArbBlockExecutorFactory, ArbBlockFinishTiming,
 };
+use crate::{ArbBlockEnv, ArbEvmFactory};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::EvmEnv;
@@ -196,7 +196,8 @@ impl ArbEvmConfig {
         gas_limit: u64,
         basefee: u64,
         difficulty: U256,
-    ) -> EvmEnv<ArbSpecId, BlockEnv> {
+        l1_block_number: u64,
+    ) -> EvmEnv<ArbSpecId, ArbBlockEnv> {
         let mut block = BlockEnv::default();
         block.number = U256::from(number);
         block.beneficiary = beneficiary;
@@ -209,7 +210,9 @@ impl ArbEvmConfig {
         // opcode returns the difficulty, NOT the mixHash. The mixHash carries ArbOS metadata
         // (send_count / l1_block_number / arbos_version) and must never be exposed via 0x44.
         block.prevrandao = Some(B256::from(difficulty.to_be_bytes::<32>()));
-        EvmEnv::new(self.cfg_env(spec), block)
+        // `NUMBER` returns the L1 block number, which revm's `BlockEnv` cannot hold; `ArbBlockEnv`
+        // carries it so it reaches the EVM on every path built from an `EvmEnv` (see `env.rs`).
+        EvmEnv::new(self.cfg_env(spec), ArbBlockEnv::new(block, l1_block_number))
     }
 }
 
@@ -254,7 +257,7 @@ impl ArbEvmConfig {
     ///
     /// The [`ArbSpecId`] is taken from the ArbOS version embedded in the header
     /// (`extra_data` + `mix_hash`, via [`ArbHeaderInfo`]).
-    pub fn evm_env(&self, header: &Header) -> EvmEnv<ArbSpecId, BlockEnv> {
+    pub fn evm_env(&self, header: &Header) -> EvmEnv<ArbSpecId, ArbBlockEnv> {
         let spec = spec_for_header(header);
         self.build_evm_env(
             spec,
@@ -264,6 +267,7 @@ impl ArbEvmConfig {
             header.gas_limit(),
             header.base_fee_per_gas().unwrap_or_default(),
             header.difficulty(),
+            l1_block_number_for_header(header),
         )
     }
 
@@ -273,7 +277,7 @@ impl ArbEvmConfig {
         &self,
         parent: &Header,
         attributes: &ArbNextBlockEnvAttributes,
-    ) -> EvmEnv<ArbSpecId, BlockEnv> {
+    ) -> EvmEnv<ArbSpecId, ArbBlockEnv> {
         let spec = ArbSpecId::from_arbos_version(attributes.arbos_format_version);
         self.build_evm_env(
             spec,
@@ -286,6 +290,7 @@ impl ArbEvmConfig {
             // from this (geth Context.Random = BigToHash(difficulty)), so the DIFFICULTY/PREVRANDAO
             // (0x44) opcode returns 1 on every spec, pre- and post-Merge.
             U256::from(1u64),
+            attributes.l1_block_number,
         )
     }
 
@@ -360,7 +365,7 @@ impl ConfigureEvm for ArbEvmConfig {
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnv<ArbSpecId, BlockEnv>, Self::Error> {
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<ArbSpecId, ArbBlockEnv>, Self::Error> {
         Ok(self.evm_env(header))
     }
 
@@ -368,7 +373,7 @@ impl ConfigureEvm for ArbEvmConfig {
         &self,
         parent: &Header,
         attributes: &ArbNextBlockEnvAttributes,
-    ) -> Result<EvmEnv<ArbSpecId, BlockEnv>, Self::Error> {
+    ) -> Result<EvmEnv<ArbSpecId, ArbBlockEnv>, Self::Error> {
         Ok(self.next_evm_env(parent, attributes))
     }
 
