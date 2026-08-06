@@ -197,13 +197,16 @@ impl ArbEvmFactory {
     /// Seeds [`ArbChainContext::l1_block_number`] (the value `arb_revm`'s `NUMBER` override reads)
     /// from the block env, so every path that builds an EVM from an [`EvmEnv`] alone gets it: the
     /// RPC simulation path (`eth_call`, `eth_estimateGas`, `debug_traceCall`) never goes through
-    /// the block executor, which sets it separately from `ArbBlockExecutionCtx`.
+    /// the block executor, which sets it separately from `ArbBlockExecutionCtx`. The block's real
+    /// base fee rides along for ArbOS L1 pricing, since reth zeroes the block env's own copy for
+    /// calls that name no gas price.
     fn build_ctx<DB: Database>(
         db: DB,
         evm_env: EvmEnv<ArbSpecId, ArbBlockEnv>,
     ) -> ArbEvmContext<DB> {
-        let chain =
-            ArbChainContext::default().with_l1_block_number(evm_env.block_env.l1_block_number);
+        let chain = ArbChainContext::default()
+            .with_l1_block_number(evm_env.block_env.l1_block_number)
+            .with_base_fee_in_block(evm_env.block_env.base_fee_in_block);
         Context::mainnet()
             .with_chain(chain)
             .with_db(db)

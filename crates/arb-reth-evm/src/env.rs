@@ -14,6 +14,11 @@
 //! context from it. alloy-evm supports wrapper block envs through
 //! [`BlockEnvironment`], so reth's generic RPC code (block overrides and friends) still reaches the
 //! inner [`BlockEnv`].
+//!
+//! [`ArbBlockEnv::base_fee_in_block`] rides along for the same reason, but points the other way:
+//! reth *does* reach the inner block env, and lowers its base fee to zero for a call that names no
+//! fee (geth's rule). ArbOS still has to price L1 calldata at the real fee, so the real one is kept
+//! here where reth's `inner_mut()` cannot reach it.
 
 use alloy_evm::env::BlockEnvironment;
 use alloy_primitives::{Address, B256, U256};
@@ -38,14 +43,24 @@ pub struct ArbBlockEnv {
     /// seeded from here when the EVM is built; ArbOS's start-block internal transaction then
     /// refreshes it from ArbOS state, which is authoritative for the rest of the block.
     pub l1_block_number: u64,
+    /// The block's real base fee (Nitro `BlockContext.BaseFeeInBlock`).
+    ///
+    /// Equal to `inner.basefee` as built, but reth lowers `inner.basefee` to zero for `eth_call`
+    /// and `debug_traceCall` when the request names no gas price, and ArbOS must keep pricing L1
+    /// calldata at the real fee. `ArbEvmFactory::build_ctx` carries this into
+    /// `ArbChainContext::base_fee_in_block`.
+    pub base_fee_in_block: u64,
 }
 
 impl ArbBlockEnv {
-    /// Wraps a [`BlockEnv`] together with the block's L1 block number.
+    /// Wraps a [`BlockEnv`] together with the block's L1 block number, taking the block's real
+    /// base fee from the block env as built.
     pub const fn new(inner: BlockEnv, l1_block_number: u64) -> Self {
+        let base_fee_in_block = inner.basefee;
         Self {
             inner,
             l1_block_number,
+            base_fee_in_block,
         }
     }
 }
