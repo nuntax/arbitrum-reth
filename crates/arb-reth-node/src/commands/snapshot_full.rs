@@ -1147,7 +1147,7 @@ fn write_state<R: Read, DB: SnapshotDb>(
 /// reth resolves a segment file's path from that range, and the first changeset file's start was
 /// moved to `S_lo` after it was created in its fixed 500k slot, so its name is stale. Every other
 /// file already agrees; this checks them all rather than assuming which one moved.
-fn rename_changeset_files_to_header(static_files: &std::path::Path) -> eyre::Result<()> {
+pub(crate) fn rename_changeset_files_to_header(static_files: &std::path::Path) -> eyre::Result<()> {
     for segment in ["account-change-sets", "storage-change-sets"] {
         let prefix = format!("static_file_{segment}_");
         let names: Vec<String> = std::fs::read_dir(static_files)?

@@ -732,40 +732,12 @@ pub fn repair_history(args: SnapshotRepairHistoryArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Rename the changeset static-file segments so their on-disk name matches the `expected_block_range`
-/// recorded in their header. The import creates them in the fixed 500k slot (e.g. `_22000000_…`) and
-/// then `set_expected_block_start(head)` shifts the header's expected start to `head`; reth resolves
-/// the file path from the header's expected range, so the name must agree or reads miss the file.
-/// Idempotent: only renames when the name doesn't already match the header.
-fn rename_changeset_files_to_header(static_files: &std::path::Path) -> eyre::Result<()> {
-    for seg in ["account-change-sets", "storage-change-sets"] {
-        let prefix = format!("static_file_{seg}_");
-        let data_name = std::fs::read_dir(static_files)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .find(|n| n.starts_with(&prefix) && !n.contains('.'));
-        let Some(data_name) = data_name else { continue };
-        let conf = std::fs::read(static_files.join(format!("{data_name}.conf")))?;
-        if conf.len() < 24 {
-            continue;
-        }
-        let exp_start = u64::from_le_bytes(conf[8..16].try_into().unwrap());
-        let exp_end = u64::from_le_bytes(conf[16..24].try_into().unwrap());
-        let want = format!("static_file_{seg}_{exp_start}_{exp_end}");
-        if data_name == want {
-            continue; // already matches header
-        }
-        for ext in ["", ".conf", ".off", ".csoff"] {
-            let src = static_files.join(format!("{data_name}{ext}"));
-            let dst = static_files.join(format!("{want}{ext}"));
-            if src.exists() && src != dst {
-                std::fs::rename(&src, &dst)?;
-            }
-        }
-        tracing::info!(seg, from = %data_name, to = %want, "renamed changeset file to match header expected range");
-    }
-    Ok(())
-}
+/// Rename the changeset static-file segments so their on-disk name matches the
+/// `expected_block_range` recorded in their header, which is what reth resolves their path from.
+///
+/// Shared with the full-snapshot importer, which hit the same hazard over ~55 files per segment
+/// rather than one. That implementation checks every file, so it covers this caller too.
+use super::snapshot_full::rename_changeset_files_to_header;
 
 /// Arbitrum One chain id.
 const ARB_ONE_CHAIN_ID: u64 = 42161;
