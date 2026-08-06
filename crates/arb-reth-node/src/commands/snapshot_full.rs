@@ -7,9 +7,8 @@
 //! `arb-kb/decisions/ADR-004-snapshot-conversion-invariants.md`; the checks below name the ones they
 //! enforce.
 //!
-//! Nothing here writes the completion manifest, so an interrupted or failed run leaves a datadir the
-//! node refuses to boot. That is deliberate: a partial conversion that boots would answer historical
-//! queries with silence rather than an error.
+//! The completion manifest is written last and only on success, so an interrupted run leaves a
+//! datadir the node refuses to boot rather than one that answers historical queries with silence.
 
 use std::{
     collections::HashSet,
@@ -136,11 +135,9 @@ pub struct SnapshotFinalizeArgs {
 
 /// Finish a datadir that was imported up to its state root but never finalised.
 ///
-/// The sections take most of an hour on a real chain and finalisation is the last and longest step,
-/// so making it re-runnable on its own is the difference between losing an afternoon and losing a
-/// few minutes. Everything it needs is recoverable from the datadir: the convert point is the
-/// highest header, its root and hash come from that header, and `S_lo` is where the changeset
-/// segments begin.
+/// Separately runnable so a failure in the last step does not force a re-import. Everything it
+/// needs comes back out of the datadir: the convert point is the highest header, its root and hash
+/// come from that header, and `S_lo` is where the changeset segments begin.
 pub fn finalize_datadir(args: SnapshotFinalizeArgs) -> eyre::Result<()> {
     let manifest_path = args
         .datadir
@@ -351,9 +348,8 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
 /// imported, the checkpoints that say how far it is synced, the boundary below which historical
 /// state is unavailable, and the manifest that marks the conversion complete.
 ///
-/// The indices are built by running reth's own stages rather than by hand. They read exactly the
-/// changesets, bodies and transactions just written, so what they produce is what a forward sync
-/// would have produced, which is the property the whole conversion is trying to hold.
+/// The indices are built by running reth's own stages rather than by hand, so they read exactly the
+/// changesets, bodies and transactions just written and produce what a forward sync would have.
 fn finalize<DB: SnapshotDb>(
     factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
     manifest: &Manifest,
@@ -471,10 +467,9 @@ where
 
 /// Give the node its L1-derivation cursor, so it does not re-derive from batch 0.
 ///
-/// Nothing in the L2 state says where derivation left off, so without this the node falls back to
-/// re-deriving the whole chain: on Robinhood that was 685,718 parent-chain blocks of `getLogs` and
-/// blob fetches, every result discarded, before a single new block. The exporter reads the answer
-/// out of the snapshot's own `arbitrumdata` and carries it in the manifest.
+/// Nothing in L2 state records where derivation left off, so without this the node re-derives from
+/// batch 0: the chain's whole parent-chain range fetched and discarded before one new block. The
+/// exporter reads the answer out of the snapshot's `arbitrumdata` and carries it in the manifest.
 fn write_resume_log(manifest: &Manifest, out: &std::path::Path) -> eyre::Result<()> {
     let Some(resume) = manifest.resume else {
         info!(

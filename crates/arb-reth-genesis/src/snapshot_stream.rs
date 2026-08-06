@@ -13,9 +13,8 @@ use std::io::Read;
 use alloy_primitives::{B256, U256, keccak256};
 use eyre::{Context as _, eyre};
 
-// Bumped when the manifest gained the resume point. An older stream would otherwise parse its first
-// section tag as the resume-present flag and desynchronise silently, which is the one failure mode
-// worth spending a magic byte to avoid.
+// Bumped when the manifest gained the resume point: an older stream would parse its first section
+// tag as the resume-present flag and desynchronise silently rather than fail.
 const MAGIC: &[u8; 8] = b"ARBSNAP2";
 
 // Section tags live above the record tags on purpose. They shared a range in the first draft, which

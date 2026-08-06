@@ -57,8 +57,8 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 pub enum L1SyncError {
     /// An execution RPC or beacon request failed. `detail` is the provider's message with any URL
     /// redacted, because HTTP client errors carry credential-bearing endpoint URLs and these end up
-    /// in logs. Without it a quota-exhausted endpoint and a malformed response are indistinguishable,
-    /// which has cost real debugging time.
+    /// in logs. Without it a quota-exhausted endpoint and a malformed response are
+    /// indistinguishable.
     Provider {
         operation: &'static str,
         detail: String,

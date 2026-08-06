@@ -735,8 +735,7 @@ pub fn repair_history(args: SnapshotRepairHistoryArgs) -> eyre::Result<()> {
 /// Rename the changeset static-file segments so their on-disk name matches the
 /// `expected_block_range` recorded in their header, which is what reth resolves their path from.
 ///
-/// Shared with the full-snapshot importer, which hit the same hazard over ~55 files per segment
-/// rather than one. That implementation checks every file, so it covers this caller too.
+/// Shared with the full-snapshot importer; it checks every segment file, not just the first.
 use super::snapshot_full::rename_changeset_files_to_header;
 
 /// Arbitrum One chain id.
@@ -804,9 +803,7 @@ fn parse_header_record(
             .next()
             .ok_or_else(|| eyre::eyre!("{tag}: missing number at line {line_number}"))?
             .parse()
-            .map_err(|error| {
-                eyre::eyre!("{tag}: bad number at line {line_number}: {error}")
-            })?;
+            .map_err(|error| eyre::eyre!("{tag}: bad number at line {line_number}: {error}"))?;
         let encoded = hex::decode(
             parts
                 .next()
@@ -1721,11 +1718,8 @@ mod tests {
     fn snapshot_identity_binds_export_header_and_state_root() {
         let head = canonical_test_head();
         assert_eq!(
-            validate_snapshot_identity(
-                arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT,
-                &head,
-            )
-            .unwrap(),
+            validate_snapshot_identity(arb_reth_genesis::arbitrum_one::GENESIS_STATE_ROOT, &head,)
+                .unwrap(),
             SnapshotPreimagePolicy::CanonicalGenesisRequired
         );
 
