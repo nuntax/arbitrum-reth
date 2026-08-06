@@ -12,6 +12,7 @@
 //! queries with silence rather than an error.
 
 use std::{
+    collections::HashSet,
     fs::File,
     io::{BufReader, Read},
     path::PathBuf,
@@ -30,13 +31,14 @@ use clap::Parser;
 use reth_chainspec::ChainSpec;
 use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments};
 use reth_db_api::{
+    cursor::DbCursorRW,
     database::Database,
     models::{AccountBeforeTx, StorageBeforeTx, StorageSettings},
     tables,
     transaction::DbTxMut,
 };
 use reth_node_types::NodeTypesWithDBAdapter;
-use reth_primitives_traits::Account;
+use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_provider::{
     BlockWriter, DBProvider, DatabaseProviderFactory, EitherWriter, MetadataWriter,
     ProviderFactory, StaticFileProviderFactory, StaticFileWriter, StorageSettingsCache,
@@ -78,6 +80,9 @@ const TX_BATCH: usize = 50_000;
 /// Changeset entries (accounts plus slots) accumulated before a commit. Blocks are batched by
 /// entries rather than by count because a single block's diff can be very large.
 const CHANGESET_BATCH: usize = 250_000;
+
+/// Hashed-state writes accumulated before a commit, to bound dirty-page growth.
+const STATE_COMMIT_THRESHOLD: usize = 250_000;
 
 /// Convert a full-snapshot stream into a reth datadir.
 #[derive(Debug, Parser)]
@@ -175,14 +180,34 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
         ));
     }
 
+    let state = write_state(&factory, &mut stream)?;
+    info!(
+        target: "arb-snapshot",
+        accounts = state.accounts,
+        slots = state.slots,
+        bytecodes = state.bytecodes,
+        "state imported; building the trie"
+    );
+
+    let root = super::snapshot::compute_state_root_chunked(&factory)?;
+    if root != manifest.root {
+        return Err(eyre::eyre!(
+            "state root is {root:#x}, but the snapshot converted at {:#x}",
+            manifest.root
+        ));
+    }
+    info!(target: "arb-snapshot", %root, "state root matches the convert point");
+
     drop(factory);
     rename_changeset_files_to_header(&static_files_path)?;
 
     Err(eyre::eyre!(
-        "the state section is not implemented yet; {} blocks and {} history objects were written \
-         but the datadir is incomplete and has no completion manifest, so it will not boot",
+        "the datadir is not finished: stage checkpoints, history indices and the completion \
+         manifest are still to come, so it will not boot ({} blocks, {} history objects, {} \
+         accounts)",
         blocks.blocks,
-        history.objects
+        history.objects,
+        state.accounts
     ))
 }
 
@@ -668,6 +693,127 @@ fn flush_history<DB: SnapshotDb>(
     Ok(())
 }
 
+/// What the state section wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateSectionStats {
+    pub accounts: u64,
+    pub slots: u64,
+    pub bytecodes: u64,
+}
+
+/// Write the state at the convert point into the hashed-state tables.
+///
+/// The keys are already hashed, because a pruned snapshot has no preimage for them. Storage v2
+/// treats the hashed tables as canonical, which is why this is enough to serve current state; the
+/// trie is then built over it and its root checked against the manifest (ADR-004 P2).
+fn write_state<R: Read, DB: SnapshotDb>(
+    factory: &ProviderFactory<NodeTypesWithDBAdapter<ArbNode, DB>>,
+    stream: &mut SnapshotStream<R>,
+) -> eyre::Result<StateSectionStats> {
+    let mut stats = StateSectionStats::default();
+    let mut provider = factory.database_provider_rw()?;
+    let mut written = 0usize;
+    // Storage records belong to the account that most recently went past. A code record can sit
+    // between an account and its slots, so it must not disturb this.
+    let mut account: Option<B256> = None;
+    // Every code hash an account referenced, against every code blob the stream carried.
+    let mut wanted: HashSet<B256> = HashSet::new();
+    let mut provided: HashSet<B256> = HashSet::new();
+
+    loop {
+        if written >= STATE_COMMIT_THRESHOLD {
+            provider
+                .commit()
+                .map_err(|error| eyre::eyre!("commit state: {error}"))?;
+            provider = factory.database_provider_rw()?;
+            written = 0;
+            info!(
+                target: "arb-snapshot",
+                accounts = stats.accounts,
+                slots = stats.slots,
+                bytecodes = stats.bytecodes,
+                "wrote state"
+            );
+        }
+
+        match stream.next_record()? {
+            Some(Record::Account {
+                hashed_address,
+                nonce,
+                balance,
+                code_hash,
+            }) => {
+                if let Some(hash) = code_hash {
+                    wanted.insert(hash);
+                }
+                provider.tx_ref().put::<tables::HashedAccounts>(
+                    hashed_address,
+                    Account {
+                        nonce,
+                        balance,
+                        bytecode_hash: code_hash,
+                    },
+                )?;
+                account = Some(hashed_address);
+                stats.accounts += 1;
+                written += 1;
+            }
+            Some(Record::Storage { hashed_slot, value }) => {
+                let owner = account.ok_or_else(|| {
+                    eyre::eyre!("storage slot {hashed_slot:#x} arrived before any account")
+                })?;
+                // A zero slot is absent from the trie, so writing one would change the root.
+                if value.is_zero() {
+                    continue;
+                }
+                provider
+                    .tx_ref()
+                    .cursor_dup_write::<tables::HashedStorages>()?
+                    .upsert(
+                        owner,
+                        &StorageEntry {
+                            key: hashed_slot,
+                            value,
+                        },
+                    )?;
+                stats.slots += 1;
+                written += 1;
+            }
+            Some(Record::Code { hash, code }) => {
+                // The stream reader already checked the blob hashes to its key.
+                provided.insert(hash);
+                provider
+                    .tx_ref()
+                    .put::<tables::Bytecodes>(hash, Bytecode::new_raw(code.into()))?;
+                stats.bytecodes += 1;
+                written += 1;
+            }
+            other => {
+                if let Some(record) = other {
+                    return Err(eyre::eyre!(
+                        "unexpected {record:?} after the state section; it is the last one"
+                    ));
+                }
+                break;
+            }
+        }
+    }
+
+    provider
+        .commit()
+        .map_err(|error| eyre::eyre!("commit state: {error}"))?;
+
+    if stats.accounts == 0 {
+        return Err(eyre::eyre!("the stream's state section is empty"));
+    }
+    if let Some(missing) = wanted.difference(&provided).next() {
+        return Err(eyre::eyre!(
+            "an account references code {missing:#x}, which the stream does not carry"
+        ));
+    }
+    Ok(stats)
+}
+
 /// Rename changeset static files whose name disagrees with the expected range in their header.
 ///
 /// reth resolves a segment file's path from that range, and the first changeset file's start was
@@ -711,7 +857,7 @@ mod tests {
     use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom, TxEip1559};
     use alloy_eips::Decodable2718;
     use alloy_primitives::{
-        Bytes, Log, LogData, Signature, TxKind, U256, address, b256, logs_bloom,
+        Bytes, Log, LogData, Signature, TxKind, U256, address, b256, keccak256, logs_bloom,
     };
     use alloy_rlp::Encodable;
     use arb_reth_genesis::snapshot_stream::{HistoryAccount, HistoryObject};
@@ -720,6 +866,7 @@ mod tests {
         receipt::{ArbReceipt, ArbReceiptEnvelope},
         transactions::{ArbTxEnvelope, deposit::TxDeposit},
     };
+    use reth_db_api::transaction::DbTx;
     use reth_provider::test_utils::create_test_provider_factory_with_node_types;
     use reth_storage_api::{
         ChangeSetReader, ReceiptProvider, StorageChangeSetReader, TransactionsProvider,
@@ -1150,6 +1297,131 @@ mod tests {
             }]
         );
         assert_eq!(objects[1].post_root, root);
+    }
+
+    /// Blocks, history and state in one stream, with the state root the trie actually produces so
+    /// the manifest check passes.
+    fn full_stream(root: B256) -> (Vec<u8>, Manifest) {
+        // Same blocks and history, but with a real state section in place of the empty one.
+        let (_, manifest, objects) = history_stream(root);
+        let mut builder = StreamBuilder::new(&manifest).blocks();
+        let mut parent = B256::ZERO;
+        for number in 0..=4u64 {
+            let h = header(number, parent, &[], &[]);
+            parent = h.hash_slow();
+            builder = builder
+                .header(number, &alloy_rlp::encode(&h))
+                .body(number, &body_rlp(&[]));
+        }
+        builder = builder.end_section().history_section();
+        for object in &objects {
+            builder = builder.history(object);
+        }
+        let code: &[u8] = &[0x60, 0x00, 0x56];
+        let bytes = builder
+            .end_section()
+            .state()
+            .account(
+                keccak256(ACCOUNT_A),
+                7,
+                U256::from(1234u64),
+                Some(keccak256(code)),
+            )
+            .code(code)
+            .storage(keccak256(B256::repeat_byte(0x01)), U256::from(5u64))
+            // A zero slot is absent from the trie, so it must not reach the database.
+            .storage(keccak256(B256::repeat_byte(0x02)), U256::ZERO)
+            .account(keccak256(ACCOUNT_B), 1, U256::from(9u64), None)
+            .end_section()
+            .finish();
+        (bytes, manifest)
+    }
+
+    /// The whole conversion, end to end: every section written, then the trie built over the
+    /// imported state and its root compared with the manifest.
+    #[test]
+    fn imports_all_three_sections_and_reproduces_the_state_root() {
+        let factory = v2_factory();
+        // The root the imported state actually hashes to is only known after the fact, so run once
+        // with a placeholder to learn it, then assert the check accepts the real one and rejects
+        // the placeholder.
+        let (bytes, manifest) = full_stream(B256::repeat_byte(0xee));
+        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
+        write_blocks(&factory, &mut stream, &manifest).unwrap();
+        write_history(&factory, &mut stream, &manifest).unwrap();
+        let state = write_state(&factory, &mut stream).unwrap();
+
+        assert_eq!(state.accounts, 2);
+        assert_eq!(state.slots, 1, "the zero slot is not written");
+        assert_eq!(state.bytecodes, 1);
+
+        let root = super::super::snapshot::compute_state_root_chunked(&factory).unwrap();
+        assert_ne!(root, B256::ZERO);
+        assert_ne!(
+            root, manifest.root,
+            "the placeholder root must not accidentally match"
+        );
+
+        let provider = factory.provider().unwrap();
+        let account = provider
+            .tx_ref()
+            .get::<tables::HashedAccounts>(keccak256(ACCOUNT_A))
+            .unwrap()
+            .expect("account A");
+        assert_eq!(account.nonce, 7);
+        assert_eq!(account.balance, U256::from(1234u64));
+        assert_eq!(
+            account.bytecode_hash,
+            Some(keccak256([0x60u8, 0x00, 0x56].as_slice()))
+        );
+        assert!(
+            provider
+                .tx_ref()
+                .get::<tables::Bytecodes>(keccak256([0x60u8, 0x00, 0x56].as_slice()))
+                .unwrap()
+                .is_some()
+        );
+        // Account B has no code, so it must be stored as an EOA rather than as empty code.
+        assert_eq!(
+            provider
+                .tx_ref()
+                .get::<tables::HashedAccounts>(keccak256(ACCOUNT_B))
+                .unwrap()
+                .expect("account B")
+                .bytecode_hash,
+            None
+        );
+    }
+
+    /// An account whose code the stream never carried would leave the datadir unable to execute
+    /// against it, and nothing else would notice.
+    #[test]
+    fn rejects_state_that_references_missing_code() {
+        let factory = v2_factory();
+        let manifest = Manifest {
+            block: 0,
+            root: B256::repeat_byte(0xee),
+            state_id: 1,
+            hash: B256::repeat_byte(0xaa),
+        };
+        let bytes = StreamBuilder::new(&manifest)
+            .blocks()
+            .end_section()
+            .history_section()
+            .end_section()
+            .state()
+            .account(
+                keccak256(ACCOUNT_A),
+                0,
+                U256::ZERO,
+                Some(B256::repeat_byte(0x77)),
+            )
+            .end_section()
+            .finish();
+
+        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
+        let error = write_state(&factory, &mut stream).unwrap_err().to_string();
+        assert!(error.contains("does not carry"), "{error}");
     }
 
     /// The first changeset file is created in its fixed 500k slot and then has its expected start

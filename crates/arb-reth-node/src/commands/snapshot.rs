@@ -1376,7 +1376,7 @@ fn require_slot_preimage(preimages: &SlotPreimagesReader, hashed_slot: B256) -> 
     Ok(plain_slot)
 }
 
-fn compute_state_root_chunked<PF>(factory: &PF) -> eyre::Result<B256>
+pub(crate) fn compute_state_root_chunked<PF>(factory: &PF) -> eyre::Result<B256>
 where
     PF: reth_provider::DatabaseProviderFactory<
             ProviderRW: DBProvider<Tx: DbTxMut> + TrieWriter + StorageSettingsCache,
