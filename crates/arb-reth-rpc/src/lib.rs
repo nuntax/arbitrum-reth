@@ -166,11 +166,19 @@ where
     // Use a Cell to capture gas_used_for_l1 from within the mapping closure.
     let gas_cell = std::cell::Cell::new(0u64);
 
-    let core = build_receipt::<N, _>(input, None, |envelope, next_log_index, meta| {
+    // Arbitrum has no priority fee: the sequencer charges the base fee and refunds the difference,
+    // so what a transaction actually paid per gas is the block's base fee. reth derives the field
+    // with Ethereum's tip formula, which returns the transaction's max fee instead.
+    let base_fee = input.meta.base_fee;
+
+    let mut core = build_receipt::<N, _>(input, None, |envelope, next_log_index, meta| {
         let (g, rpc_envelope) = map_arb_receipt_envelope(envelope, next_log_index, meta);
         gas_cell.set(g);
         rpc_envelope
     });
+    if let Some(base_fee) = base_fee {
+        core.effective_gas_price = base_fee as u128;
+    }
 
     Ok(ArbTransactionReceipt {
         inner: core,
