@@ -7,3 +7,4 @@ pub mod genesis;
 pub mod node;
 pub mod rewind;
 pub mod snapshot;
+pub mod snapshot_full;

@@ -5,6 +5,7 @@
 //!
 //! - `node`             the standalone no-engine node (feed / L1-derivation block producer + RPC)
 //! - `snapshot import`  import a Nitro genesis-state stream into reth MDBX
+//! - `snapshot import-full`  convert a full-snapshot stream (blocks + history + state)
 //! - `snapshot read`    read hashed-state from a converted snapshot
 //! - `genesis verify`   verify the Arbitrum One Nitro-genesis state root from the classic export
 //! - `genesis verify-export`  verify a `reth-export --mode state` stream (stdin)
@@ -23,6 +24,7 @@ use arb_reth_node::commands::{
         SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs,
         SnapshotRepairHistoryArgs,
     },
+    snapshot_full::SnapshotImportFullArgs,
 };
 use clap::{Args, Parser, Subcommand};
 use reth_cli_runner::CliRunner;
@@ -72,6 +74,8 @@ enum SnapshotSub {
     BuildPreimages(SnapshotBuildPreimagesArgs),
     /// Import a Nitro genesis state stream into reth MDBX and verify the state root.
     Import(SnapshotImportArgs),
+    /// Convert a `reth-export --mode full-snapshot` stream into a reth datadir.
+    ImportFull(SnapshotImportFullArgs),
     /// Read hashed-state from a converted Arbitrum reth MDBX snapshot.
     Read(SnapshotReadArgs),
     /// Add missing history-boundary metadata to an existing snapshot import.
@@ -112,6 +116,7 @@ fn main() -> eyre::Result<()> {
         Command::Snapshot(cmd) => match cmd.command {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),
             SnapshotSub::Import(args) => commands::snapshot::import(args),
+            SnapshotSub::ImportFull(args) => commands::snapshot_full::import_full(args),
             SnapshotSub::Read(args) => commands::snapshot::read(args),
             SnapshotSub::RepairHistory(args) => commands::snapshot::repair_history(args),
         },

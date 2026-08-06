@@ -636,7 +636,7 @@ pub(crate) fn validate_snapshot_import_for_launch(
     Ok(())
 }
 
-fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
+pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
     let import_manifest = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
     if import_manifest.exists() {
         eyre::bail!(
