@@ -114,6 +114,8 @@ pub struct SnapshotStream<R> {
     last_block: Option<(u64, B256)>,
     /// Last history object seen, for root chaining.
     last_history: Option<(u64, B256)>,
+    /// Set by [`SnapshotStream::unread`]; returned before anything is read from `inner`.
+    held: Option<Record>,
     finished: bool,
 }
 
@@ -144,6 +146,7 @@ impl<R: Read> SnapshotStream<R> {
             section: SECTION_MANIFEST,
             last_block: None,
             last_history: None,
+            held: None,
             finished: false,
         })
     }
@@ -153,8 +156,20 @@ impl<R: Read> SnapshotStream<R> {
         &self.manifest
     }
 
+    /// Hand a record back, so the next [`Self::next_record`] returns it again.
+    ///
+    /// Sections are only delimited by the record that follows them, so a per-section reader has to
+    /// read one record too far to learn it is done. This gives that record to the next reader.
+    pub fn unread(&mut self, record: Record) {
+        debug_assert!(self.held.is_none(), "only one record can be held back");
+        self.held = Some(record);
+    }
+
     /// Next record, or `None` at the end of the stream.
     pub fn next_record(&mut self) -> eyre::Result<Option<Record>> {
+        if let Some(record) = self.held.take() {
+            return Ok(Some(record));
+        }
         if self.finished {
             return Ok(None);
         }
@@ -498,94 +513,181 @@ fn read_blob(r: &mut impl Read) -> eyre::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Builds a full-snapshot stream in memory, mirroring the exporter's framing.
+///
+/// This exists so tests can produce streams without a second copy of the format. It is not how real
+/// snapshots are made: those come from `reth-export --mode full-snapshot`, which reads a Nitro
+/// database. Nothing here enforces the invariants the reader checks, on purpose, so a test can build
+/// a deliberately broken stream.
+#[derive(Debug, Default)]
+pub struct StreamBuilder {
+    out: Vec<u8>,
+}
+
+impl StreamBuilder {
+    /// Start a stream with its magic and manifest.
+    pub fn new(manifest: &Manifest) -> Self {
+        let mut out = MAGIC.to_vec();
+        out.push(SECTION_MANIFEST);
+        put_uvarint(&mut out, manifest.block);
+        out.extend_from_slice(manifest.root.as_slice());
+        put_uvarint(&mut out, manifest.state_id);
+        out.extend_from_slice(manifest.hash.as_slice());
+        Self { out }
+    }
+
+    /// Open the blocks section.
+    pub fn blocks(self) -> Self {
+        self.section(SECTION_BLOCKS)
+    }
+
+    /// Open the state-history section.
+    pub fn history_section(self) -> Self {
+        self.section(SECTION_HISTORY)
+    }
+
+    /// Open the state section.
+    pub fn state(self) -> Self {
+        self.section(SECTION_STATE)
+    }
+
+    fn section(mut self, tag: u8) -> Self {
+        self.out.push(tag);
+        self
+    }
+
+    /// Close the current section.
+    pub fn end_section(mut self) -> Self {
+        self.out.push(REC_END);
+        self
+    }
+
+    /// A block header. Its hash is derived from the bytes, so headers are self-consistent.
+    pub fn header(mut self, block: u64, rlp: &[u8]) -> Self {
+        self.out.push(REC_HEADER);
+        put_uvarint(&mut self.out, block);
+        self.out.extend_from_slice(keccak256(rlp).as_slice());
+        put_uvarint(&mut self.out, rlp.len() as u64);
+        self.out.extend_from_slice(rlp);
+        self
+    }
+
+    /// A block body, as geth's `ReadBodyRLP` returns it.
+    pub fn body(mut self, block: u64, rlp: &[u8]) -> Self {
+        self.out.push(REC_BODY);
+        put_uvarint(&mut self.out, block);
+        put_uvarint(&mut self.out, rlp.len() as u64);
+        self.out.extend_from_slice(rlp);
+        self
+    }
+
+    /// A block's receipts, as geth's `ReadReceiptsRLP` returns them: the storage form.
+    pub fn receipts(mut self, block: u64, rlp: &[u8]) -> Self {
+        self.out.push(REC_RECEIPTS);
+        put_uvarint(&mut self.out, block);
+        put_uvarint(&mut self.out, rlp.len() as u64);
+        self.out.extend_from_slice(rlp);
+        self
+    }
+
+    /// One state-history object.
+    pub fn history(mut self, o: &HistoryObject) -> Self {
+        self.out.push(REC_HEADER);
+        put_uvarint(&mut self.out, o.state_id);
+        put_uvarint(&mut self.out, o.block);
+        self.out.push(HISTORY_VERSION_RAW_SLOTS);
+        self.out.extend_from_slice(o.parent_root.as_slice());
+        self.out.extend_from_slice(o.post_root.as_slice());
+        put_uvarint(&mut self.out, o.accounts.len() as u64);
+        for a in &o.accounts {
+            self.out.extend_from_slice(a.address.as_slice());
+            match &a.previous {
+                None => self.out.push(0),
+                Some((nonce, balance, code)) => {
+                    self.out.push(1);
+                    put_uvarint(&mut self.out, *nonce);
+                    put_short(&mut self.out, &trim(balance.to_be_bytes::<32>()));
+                    put_short(
+                        &mut self.out,
+                        code.map(|c| c.to_vec()).unwrap_or_default().as_slice(),
+                    );
+                }
+            }
+            put_uvarint(&mut self.out, a.storage.len() as u64);
+            for (k, v) in &a.storage {
+                self.out.extend_from_slice(k.as_slice());
+                put_short(&mut self.out, &trim(v.to_be_bytes::<32>()));
+            }
+        }
+        self
+    }
+
+    /// An account at the exported state root, keyed by the hash of its address.
+    pub fn account(
+        mut self,
+        hashed_address: B256,
+        nonce: u64,
+        balance: U256,
+        code_hash: Option<B256>,
+    ) -> Self {
+        self.out.push(REC_ACCOUNT);
+        self.out.extend_from_slice(hashed_address.as_slice());
+        put_uvarint(&mut self.out, nonce);
+        put_short(&mut self.out, &trim(balance.to_be_bytes::<32>()));
+        put_short(
+            &mut self.out,
+            code_hash.map(|c| c.to_vec()).unwrap_or_default().as_slice(),
+        );
+        self
+    }
+
+    /// A storage slot belonging to the preceding account.
+    pub fn storage(mut self, hashed_slot: B256, value: U256) -> Self {
+        self.out.push(REC_STORAGE);
+        self.out.extend_from_slice(hashed_slot.as_slice());
+        put_short(&mut self.out, &trim(value.to_be_bytes::<32>()));
+        self
+    }
+
+    /// Contract code, keyed by its hash.
+    pub fn code(mut self, code: &[u8]) -> Self {
+        self.out.push(REC_CODE);
+        self.out.extend_from_slice(keccak256(code).as_slice());
+        put_uvarint(&mut self.out, code.len() as u64);
+        self.out.extend_from_slice(code);
+        self
+    }
+
+    /// Close the stream and return its bytes.
+    pub fn finish(mut self) -> Vec<u8> {
+        self.out.push(SECTION_END);
+        self.out
+    }
+}
+
+fn trim(bytes: [u8; 32]) -> Vec<u8> {
+    let first = bytes.iter().position(|b| *b != 0).unwrap_or(32);
+    bytes[first..].to_vec()
+}
+
+fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn put_short(out: &mut Vec<u8>, b: &[u8]) {
+    out.push(b.len() as u8);
+    out.extend_from_slice(b);
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, address};
 
     use super::*;
-
-    /// Mirrors the exporter's framing, so the tests exercise the same bytes it writes.
-    #[derive(Default)]
-    struct StreamBuilder {
-        out: Vec<u8>,
-    }
-
-    impl StreamBuilder {
-        fn new(manifest: &Manifest) -> Self {
-            let mut out = MAGIC.to_vec();
-            out.push(SECTION_MANIFEST);
-            put_uvarint(&mut out, manifest.block);
-            out.extend_from_slice(manifest.root.as_slice());
-            put_uvarint(&mut out, manifest.state_id);
-            out.extend_from_slice(manifest.hash.as_slice());
-            Self { out }
-        }
-        fn section(mut self, tag: u8) -> Self {
-            self.out.push(tag);
-            self
-        }
-        fn end_section(mut self) -> Self {
-            self.out.push(REC_END);
-            self
-        }
-        fn header(mut self, block: u64, rlp: &[u8]) -> Self {
-            self.out.push(REC_HEADER);
-            put_uvarint(&mut self.out, block);
-            self.out.extend_from_slice(keccak256(rlp).as_slice());
-            put_uvarint(&mut self.out, rlp.len() as u64);
-            self.out.extend_from_slice(rlp);
-            self
-        }
-        fn history(mut self, o: &HistoryObject) -> Self {
-            self.out.push(REC_HEADER);
-            put_uvarint(&mut self.out, o.state_id);
-            put_uvarint(&mut self.out, o.block);
-            self.out.push(HISTORY_VERSION_RAW_SLOTS);
-            self.out.extend_from_slice(o.parent_root.as_slice());
-            self.out.extend_from_slice(o.post_root.as_slice());
-            put_uvarint(&mut self.out, o.accounts.len() as u64);
-            for a in &o.accounts {
-                self.out.extend_from_slice(a.address.as_slice());
-                match &a.previous {
-                    None => self.out.push(0),
-                    Some((nonce, balance, code)) => {
-                        self.out.push(1);
-                        put_uvarint(&mut self.out, *nonce);
-                        put_short(&mut self.out, &trim(balance.to_be_bytes::<32>()));
-                        put_short(&mut self.out, code.map(|c| c.to_vec()).unwrap_or_default().as_slice());
-                    }
-                }
-                put_uvarint(&mut self.out, a.storage.len() as u64);
-                for (k, v) in &a.storage {
-                    self.out.extend_from_slice(k.as_slice());
-                    put_short(&mut self.out, &trim(v.to_be_bytes::<32>()));
-                }
-            }
-            self
-        }
-        fn finish(mut self) -> Vec<u8> {
-            self.out.push(SECTION_END);
-            self.out
-        }
-    }
-
-    fn trim(bytes: [u8; 32]) -> Vec<u8> {
-        let first = bytes.iter().position(|b| *b != 0).unwrap_or(32);
-        bytes[first..].to_vec()
-    }
-
-    fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
-        while v >= 0x80 {
-            out.push((v as u8) | 0x80);
-            v >>= 7;
-        }
-        out.push(v as u8);
-    }
-
-    fn put_short(out: &mut Vec<u8>, b: &[u8]) {
-        out.push(b.len() as u8);
-        out.extend_from_slice(b);
-    }
 
     /// A header RLP whose first field is `parent` and whose remaining fields are placeholders, so
     /// `header_field` and the linkage check have something real to walk.
@@ -635,14 +737,14 @@ mod tests {
             ],
         };
         let bytes = StreamBuilder::new(&m)
-            .section(SECTION_BLOCKS)
+            .blocks()
             .header(0, &h0)
             .header(1, &h1)
             .end_section()
-            .section(SECTION_HISTORY)
+            .history_section()
             .history(&obj)
             .end_section()
-            .section(SECTION_STATE)
+            .state()
             .end_section()
             .finish();
 
@@ -670,7 +772,7 @@ mod tests {
         let h0 = header_rlp(B256::ZERO);
         let h2 = header_rlp(keccak256(&h0));
         let bytes = StreamBuilder::new(&m)
-            .section(SECTION_BLOCKS)
+            .blocks()
             .header(0, &h0)
             .header(2, &h2)
             .end_section()
@@ -688,7 +790,7 @@ mod tests {
         let h0 = header_rlp(B256::ZERO);
         let h1 = header_rlp(B256::repeat_byte(0x77)); // wrong parent
         let bytes = StreamBuilder::new(&m)
-            .section(SECTION_BLOCKS)
+            .blocks()
             .header(0, &h0)
             .header(1, &h1)
             .end_section()
@@ -719,9 +821,9 @@ mod tests {
             accounts: vec![],
         };
         let bytes = StreamBuilder::new(&m)
-            .section(SECTION_BLOCKS)
+            .blocks()
             .end_section()
-            .section(SECTION_HISTORY)
+            .history_section()
             .history(&first)
             .history(&second)
             .end_section()
@@ -744,12 +846,12 @@ mod tests {
             accounts: vec![],
         };
         let bytes = StreamBuilder::new(&m)
-            .section(SECTION_BLOCKS)
+            .blocks()
             .end_section()
-            .section(SECTION_HISTORY)
+            .history_section()
             .history(&short)
             .end_section()
-            .section(SECTION_STATE)
+            .state()
             .end_section()
             .finish();
 
@@ -765,7 +867,7 @@ mod tests {
 
         let m = manifest();
         let mut bytes = StreamBuilder::new(&m)
-            .section(SECTION_BLOCKS)
+            .blocks()
             .header(0, &header_rlp(B256::ZERO))
             .end_section()
             .finish();
