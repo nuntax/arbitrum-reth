@@ -55,7 +55,7 @@ use reth_storage_api::{BlockBodyIndicesProvider, StageCheckpointWriter};
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
 
-use crate::{ArbNode, stored_receipt::decode_stored_receipts};
+use crate::{ArbNode, L1ResumeCheckpoint, L1ResumeLog, stored_receipt::decode_stored_receipts};
 
 type ArbNodeTypesWithDB = NodeTypesWithDBAdapter<ArbNode, reth_db::DatabaseEnv>;
 
@@ -183,6 +183,7 @@ pub fn finalize_datadir(args: SnapshotFinalizeArgs) -> eyre::Result<()> {
         root: head.state_root,
         state_id: 0,
         hash: head.hash(),
+        resume: None,
     };
     drop(provider);
 
@@ -411,6 +412,8 @@ fn finalize<DB: SnapshotDb>(
         .commit()
         .map_err(|error| eyre::eyre!("commit finalisation: {error}"))?;
 
+    write_resume_log(manifest, out)?;
+
     // Last, and only once everything above held. Without it the node refuses to boot, so a run that
     // dies anywhere earlier leaves a datadir that cannot be mistaken for a finished one.
     super::snapshot::write_snapshot_import_manifest(
@@ -463,6 +466,50 @@ where
         info!(target: "arb-snapshot", stage = what, at = output.checkpoint.block_number, "building index");
     }
     info!(target: "arb-snapshot", stage = what, elapsed = ?started.elapsed(), "index built");
+    Ok(())
+}
+
+/// Give the node its L1-derivation cursor, so it does not re-derive from batch 0.
+///
+/// Nothing in the L2 state says where derivation left off, so without this the node falls back to
+/// re-deriving the whole chain: on Robinhood that was 685,718 parent-chain blocks of `getLogs` and
+/// blob fetches, every result discarded, before a single new block. The exporter reads the answer
+/// out of the snapshot's own `arbitrumdata` and carries it in the manifest.
+fn write_resume_log(manifest: &Manifest, out: &std::path::Path) -> eyre::Result<()> {
+    let Some(resume) = manifest.resume else {
+        info!(
+            target: "arb-snapshot",
+            "the stream carries no resume point, so the node will re-derive from batch 0; \
+             re-export with --arbitrumdata to avoid that"
+        );
+        return Ok(());
+    };
+    // The boundary sits at or below the convert point, never above it: derivation would otherwise
+    // start after blocks the datadir does not have and leave a gap.
+    if resume.l2_block > manifest.block {
+        return Err(eyre::eyre!(
+            "resume point names L2 block {}, above the convert point {}",
+            resume.l2_block,
+            manifest.block
+        ));
+    }
+    let log = L1ResumeLog {
+        checkpoints: vec![L1ResumeCheckpoint {
+            l1_block: resume.l1_block,
+            delayed_count: resume.delayed_count,
+            l2_block: resume.l2_block,
+        }],
+    };
+    let path = L1ResumeLog::path_in(out);
+    std::fs::write(&path, serde_json::to_vec(&log)?)
+        .map_err(|error| eyre::eyre!("write {}: {error}", path.display()))?;
+    info!(
+        target: "arb-snapshot",
+        l1_block = resume.l1_block,
+        delayed = resume.delayed_count,
+        l2_block = resume.l2_block,
+        "wrote the L1 derivation resume point"
+    );
     Ok(())
 }
 
@@ -1359,6 +1406,7 @@ mod tests {
             root: B256::repeat_byte(0xee),
             state_id: 3,
             hash: hash2,
+            resume: None,
         };
         let bytes = StreamBuilder::new(&manifest)
             .blocks()
@@ -1452,6 +1500,7 @@ mod tests {
             root,
             state_id: 5,
             hash: B256::repeat_byte(0xaa),
+            resume: None,
         })
         .blocks();
         let mut parent = B256::ZERO;
@@ -1467,6 +1516,7 @@ mod tests {
             root,
             state_id: 5,
             hash: parent,
+            resume: None,
         };
 
         let objects = vec![
@@ -1619,6 +1669,76 @@ mod tests {
         (bytes, manifest)
     }
 
+    /// A stream carrying a resume point must leave the node able to skip re-deriving the whole
+    /// chain. Without this the conversion is correct but unusable: the node re-derives from batch 0,
+    /// which on a real chain is hundreds of thousands of L1 blocks fetched and discarded.
+    #[test]
+    fn a_resume_point_in_the_stream_becomes_the_node_s_derivation_cursor() {
+        let factory = v2_factory();
+        let root = B256::repeat_byte(0xee);
+        let (bytes, mut manifest) = full_stream(root);
+        // Rebuild the stream with a resume point in its manifest.
+        manifest.resume = Some(arb_reth_genesis::snapshot_stream::ResumePoint {
+            l1_block: 25_679_956,
+            delayed_count: 91_588,
+            l2_block: 3,
+        });
+        let _ = bytes;
+        let mut rebuilt = StreamBuilder::new(&manifest).blocks();
+        let mut parent = B256::ZERO;
+        for number in 0..=4u64 {
+            let h = header(number, parent, &[], &[]);
+            parent = h.hash_slow();
+            rebuilt = rebuilt
+                .header(number, &alloy_rlp::encode(&h))
+                .body(number, &body_rlp(&[]));
+        }
+        let bytes = rebuilt
+            .end_section()
+            .history_section()
+            .end_section()
+            .state()
+            .account(keccak256(ACCOUNT_A), 1, U256::from(1u64), None)
+            .end_section()
+            .finish();
+
+        let mut stream = SnapshotStream::open(bytes.as_slice()).unwrap();
+        assert_eq!(stream.manifest().resume, manifest.resume);
+        write_blocks(&factory, &mut stream, &manifest).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        write_resume_log(&manifest, out.path()).unwrap();
+
+        let log = L1ResumeLog::load(&L1ResumeLog::path_in(out.path())).expect("resume log");
+        assert_eq!(log.checkpoints.len(), 1);
+        assert_eq!(log.checkpoints[0].l1_block, 25_679_956);
+        assert_eq!(log.checkpoints[0].delayed_count, 91_588);
+        // The node resolves it for its own tip, which is what makes a non-boundary convert point work.
+        assert_eq!(log.resume_for(4).map(|c| c.l2_block), Some(3));
+    }
+
+    /// A cursor above the convert point would start derivation after blocks the datadir does not
+    /// have, leaving a gap that nothing downstream detects.
+    #[test]
+    fn rejects_a_resume_point_above_the_convert_point() {
+        let out = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            block: 100,
+            root: B256::repeat_byte(0xee),
+            state_id: 1,
+            hash: B256::repeat_byte(0xaa),
+            resume: Some(arb_reth_genesis::snapshot_stream::ResumePoint {
+                l1_block: 5,
+                delayed_count: 0,
+                l2_block: 101,
+            }),
+        };
+        let error = write_resume_log(&manifest, out.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("above the convert point"), "{error}");
+    }
+
     /// `S_lo` has to come back out of the datadir for finalisation to be re-runnable on its own,
     /// and the sidecars share the segment prefix, so they must not be mistaken for segments.
     #[test]
@@ -1719,6 +1839,9 @@ mod tests {
 
         // The completion manifest is written last and only on success.
         assert!(out.path().join("snapshot-import.json").is_file());
+
+        // Absent from this stream, so no cursor is written and the node falls back to batch 0.
+        assert!(!out.path().join("arb-l1-resume.json").is_file());
     }
 
     /// The whole conversion, end to end: every section written, then the trie built over the
@@ -1787,6 +1910,7 @@ mod tests {
             root: B256::repeat_byte(0xee),
             state_id: 1,
             hash: B256::repeat_byte(0xaa),
+            resume: None,
         };
         let bytes = StreamBuilder::new(&manifest)
             .blocks()
@@ -1909,6 +2033,7 @@ mod tests {
             root: B256::repeat_byte(0xee),
             state_id: 1,
             hash: h0.hash_slow(),
+            resume: None,
         };
         // The header commits to no transactions; the body carries two.
         let bytes = StreamBuilder::new(&manifest)
@@ -1943,6 +2068,7 @@ mod tests {
             root: B256::repeat_byte(0xee),
             state_id: 1,
             hash: h0.hash_slow(),
+            resume: None,
         };
         let bytes = StreamBuilder::new(&manifest)
             .blocks()
@@ -1979,6 +2105,7 @@ mod tests {
             root: B256::repeat_byte(0xee),
             state_id: 8,
             hash: B256::repeat_byte(0xaa),
+            resume: None,
         };
         let bytes = StreamBuilder::new(&manifest)
             .blocks()

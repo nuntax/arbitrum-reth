@@ -13,7 +13,10 @@ use std::io::Read;
 use alloy_primitives::{B256, U256, keccak256};
 use eyre::{Context as _, eyre};
 
-const MAGIC: &[u8; 8] = b"ARBSNAP1";
+// Bumped when the manifest gained the resume point. An older stream would otherwise parse its first
+// section tag as the resume-present flag and desynchronise silently, which is the one failure mode
+// worth spending a magic byte to avoid.
+const MAGIC: &[u8; 8] = b"ARBSNAP2";
 
 // Section tags live above the record tags on purpose. They shared a range in the first draft, which
 // made a receipts record inside the blocks section indistinguishable from the start of the history
@@ -35,6 +38,17 @@ const REC_CODE: u8 = 0x06;
 /// History objects identify storage slots by raw key from this version on.
 const HISTORY_VERSION_RAW_SLOTS: u8 = 1;
 
+/// Where L1 derivation should restart, so a converted datadir does not re-derive from batch 0.
+///
+/// Mirrors arb-reth's `L1ResumeCheckpoint`: after consuming every batch up to and including L1 block
+/// `l1_block - 1`, the delayed cursor is `delayed_count` and the chain has reached `l2_block`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumePoint {
+    pub l1_block: u64,
+    pub delayed_count: u64,
+    pub l2_block: u64,
+}
+
 /// Where the conversion stops: state, blocks and history all end here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -46,6 +60,9 @@ pub struct Manifest {
     pub state_id: u64,
     /// Canonical hash of block `P`.
     pub hash: B256,
+    /// Present when the exporter was given the snapshot's `arbitrumdata`. Absent means the importer
+    /// cannot write a derivation cursor and the node will re-derive from batch 0.
+    pub resume: Option<ResumePoint>,
 }
 
 /// One account's pre-block state, and the slots the block overwrote.
@@ -134,12 +151,20 @@ impl<R: Read> SnapshotStream<R> {
         if tag != SECTION_MANIFEST {
             return Err(eyre!("expected the manifest section, found tag {tag:#04x}"));
         }
-        let manifest = Manifest {
+        let mut manifest = Manifest {
             block: read_uvarint(&mut inner)?,
             root: read_b256(&mut inner)?,
             state_id: read_uvarint(&mut inner)?,
             hash: read_b256(&mut inner)?,
+            resume: None,
         };
+        if read_u8(&mut inner)? == 1 {
+            manifest.resume = Some(ResumePoint {
+                l1_block: read_uvarint(&mut inner)?,
+                delayed_count: read_uvarint(&mut inner)?,
+                l2_block: read_uvarint(&mut inner)?,
+            });
+        }
         Ok(Self {
             inner,
             manifest,
@@ -259,7 +284,8 @@ impl<R: Read> SnapshotStream<R> {
                 self.manifest.block
             ));
         }
-        let parent = header_field(rlp, 0).wrap_err_with(|| format!("block {block}: parent hash"))?;
+        let parent =
+            header_field(rlp, 0).wrap_err_with(|| format!("block {block}: parent hash"))?;
         if let Some((last_number, last_hash)) = self.last_block {
             if block != last_number + 1 {
                 return Err(eyre!("blocks jump from {last_number} to {block}"));
@@ -438,12 +464,18 @@ fn rlp_split(blob: &[u8], want_list: bool) -> eyre::Result<(&[u8], &[u8])> {
         0x80..=0xb7 => (1, (prefix - 0x80) as usize),
         0xb8..=0xbf => {
             let n = (prefix - 0xb7) as usize;
-            (1 + n, be_usize(blob.get(1..1 + n).ok_or_else(|| eyre!("short RLP"))?))
+            (
+                1 + n,
+                be_usize(blob.get(1..1 + n).ok_or_else(|| eyre!("short RLP"))?),
+            )
         }
         0xc0..=0xf7 => (1, (prefix - 0xc0) as usize),
         0xf8..=0xff => {
             let n = (prefix - 0xf7) as usize;
-            (1 + n, be_usize(blob.get(1..1 + n).ok_or_else(|| eyre!("short RLP"))?))
+            (
+                1 + n,
+                be_usize(blob.get(1..1 + n).ok_or_else(|| eyre!("short RLP"))?),
+            )
         }
     };
     if (prefix >= 0xc0) != want_list {
@@ -533,6 +565,15 @@ impl StreamBuilder {
         out.extend_from_slice(manifest.root.as_slice());
         put_uvarint(&mut out, manifest.state_id);
         out.extend_from_slice(manifest.hash.as_slice());
+        match manifest.resume {
+            None => out.push(0),
+            Some(r) => {
+                out.push(1);
+                put_uvarint(&mut out, r.l1_block);
+                put_uvarint(&mut out, r.delayed_count);
+                put_uvarint(&mut out, r.l2_block);
+            }
+        }
         Self { out }
     }
 
@@ -710,6 +751,7 @@ mod tests {
             root: B256::repeat_byte(0xee),
             state_id: 12,
             hash: B256::repeat_byte(0xaa),
+            resume: None,
         }
     }
 
@@ -727,7 +769,10 @@ mod tests {
                 HistoryAccount {
                     address: address!("00000000000000000000000000000000000000aa"),
                     previous: Some((7, U256::from(1234u64), Some(B256::repeat_byte(0x9)))),
-                    storage: vec![(B256::repeat_byte(1), U256::from(5u64)), (B256::repeat_byte(2), U256::ZERO)],
+                    storage: vec![
+                        (B256::repeat_byte(1), U256::from(5u64)),
+                        (B256::repeat_byte(2), U256::ZERO),
+                    ],
                 },
                 HistoryAccount {
                     address: Address::ZERO,

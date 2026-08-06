@@ -134,7 +134,7 @@ func walkRange(w *bufio.Writer, sdb state.Database, tdb *triedb.Database, root c
 
 func main() {
 	ancient := flag.String("ancient", "", "ancients/freezer directory (default <dir>/ancient)")
-	mode := flag.String("mode", "diag", "diag|state|blocks|history|full-snapshot|diskroot|accounts|addr")
+	mode := flag.String("mode", "diag", "diag|state|blocks|history|full-snapshot|diskroot|accounts|addr|resume-point")
 	max := flag.Uint64("max", 0, "max accounts to dump (0 = all)")
 	addr := flag.String("addr", "", "for --mode addr: a 0x address to dump (storage key form check)")
 	from := flag.Int64("from", -1, "for --mode blocks: first block; for --mode history: first state id (default = earliest)")
@@ -153,6 +153,9 @@ func main() {
 	// Never defaults to the source directory: that is a live pebble database, and scattering part
 	// files through it risks confusing a later open.
 	tmpdir := flag.String("tmpdir", os.TempDir(), "for --mode full-snapshot --parallel N: scratch directory for state part files")
+	arbitrumdata := flag.String("arbitrumdata", "", "for --mode resume-point: the snapshot's arbitrumdata directory")
+	l2Block := flag.Int64("l2-block", -1, "for --mode resume-point: the converted head (P)")
+	genesisBlock := flag.Uint64("genesis-block", 0, "for --mode resume-point: the chain's ArbOS GenesisBlockNum")
 	flag.Parse()
 	if flag.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: reth-export <l2chaindata-dir> [--ancient DIR] [--mode diag|accounts] [--max N]")
@@ -341,7 +344,12 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "exported %d blocks [%d..%d]\n", nBlk, lo, hi)
 	case "full-snapshot":
-		fullSnapshot(db, anc, sdb, tdb, *parallel, *tmpdir)
+		fullSnapshot(db, anc, sdb, tdb, *parallel, *tmpdir, *arbitrumdata, *genesisBlock, *cacheMB, *handles)
+	case "resume-point":
+		if *arbitrumdata == "" {
+			fatal("resume-point", fmt.Errorf("--arbitrumdata is required"))
+		}
+		resumePoint(*arbitrumdata, uint64(*l2Block), *genesisBlock, *cacheMB, *handles)
 	case "diskroot":
 		// The path-scheme disk layer: the persisted trie, before any journalled diff layers.
 		// pathdb derives it the same way in loadLayers(). Its root is the post root of the most
@@ -669,23 +677,39 @@ func resolveConvertPoint(db ethdb.Database, ancientDir string, sdb state.Databas
 //
 // Sections are ordered so the importer can write append-only: blocks ascending, then history
 // ascending, then the state bulk load. Everything stops at P, so the three agree.
-func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database, parallel int, tmpDir string) {
+func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database, parallel int, tmpDir string, arbitrumdata string, genesisBlock uint64, cacheMB, handles int) {
 	point := resolveConvertPoint(db, ancientDir, sdb)
 	fmt.Fprintf(os.Stderr, "convert point: block=%d root=%s stateID=%d\n",
 		point.block, point.root.Hex(), point.stateID)
+
+	// The derivation cursor is not recoverable from L2 state, so without it an importer's node can
+	// only re-derive from batch 0: on this chain that was 685,718 parent-chain blocks of getLogs and
+	// blob fetches, all discarded, before a single new block. Nitro already knows the answer, so
+	// carry it in the stream rather than making the operator run a second tool.
+	var resume *resumeCheckpoint
+	if arbitrumdata != "" {
+		if cp, ok := computeResumePoint(arbitrumdata, point.block, genesisBlock, cacheMB, handles); ok {
+			resume = &cp
+			fmt.Fprintf(os.Stderr, "resume point: l1_block=%d delayed=%d l2_block=%d\n",
+				cp.L1Block, cp.DelayedCount, cp.L2Block)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr,
+			"note: no --arbitrumdata, so the stream carries no resume point; the importing node will re-derive from batch 0")
+	}
 
 	w := bufio.NewWriterSize(os.Stdout, 1<<22)
 	defer w.Flush()
 	w.WriteString(snapStreamMagic)
 
-	writeManifestSection(w, db, point)
+	writeManifestSection(w, db, point, resume)
 	writeBlocksSection(w, db, point)
 	writeHistorySection(w, ancientDir, point)
 	writeStateSection(w, sdb, tdb, db, point, parallel, tmpDir)
 	w.WriteByte(snapSectionEnd)
 }
 
-func writeManifestSection(w *bufio.Writer, db ethdb.Database, point convertPoint) {
+func writeManifestSection(w *bufio.Writer, db ethdb.Database, point convertPoint, resume *resumeCheckpoint) {
 	w.WriteByte(snapSectionManifest)
 	writeUvarint(w, point.block)
 	w.Write(point.root.Bytes())
@@ -695,6 +719,17 @@ func writeManifestSection(w *bufio.Writer, db ethdb.Database, point convertPoint
 		fatal("read convert-point hash", fmt.Errorf("no canonical hash at block %d", point.block))
 	}
 	w.Write(hash.Bytes())
+
+	// Optional, because a snapshot without its arbitrumdata can still be converted; the importer
+	// just cannot write a derivation cursor for it.
+	if resume == nil {
+		w.WriteByte(0)
+		return
+	}
+	w.WriteByte(1)
+	writeUvarint(w, resume.L1Block)
+	writeUvarint(w, resume.DelayedCount)
+	writeUvarint(w, resume.L2Block)
 }
 
 // writeBlocksSection streams headers, bodies and receipts for [0, P] as raw RLP.
@@ -970,4 +1005,135 @@ func streamHistoryRange(w *bufio.Writer, store ethdb.AncientStore, first, last u
 		}
 	}
 	return emitted, skipped, accounts, slots
+}
+
+// ---------------------------------------------------------------------------
+// --mode resume-point: where L1 derivation should restart for a converted datadir
+// ---------------------------------------------------------------------------
+
+// A converted datadir has no derivation cursor, so the node falls back to re-deriving from batch 0.
+// On a real chain that scans the whole parent-chain range and refetches every historical blob only to
+// drop the results, before producing a single new block.
+//
+// Nitro already knows the answer. `arbitrumdata` maps each batch sequence number to its
+// BatchMetadata, which carries the message count reached, the delayed cursor, and the parent-chain
+// block the batch was posted in. The batch boundary at or below the convert point is exactly the
+// resume checkpoint the node's persisted-checkpoint path wants.
+type batchMetadata struct {
+	Accumulator         common.Hash
+	MessageCount        uint64
+	DelayedMessageCount uint64
+	ParentChainBlock    uint64
+}
+
+// Matches arb-reth's `L1ResumeCheckpoint`: after consuming every batch up to and including L1 block
+// `l1_block - 1`, the delayed cursor is `delayed_count` and the chain has reached `l2_block`.
+type resumeCheckpoint struct {
+	L1Block      uint64 `json:"l1_block"`
+	DelayedCount uint64 `json:"delayed_count"`
+	L2Block      uint64 `json:"l2_block"`
+}
+
+type resumeLog struct {
+	Checkpoints []resumeCheckpoint `json:"checkpoints"`
+}
+
+func resumePoint(arbitrumdata string, convertPoint uint64, genesisBlock uint64, cacheMB, handles int) {
+	cp, ok := computeResumePoint(arbitrumdata, convertPoint, genesisBlock, cacheMB, handles)
+	if !ok {
+		fatal("resume-point", fmt.Errorf("no batch boundary at or below block %d", convertPoint))
+	}
+	out, err := json.Marshal(resumeLog{Checkpoints: []resumeCheckpoint{cp}})
+	if err != nil {
+		fatal("encode resume log", err)
+	}
+	fmt.Println(string(out))
+}
+
+func computeResumePoint(arbitrumdata string, convertPoint uint64, genesisBlock uint64, cacheMB, handles int) (resumeCheckpoint, bool) {
+	if convertPoint == 0 {
+		fatal("resume-point", fmt.Errorf("--l2-block is required"))
+	}
+	db, err := node.OpenDatabase(node.InternalOpenOptions{
+		DbEngine:  "pebble",
+		Directory: arbitrumdata,
+		DatabaseOptions: node.DatabaseOptions{
+			MetricsNamespace: "rethexport/",
+			ReadOnly:         true,
+			Cache:            cacheMB,
+			Handles:          handles,
+		},
+	})
+	if err != nil {
+		fatal("open arbitrumdata", err)
+	}
+	defer db.Close()
+
+	countBytes, err := db.Get([]byte("_sequencerBatchCount"))
+	if err != nil {
+		fatal("read _sequencerBatchCount", err)
+	}
+	var batchCount uint64
+	if err := rlp.DecodeBytes(countBytes, &batchCount); err != nil {
+		fatal("decode _sequencerBatchCount", err)
+	}
+	if batchCount == 0 {
+		fatal("resume-point", fmt.Errorf("arbitrumdata holds no batches"))
+	}
+
+	read := func(seq uint64) batchMetadata {
+		key := append([]byte("s"), encodeBE(seq)...)
+		raw, err := db.Get(key)
+		if err != nil {
+			fatal(fmt.Sprintf("read batch meta %d", seq), err)
+		}
+		var meta batchMetadata
+		if err := rlp.DecodeBytes(raw, &meta); err != nil {
+			fatal(fmt.Sprintf("decode batch meta %d", seq), err)
+		}
+		return meta
+	}
+	// The last L2 block a batch produced. Message index n is block genesisBlock+n.
+	lastBlock := func(seq uint64) uint64 { return genesisBlock + read(seq).MessageCount - 1 }
+
+	// Largest batch whose blocks are all at or below the convert point.
+	lo, hi := uint64(0), batchCount-1
+	if lastBlock(lo) > convertPoint {
+		fatal("resume-point", fmt.Errorf("even batch 0 ends at block %d, above the convert point %d", lastBlock(lo), convertPoint))
+	}
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if lastBlock(mid) <= convertPoint {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+
+	// Several batches can share one parent-chain block. Resuming at ParentChainBlock+1 would then
+	// skip the siblings posted in the same block, leaving a gap that nothing later detects. Step
+	// back until the chosen batch is the last one in its parent-chain block.
+	chosen := lo
+	for chosen > 0 && chosen+1 < batchCount && read(chosen+1).ParentChainBlock == read(chosen).ParentChainBlock {
+		chosen--
+	}
+	meta := read(chosen)
+	cp := resumeCheckpoint{
+		L1Block:      meta.ParentChainBlock + 1,
+		DelayedCount: meta.DelayedMessageCount,
+		L2Block:      genesisBlock + meta.MessageCount - 1,
+	}
+	fmt.Fprintf(os.Stderr,
+		"batches=%d convert_point=%d chosen_batch=%d (stepped back %d) parent_chain_block=%d\n",
+		batchCount, convertPoint, chosen, lo-chosen, meta.ParentChainBlock)
+	fmt.Fprintf(os.Stderr,
+		"resuming at L1 %d skips %d parent-chain blocks of re-derivation\n",
+		cp.L1Block, cp.L1Block-read(0).ParentChainBlock)
+	return cp, true
+}
+
+func encodeBE(v uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, v)
+	return b
 }
