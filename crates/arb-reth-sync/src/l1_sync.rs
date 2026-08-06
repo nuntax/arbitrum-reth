@@ -28,15 +28,15 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::pin::Pin;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_l1::sync::{
-    derive_from_resolved_cached, resolve_batches, DelayedCache, ReportStatsCache,
-    DEFAULT_DELAYED_WINDOW,
+    DEFAULT_DELAYED_WINDOW, DelayedCache, ReportStatsCache, derive_from_resolved_cached,
+    resolve_batches,
 };
 use arb_reth_l1::{BeaconClient, DelayedInboxReader, DeliveredBatch, SequencerInboxReader};
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
@@ -55,9 +55,14 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// unsupported chain data remains visible instead of becoming an infinite retry loop.
 #[derive(Debug)]
 pub enum L1SyncError {
-    /// An execution RPC or beacon request failed. The provider's error text is intentionally not
-    /// retained because HTTP client errors may contain credential-bearing endpoint URLs.
-    Provider { operation: &'static str },
+    /// An execution RPC or beacon request failed. `detail` is the provider's message with any URL
+    /// redacted, because HTTP client errors carry credential-bearing endpoint URLs and these end up
+    /// in logs. Without it a quota-exhausted endpoint and a malformed response are
+    /// indistinguishable.
+    Provider {
+        operation: &'static str,
+        detail: String,
+    },
     /// The provider returned data, but deriving it failed deterministically.
     Derivation {
         operation: &'static str,
@@ -70,13 +75,19 @@ pub enum L1SyncError {
 }
 
 impl L1SyncError {
-    const fn provider(operation: &'static str) -> Self {
-        Self::Provider { operation }
+    fn provider(operation: &'static str) -> Self {
+        Self::Provider {
+            operation,
+            detail: String::new(),
+        }
     }
 
     fn l1(operation: &'static str, source: arb_reth_l1::L1Error) -> Self {
         if matches!(source, arb_reth_l1::L1Error::Rpc(_)) {
-            Self::Provider { operation }
+            Self::Provider {
+                operation,
+                detail: redact_urls(&source.to_string()),
+            }
         } else {
             Self::Derivation { operation, source }
         }
@@ -88,11 +99,44 @@ impl L1SyncError {
     }
 }
 
+/// Replace every URL in a provider message with a placeholder.
+///
+/// Endpoint URLs carry API keys, and often userinfo as well, so the raw message cannot go to a log.
+/// Everything around the URL is what actually identifies the failure ("429 Too Many Requests",
+/// "quota limit", "decode error"), so redacting rather than discarding keeps the diagnosis and
+/// loses the secret.
+fn redact_urls(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(sep) = rest.find("://") {
+        // Walk back over the scheme to the start of the URL.
+        let scheme_start = rest[..sep]
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.')
+            .map_or(0, |i| i + 1);
+        out.push_str(&rest[..scheme_start]);
+        out.push_str("<redacted-url>");
+        // Skip to the end of the URL: whitespace or a closing delimiter ends it.
+        let after = &rest[sep + 3..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == ')' || c == ',' || c == '"')
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl core::fmt::Display for L1SyncError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Provider { operation } => {
+            Self::Provider { operation, detail } if detail.is_empty() => {
                 write!(f, "transient L1 provider failure during {operation}")
+            }
+            Self::Provider { operation, detail } => {
+                write!(
+                    f,
+                    "transient L1 provider failure during {operation}: {detail}"
+                )
             }
             Self::Derivation { operation, source } => {
                 write!(
@@ -353,8 +397,12 @@ where
                 tracing::warn!(
                     target: "arb-reth::l1-sync",
                     operation = match &err {
-                        L1SyncError::Provider { operation } => *operation,
+                        L1SyncError::Provider { operation, .. } => *operation,
                         _ => unreachable!("only provider errors are retryable"),
+                    },
+                    detail = match &err {
+                        L1SyncError::Provider { detail, .. } => detail.as_str(),
+                        _ => "",
                     },
                     retry_ms = delay.as_millis() as u64,
                     made_progress,
@@ -389,7 +437,9 @@ where
     // throttle the happy path. Beacon blob fetches have their own retry (see BeaconClient).
     let url = cfg.l1_rpc.parse().map_err(|_| L1SyncError::InvalidRpcUrl)?;
     let client = alloy_rpc_client::ClientBuilder::default()
-        .layer(alloy_transport::layers::RetryBackoffLayer::new(10, 500, 660))
+        .layer(alloy_transport::layers::RetryBackoffLayer::new(
+            10, 500, 660,
+        ))
         .http(url);
     let provider = ProviderBuilder::new().connect_client(client);
     let seq_reader = SequencerInboxReader::new(provider.clone(), cfg.sequencer_inbox);
@@ -514,7 +564,9 @@ where
                 // The window delivers batches: scan it for real (prefetch the getLogs + payload fetch).
                 let (s, b) = (seq_reader.clone(), beacon.clone());
                 let handle =
-                    tokio::spawn(async move { resolve_batches(&s, b.as_ref(), from, win_to).await });
+                    tokio::spawn(
+                        async move { resolve_batches(&s, b.as_ref(), from, win_to).await },
+                    );
                 inflight.0.push_back((from, win_to, handle));
                 seen_batch_count = win_batch_count;
                 spawn_cursor = win_to + 1;
@@ -686,7 +738,11 @@ mod tests {
     use std::thread;
 
     fn cp(l1_block: u64, l2_block: u64) -> L1ResumeCheckpoint {
-        L1ResumeCheckpoint { l1_block, delayed_count: 0, l2_block }
+        L1ResumeCheckpoint {
+            l1_block,
+            delayed_count: 0,
+            l2_block,
+        }
     }
 
     /// Covers the variants that reach the caller directly rather than through `L1SyncError::l1`,
@@ -827,8 +883,9 @@ mod tests {
         let dir = reth_db::test_utils::tempdir_path();
         let path = L1ResumeLog::path_in(&dir);
         let mut log = L1ResumeLog::default();
-        let mut pending: VecDeque<L1ResumeCheckpoint> =
-            [cp(100, 10), cp(200, 20), cp(300, 30)].into_iter().collect();
+        let mut pending: VecDeque<L1ResumeCheckpoint> = [cp(100, 10), cp(200, 20), cp(300, 30)]
+            .into_iter()
+            .collect();
 
         // Nothing persisted past block 5 → no boundary is safe to append yet.
         maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 5);
@@ -838,13 +895,20 @@ mod tests {
         // Durable tip at 20 → boundaries 10 and 20 are safe; both logged, 30 stays queued.
         maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 20);
         let loaded = L1ResumeLog::load(&path).expect("log written");
-        assert_eq!(loaded.resume_for(u64::MAX), Some(cp(200, 20)), "newest logged is 20");
+        assert_eq!(
+            loaded.resume_for(u64::MAX),
+            Some(cp(200, 20)),
+            "newest logged is 20"
+        );
         assert_eq!(loaded.checkpoints, vec![cp(100, 10), cp(200, 20)]);
         assert_eq!(pending, [cp(300, 30)].into_iter().collect::<VecDeque<_>>());
 
         // Durable tip past 30 → final boundary flushes.
         maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 99);
-        assert_eq!(L1ResumeLog::load(&path).unwrap().resume_for(u64::MAX), Some(cp(300, 30)));
+        assert_eq!(
+            L1ResumeLog::load(&path).unwrap().resume_for(u64::MAX),
+            Some(cp(300, 30))
+        );
         assert!(pending.is_empty());
     }
 
@@ -856,8 +920,9 @@ mod tests {
         let path = L1ResumeLog::path_in(&dir);
         let mut log = L1ResumeLog::default();
         // Two windows produced block 10; the next two windows held no batches (l2 stays 10).
-        let mut pending: VecDeque<L1ResumeCheckpoint> =
-            [cp(100, 10), cp(200, 10), cp(300, 10)].into_iter().collect();
+        let mut pending: VecDeque<L1ResumeCheckpoint> = [cp(100, 10), cp(200, 10), cp(300, 10)]
+            .into_iter()
+            .collect();
 
         maybe_write_checkpoint(Some(&path), &mut log, &mut pending, 10);
         let loaded = L1ResumeLog::load(&path).expect("log written");
@@ -892,9 +957,15 @@ mod tests {
             ),
         );
         assert!(provider.is_retryable());
-        assert_eq!(
-            provider.to_string(),
-            "transient L1 provider failure during get_block_number"
+        let rendered = provider.to_string();
+        assert!(
+            !rendered.contains("secret") && !rendered.contains("example.invalid"),
+            "the endpoint URL must never reach a log: {rendered}"
+        );
+        assert!(
+            rendered.contains("error sending request for url")
+                && rendered.contains("<redacted-url>"),
+            "the part that identifies the failure must survive: {rendered}"
         );
         assert!(!format!("{provider:?}").contains("secret"));
 
@@ -903,7 +974,11 @@ mod tests {
             arb_reth_l1::L1Error::Missing("SequencerBatchData event"),
         );
         assert!(!deterministic.is_retryable());
-        assert!(deterministic.to_string().contains("missing SequencerBatchData event"));
+        assert!(
+            deterministic
+                .to_string()
+                .contains("missing SequencerBatchData event")
+        );
     }
 
     #[test]

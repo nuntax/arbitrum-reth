@@ -7,4 +7,5 @@
 pub mod arbitrum_one;
 pub mod preimages;
 pub mod readers;
+pub mod snapshot_stream;
 pub mod verify;

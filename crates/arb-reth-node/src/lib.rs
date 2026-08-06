@@ -38,6 +38,9 @@ pub use genesis::{
 };
 
 pub mod hashed_db;
+
+/// Decoder for the receipt layout a Nitro node writes into its chain freezer.
+pub mod stored_receipt;
 pub use hashed_db::{account_by_address, code_of, storage_at};
 
 pub mod persist;
