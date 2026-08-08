@@ -33,15 +33,17 @@ pub struct ArbPrecompilesMap {
 }
 
 impl ArbPrecompilesMap {
-    /// Builds the provider for an ArbOS version: eth precompile set (Cancun+P256 below ArbOS 50,
-    /// Osaka at/after, the same selection as the in-EVM path) plus the ArbOS addresses in the warm
-    /// set. ArbOS precompiles are dispatched by [`ArbPrecompilesEnum`], not stored in `inner`.
+    /// Builds the provider for an ArbOS version: eth precompile set (Berlin below ArbOS 30,
+    /// Cancun+P256 below ArbOS 50, Osaka at/after, the same selection as the in-EVM path) plus the
+    /// ArbOS addresses active at that version in the warm set. An inactive ArbOS precompile is an
+    /// empty account, so warming it would undercharge the caller by the 2500 cold-access delta.
+    /// ArbOS precompiles are dispatched by [`ArbPrecompilesEnum`], not stored in `inner`.
     pub fn new(spec: ArbSpecId) -> Self {
         let eth = arb_eth_precompiles(spec);
         let inner = PrecompilesMap::from_static(eth);
         let mut warm = AddressSet::default();
         warm.clone_from(eth.addresses_set());
-        for address in ArbPrecompilesEnum::all_addresses() {
+        for address in ArbPrecompilesEnum::active_addresses(spec.arbos_version()) {
             warm.insert(address);
         }
         Self { inner, warm }
