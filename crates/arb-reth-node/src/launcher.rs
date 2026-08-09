@@ -648,6 +648,7 @@ mod tests {
                 execution_cache_size: 256 * 1024 * 1024,
                 share_execution_cache_with_payload_builder: true,
                 share_sparse_trie_with_payload_builder: false,
+                sparse_trie_prune_depth: 4,
             },
             prune_config: None,
             messages: rx,

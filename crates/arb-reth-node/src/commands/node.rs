@@ -98,6 +98,17 @@ pub struct NodeArgs {
     #[arg(long = "engine.cross-block-cache-size", default_value_t = 256, value_name = "MiB")]
     execution_cache_size_mb: usize,
 
+    /// Depth at which Reth prunes sparse-trie subtrees between state-root tasks.
+    ///
+    /// A larger depth retains more trie structure and can reduce subsequent root work, but grows
+    /// memory use. The default of four is Reth's conservative long-running setting.
+    #[arg(
+        long = "engine.sparse-trie-prune-depth",
+        default_value_t = 4,
+        value_name = "DEPTH"
+    )]
+    sparse_trie_prune_depth: usize,
+
     /// Share reth's cross-block execution cache with the serial native payload builder.
     #[arg(
         long = "share-execution-cache-with-payload-builder",
@@ -591,6 +602,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             share_execution_cache_with_payload_builder: args
                 .share_execution_cache_with_payload_builder,
             share_sparse_trie_with_payload_builder: args.share_sparse_trie_with_payload_builder,
+            sparse_trie_prune_depth: args.sparse_trie_prune_depth,
         },
         prune_config,
         messages: feed_rx,

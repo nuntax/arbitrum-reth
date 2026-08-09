@@ -695,6 +695,11 @@ pub struct ArbEngineTuning {
     /// retain reth's conservative payload-builder behavior on hosts that may build payloads in
     /// parallel.
     pub share_sparse_trie_with_payload_builder: bool,
+    /// Depth at which the sparse trie converts subtrees to hash stubs between blocks.
+    ///
+    /// Larger values retain more trie structure for subsequent state-root tasks, at a higher
+    /// memory cost. The Reth default of four remains the safe long-running setting.
+    pub sparse_trie_prune_depth: usize,
 }
 
 impl Default for ArbEngineTuning {
@@ -716,6 +721,7 @@ impl ArbEngineTuning {
             execution_cache_size: 256 * 1024 * 1024,
             share_execution_cache_with_payload_builder: true,
             share_sparse_trie_with_payload_builder: false,
+            sparse_trie_prune_depth: 4,
         }
     }
 
@@ -734,6 +740,7 @@ impl ArbEngineTuning {
             .with_share_sparse_trie_with_payload_builder(
                 self.share_sparse_trie_with_payload_builder,
             )
+            .with_sparse_trie_prune_depth(self.sparse_trie_prune_depth)
     }
 }
 

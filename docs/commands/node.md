@@ -55,6 +55,10 @@ Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [ob
 - `--engine.cross-block-cache-size <MiB>` controls Reth's cross-block account, storage, and
   bytecode cache. It defaults to 256 MiB for ArbOS's serial producer; Reth's generic 4 GiB
   `TreeConfig` default is unnecessarily sparse here.
+- `--engine.sparse-trie-prune-depth <DEPTH>` controls how much of the sparse trie is retained
+  between state-root tasks. It defaults to Reth's conservative depth of 4. Increase it only after
+  measuring memory and root-task cache hits; disabling pruning entirely is not appropriate for an
+  unbounded historical sync.
 
 ## Payload execution
 

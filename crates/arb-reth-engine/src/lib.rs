@@ -258,6 +258,7 @@ mod tests {
         let config = ArbEngineTuning::reth_defaults().to_tree_config();
 
         assert_eq!(config.cross_block_cache_size(), 256 * 1024 * 1024);
+        assert_eq!(config.sparse_trie_prune_depth(), 4);
         assert!(config.share_execution_cache_with_payload_builder());
         assert!(!config.share_sparse_trie_with_payload_builder());
     }
@@ -275,5 +276,23 @@ mod engine_tuning_tests {
                 .cross_block_cache_size(),
             256 * 1024 * 1024,
         );
+    }
+
+    #[test]
+    fn arb_default_sparse_trie_prune_depth_matches_reth() {
+        assert_eq!(
+            ArbEngineTuning::reth_defaults()
+                .to_tree_config()
+                .sparse_trie_prune_depth(),
+            4,
+        );
+    }
+
+    #[test]
+    fn arb_tuning_forwards_sparse_trie_prune_depth() {
+        let mut tuning = ArbEngineTuning::reth_defaults();
+        tuning.sparse_trie_prune_depth = 5;
+
+        assert_eq!(tuning.to_tree_config().sparse_trie_prune_depth(), 5);
     }
 }
