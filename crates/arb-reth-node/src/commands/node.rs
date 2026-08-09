@@ -22,7 +22,6 @@
 
 use std::{
     fs,
-    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -233,7 +232,6 @@ pub struct ArbNodeArgs {
     /// Use with `--datadir <imported-dir>`; no separate Reth chain spec is needed.
     #[arg(long = "snapshot-head", value_name = "PATH")]
     snapshot_head: Option<PathBuf>,
-
 }
 
 /// The L1 rollup deployment arb-reth reads from: the contract addresses plus the L1 block the
@@ -392,19 +390,16 @@ struct NodeBootstrap {
 async fn resolve_bootstrap(
     args: &ArbNodeArgs,
     fallback_chain_spec: Arc<ChainSpec>,
+    snapshot_datadir: Option<&Path>,
 ) -> eyre::Result<NodeBootstrap> {
-
     // --chain-info plus --genesis boots an Orbit chain. The pair supplies both the chain spec and
     // prealloc state, plus the L1 rollup deployment. Accepting either file alone would silently
     // construct a different genesis.
-    let orbit = match orbit_boot_paths(
-        args.chain_info.as_deref(),
-        args.genesis_json.as_deref(),
-    )? {
+    let orbit = match orbit_boot_paths(args.chain_info.as_deref(), args.genesis_json.as_deref())? {
         Some((ci, genesis)) => {
             let ci_json = fs::read(ci).map_err(|e| eyre::eyre!("read chain-info {ci:?}: {e}"))?;
-            let genesis_json = fs::read(genesis)
-                .map_err(|e| eyre::eyre!("read genesis {genesis:?}: {e}"))?;
+            let genesis_json =
+                fs::read(genesis).map_err(|e| eyre::eyre!("read genesis {genesis:?}: {e}"))?;
             let (spec, init, info) = crate::orbit_chain_from_files(&ci_json, &genesis_json)?;
             Some((std::sync::Arc::new(spec), init, info))
         }
@@ -447,9 +442,8 @@ async fn resolve_bootstrap(
         (None, Some(head_path), _) => {
             let (num, hash, header) = crate::read_head_header(head_path)?;
             snapshot_delayed = Some(u64::from_be_bytes(header.nonce.0));
-            let datadir = args.datadir.as_deref().ok_or_else(|| {
-                eyre::eyre!("--snapshot-head requires an explicit --datadir")
-            })?;
+            let datadir = snapshot_datadir
+                .ok_or_else(|| eyre::eyre!("--snapshot-head requires an explicit --datadir"))?;
             super::snapshot::validate_snapshot_import_for_launch(
                 datadir,
                 &(num, hash, header.clone()),
@@ -536,7 +530,13 @@ pub async fn run(
         }
     }
 
-    let bootstrap = resolve_bootstrap(&command.ext, command.chain.clone()).await?;
+    let snapshot_datadir = command.datadir.datadir.as_ref().map(Path::to_path_buf);
+    let bootstrap = resolve_bootstrap(
+        &command.ext,
+        command.chain.clone(),
+        snapshot_datadir.as_deref(),
+    )
+    .await?;
     command.chain = bootstrap.chain_spec.clone();
 
     command
@@ -583,18 +583,14 @@ fn validate_standalone_components(
             "dev mode is unsupported: ArbOS blocks must be derived from Arbitrum messages"
         ));
     }
-    if command.era.enabled
-        || command.era.source.path.is_some()
-        || command.era.source.url.is_some()
+    if command.era.enabled || command.era.source.path.is_some() || command.era.source.url.is_some()
     {
         return Err(eyre::eyre!(
             "ERA import is unsupported: it imports Ethereum block bodies rather than deriving ArbOS blocks"
         ));
     }
     if command.jit != Default::default() {
-        return Err(eyre::eyre!(
-            "--jit options are not wired to arb-revm yet"
-        ));
+        return Err(eyre::eyre!("--jit options are not wired to arb-revm yet"));
     }
 
     Ok(())
@@ -837,15 +833,21 @@ async fn launch(
         let (start_block, start_delayed, start_l2_block) = if let Some(b) = args.l1_start_block {
             // Manual override: the operator asserts `b` is the batch boundary the tip was built
             // from, so the next derived block is `db_tip + 1`.
-            let delayed = match args.l1_start_delayed {
-                Some(delayed) => delayed,
-                None => header_delayed_messages_read(&handle.provider, db_tip)?.ok_or_else(|| {
+            let delayed = args
+                .l1_start_delayed
+                .or(snapshot_delayed)
+                .or(if db_tip == l2_genesis_block {
+                    genesis_delayed
+                } else {
+                    None
+                })
+                .or(header_delayed_messages_read(&handle.provider, db_tip)?)
+                .ok_or_else(|| {
                     eyre::eyre!(
                         "cannot recover the delayed-message cursor: durable L2 tip header \
                          {db_tip} is missing; pass --l1-start-delayed explicitly"
                     )
-                })?,
-            };
+                })?;
             info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 resume point: --l1-start-block override");
             (b, delayed, db_tip)
         } else if let Some(log) = &resume_log {
@@ -940,9 +942,7 @@ async fn launch(
         let tx = feed_tx.clone();
         let fatal_tx = l1_fatal_tx;
         task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
-            if let Err(e) =
-                crate::supervise_l1_sync(sync_cfg, tx, persisted_tip, shutdown).await
-            {
+            if let Err(e) = crate::supervise_l1_sync(sync_cfg, tx, persisted_tip, shutdown).await {
                 reth_tracing::tracing::error!(
                     target: "arb-reth",
                     err = %e,
@@ -976,8 +976,8 @@ mod tests {
     use super::*;
     use alloy_consensus::Header;
     use alloy_primitives::{B64, B256};
-    use reth_provider::test_utils::MockEthProvider;
     use clap::{Parser, Subcommand};
+    use reth_provider::test_utils::MockEthProvider;
 
     const ROBINHOOD_CHAIN_INFO: &[u8] =
         include_bytes!("../../tests/fixtures/robinhood-chain-info.json");
@@ -1114,7 +1114,7 @@ mod tests {
         .command;
 
         assert_eq!(command.engine.persistence_threshold, 128);
-        assert_eq!(command.engine.memory_block_buffer_target, 64);
+        assert_eq!(command.engine.memory_block_buffer_target, Some(64));
         assert_eq!(command.engine.persistence_backpressure_threshold(), 512);
         assert_eq!(command.db.sync_mode, Some(SyncMode::SafeNoSync));
         assert!(command.pruning.full);
@@ -1127,26 +1127,19 @@ mod tests {
 
     #[test]
     fn generic_genesis_does_not_replace_arbos_bootstrap() {
-        let err = TestCli::try_parse_from([
-            "arb-reth",
-            "node",
-            "--chain",
-            "/tmp/ethereum-genesis.json",
-        ])
-        .expect_err("a generic Ethereum genesis is not an ArbOS bootstrap input");
+        let err =
+            TestCli::try_parse_from(["arb-reth", "node", "--chain", "/tmp/ethereum-genesis.json"])
+                .expect_err("a generic Ethereum genesis is not an ArbOS bootstrap input");
 
         assert!(err.to_string().contains("unsupported Arbitrum chain spec"));
     }
 
     #[test]
     fn noop_component_options_are_rejected() {
-        let TestCommand::Node(command) = TestCli::try_parse_from([
-            "arb-reth",
-            "node",
-            "--disable-discovery",
-        ])
-        .expect("the native parser should accept its standard flag")
-        .command;
+        let TestCommand::Node(command) =
+            TestCli::try_parse_from(["arb-reth", "node", "--disable-discovery"])
+                .expect("the native parser should accept its standard flag")
+                .command;
 
         let err = validate_standalone_components(&command)
             .expect_err("a no-op network setting must not be silently accepted");
