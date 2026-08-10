@@ -4,7 +4,7 @@
 
 It also follows a sequencer feed after catch-up, import Nitro state exports, verify genesis state roots, rewind a local database, and inspect stored blocks.
 
-> Experimental software. Do not use it to custody funds or as production infrastructure.
+> Experimental software. Do not use it to custody funds or as production infrastructure. You **will** run into state divergences.
 
 ## Snapshot sync benchmark
 
