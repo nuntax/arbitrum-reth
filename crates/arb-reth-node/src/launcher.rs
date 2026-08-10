@@ -10,21 +10,21 @@
 //! Deadlock rule: never hold a read provider across a `provider_rw()`/`save_blocks()` call.
 
 use core::{future::Future, pin::Pin};
-use std::net::SocketAddr;
 
 use crate::metrics::FeedLatencyTracker;
 use alloy_consensus::Header;
 use arbitrum_alloy_consensus::reth::ArbPrimitives;
 use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use eyre::eyre;
+use futures_util::StreamExt;
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
-use reth_node_api::{AddOnsContext, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter};
+use reth_node_api::{AddOnsContext, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter};
 use reth_node_builder::hooks::NodeHooks;
 use reth_node_builder::{
-    AddOns, LaunchContext, LaunchNode, Node, NodeBuilderWithComponents, NodeComponents,
-    NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter,
+    AddOns, LaunchContext, LaunchNode, Node, NodeAdapter, NodeBuilderWithComponents,
+    NodeComponents, NodeComponentsBuilder, NodeTypesAdapter, RethFullAdapter, rpc::RethRpcAddOns,
 };
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
@@ -70,7 +70,7 @@ impl<P> ArbNodeHandle<P> {
     }
 }
 
-/// A custom `LaunchNode` for the no-engine Arbitrum node.
+/// A custom `LaunchNode` for the self-driven Arbitrum node.
 ///
 /// Reuses reth's `LaunchContext` type-state chain for DB/provider/blockchain-db/task
 /// infrastructure but skips the sync pipeline and consensus-engine orchestrator. Spawns
@@ -87,21 +87,15 @@ pub struct ArbLauncher {
     pub genesis_block: u64,
     /// Engine-tree persistence tuning (batch/buffer/backpressure knobs).
     pub tuning: ArbEngineTuning,
-    /// Optional history-pruning configuration from `--prune.*` / `--full`. `None` keeps the node
-    /// an archive node. A configured mode is applied to both the provider factory and the
-    /// engine-tree persistence pruner so static-file writes follow the same segment policy.
-    pub prune_config: Option<reth_config::PruneConfig>,
     /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
     /// tip, so no per-message version is carried.
     pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
     /// Correlates live WebSocket feed messages with canonical in-memory state for Prometheus.
     /// `None` keeps replay and L1-only operation free of feed-latency instrumentation.
     pub feed_latency: Option<FeedLatencyTracker>,
-    /// Optional HTTP bind address for the `eth_*` RPC server (`None` disables RPC).
-    pub rpc_addr: Option<SocketAddr>,
 }
 
-impl<N, DB, T, CB> LaunchNode<NodeBuilderWithComponents<T, CB, ()>> for ArbLauncher
+impl<N, DB, T, CB, AO> LaunchNode<NodeBuilderWithComponents<T, CB, AO>> for ArbLauncher
 where
     N: Node<RethFullAdapter<DB, N>>
         + NodeTypesForProvider
@@ -119,6 +113,7 @@ where
             DB = DB,
         >,
     CB: NodeComponentsBuilder<T> + 'static,
+    AO: RethRpcAddOns<NodeAdapter<T, CB::Components>> + 'static,
     <CB::Components as NodeComponents<T>>::Evm:
         ConfigureEvm<Primitives = ArbPrimitives> + Into<arb_reth_evm::ArbEvmConfig> + Clone,
     CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
@@ -155,7 +150,7 @@ where
     type Node = ArbNodeHandle<BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>>;
     type Future = Pin<Box<dyn Future<Output = eyre::Result<Self::Node>> + Send>>;
 
-    fn launch_node(self, target: NodeBuilderWithComponents<T, CB, ()>) -> Self::Future {
+    fn launch_node(self, target: NodeBuilderWithComponents<T, CB, AO>) -> Self::Future {
         Box::pin(self.launch_impl(target))
     }
 }
@@ -163,9 +158,9 @@ where
 impl ArbLauncher {
     /// Core async launch body. Separated from `launch_node` so it can be `async fn`
     /// (the trait requires a boxed future; `launch_node` boxes it).
-    async fn launch_impl<N, DB, T, CB>(
+    async fn launch_impl<N, DB, T, CB, AO>(
         self,
-        target: NodeBuilderWithComponents<T, CB, ()>,
+        target: NodeBuilderWithComponents<T, CB, AO>,
     ) -> eyre::Result<ArbNodeHandle<BlockchainProvider<NodeTypesWithDBAdapter<N, DB>>>>
     where
         N: Node<RethFullAdapter<DB, N>>
@@ -184,6 +179,7 @@ impl ArbLauncher {
                 DB = DB,
             >,
         CB: NodeComponentsBuilder<T> + 'static,
+        AO: RethRpcAddOns<NodeAdapter<T, CB::Components>> + 'static,
         <CB::Components as NodeComponents<T>>::Evm:
             ConfigureEvm<Primitives = ArbPrimitives> + Into<arb_reth_evm::ArbEvmConfig> + Clone,
         CB::Components: NodeComponents<T, Evm = arb_reth_evm::ArbEvmConfig>,
@@ -197,10 +193,8 @@ impl ArbLauncher {
             chain_id,
             genesis_block,
             tuning,
-            prune_config,
             messages,
             feed_latency,
-            rpc_addr,
         } = self;
 
         let NodeBuilderWithComponents {
@@ -211,7 +205,7 @@ impl ArbLauncher {
                 AddOns {
                     hooks,
                     exexs: _,
-                    add_ons: _,
+                    add_ons,
                 },
             config,
         } = target;
@@ -220,21 +214,10 @@ impl ArbLauncher {
             ..
         } = hooks;
 
-        // Drive RPC config from the explicit `rpc_addr`: canonical `RpcAddOns` reads addresses from
-        // `NodeConfig.rpc`, not an arg. Enable http+ws with the full module fleet; this node is
-        // self-driven from L1 derivation, so the auth/engine server is disabled.
+        // The native command owns public RPC configuration. This node is self-driven from L1
+        // derivation, so its authenticated Engine API server must always stay disabled.
         let mut config = config;
-        if let Some(addr) = rpc_addr {
-            config.rpc.http = true;
-            config.rpc.http_addr = addr.ip();
-            config.rpc.http_port = addr.port();
-            config.rpc.http_api = Some(reth_rpc_server_types::RpcModuleSelection::All);
-            config.rpc.ws = true;
-            config.rpc.ws_addr = addr.ip();
-            config.rpc.ws_port = addr.port();
-            config.rpc.ws_api = Some(reth_rpc_server_types::RpcModuleSelection::All);
-            config.rpc.disable_auth_server = true;
-        }
+        config.rpc.disable_auth_server = true;
 
         let overlay_manager = OverlayManager::<ArbPrimitives>::new(
             ctx.task_executor.state_trie_overlay_worker_pool(),
@@ -244,7 +227,36 @@ impl ArbLauncher {
         let ctx = ctx
             .with_configured_globals(0)
             .with_loaded_toml_config(config)?
-            .attach(database.clone())
+            .attach(database.clone());
+
+        // TOML is intentionally allowed to configure the public Reth RPC servers, but this
+        // standalone node has no beacon-engine service to back an authenticated Engine API.
+        // Apply this after TOML merging so no config file can inadvertently expose it.
+        let mut ctx = ctx;
+        ctx.node_config_mut().rpc.disable_auth_server = true;
+
+        // Use Reth's effective configuration after the native CLI and persisted `reth.toml` have
+        // been merged. The provider factory and persistence pruner must use these exact same modes:
+        // otherwise a run can try to append a static-file segment that an earlier run pruned.
+        let prune_config = ctx.prune_config();
+        if prune_config.is_default() {
+            reth_tracing::tracing::info!(
+                target: "arb-reth",
+                "archive node (no pruning configured; keeping all history)",
+            );
+        } else {
+            reth_tracing::tracing::info!(
+                target: "arb-reth",
+                segments = ?prune_config.segments,
+                block_interval = prune_config.block_interval,
+                minimum_pruning_distance = prune_config.minimum_pruning_distance,
+                "history pruning enabled",
+            );
+        }
+        let prune_builder =
+            (!prune_config.is_default()).then(|| reth_prune::PrunerBuilder::new(prune_config));
+
+        let ctx = ctx
             .with_adjusted_configs()
             .with_provider_factory::<NodeTypesWithDBAdapter<N, DB>, <CB::Components as NodeComponents<T>>::Evm>(
                 overlay_manager.clone(),
@@ -286,21 +298,35 @@ impl ArbLauncher {
             .with_components(components_builder, on_component_initialized)
             .await?;
 
+        let rpc = &ctx.node_config().rpc;
+        let rpc_enabled = rpc.http || rpc.ws || !rpc.ipcdisable;
+
         let provider: BlockchainProvider<NodeTypesWithDBAdapter<N, DB>> =
             ctx.node_adapter().provider.clone();
-        // Reth's provider factory consults `PruneModes` while it writes static-file segments. In
-        // particular, full sender recovery pruning stops new TransactionSenders writes. Feeding
-        // the configuration only to `PrunerBuilder` would let the writer append to a segment the
-        // pruner deletes, breaking its contiguous-block invariant on the next persistence batch.
+        // `with_provider_factory` already applied the merged pruning modes above.
         let provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DB>> =
-            ctx.provider_factory().clone().with_prune_modes(
-                prune_config
-                    .as_ref()
-                    .map(|config| config.segments.clone())
-                    .unwrap_or_default(),
-            );
+            ctx.provider_factory().clone();
         let task_executor: TaskExecutor = ctx.task_executor().clone();
         let head = ctx.head();
+        let engine_events = reth_tokio_util::EventSender::default();
+        // Reth's generic `CanonicalBlockAdded` log treats the consensus header gas limit as
+        // executable block capacity and its event elapsed time as execution throughput. Neither
+        // interpretation is valid for Arbitrum: the header carries Nitro's permissive `2^50`
+        // envelope, and ArbOS execution happened before insertion into the engine tree. The
+        // driver emits an Arbitrum-aware replacement with its measured production timings.
+        let node_events = engine_events.new_listener().filter_map(|event| {
+            futures_util::future::ready(
+                (!matches!(
+                    &event,
+                    reth_engine_primitives::ConsensusEngineEvent::CanonicalBlockAdded(..)
+                ))
+                .then(|| event.into()),
+            )
+        });
+        task_executor.spawn_critical_task(
+            "events task",
+            reth_node_events::node::handle_events(None, Some(head.number), node_events),
+        );
 
         // Clone the in-memory state from the provider so the tree updates the same instance that
         // BlockchainProvider serves for RPC queries.
@@ -326,7 +352,8 @@ impl ArbLauncher {
             canonical,
             task_executor.clone(),
             tuning,
-            prune_config.map(reth_prune::PrunerBuilder::new),
+            prune_builder,
+            engine_events.clone(),
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
@@ -334,20 +361,23 @@ impl ArbLauncher {
 
         task_executor.spawn_critical_task("arb-engine-driver", async move {
             let res: eyre::Result<()> = async {
-                // Bench accounting: separate time spent WAITING for the next derived feed
-                // message (L1-fetch-bound) from time spent in advance() (compute/persist-bound).
-                // Emitted every 1000 blocks at target "arb-reth::bench"; harmless at info off.
-                let mut bench_recv_us: u128 = 0;
-                let mut bench_work_us: u128 = 0;
-                let mut bench_n: u64 = 0;
-                let mut bench_wall = std::time::Instant::now();
+                // Periodically summarize progress while distinguishing source wait from local
+                // production. Per-block and per-payload details remain available at DEBUG.
+                let mut status_recv_us: u128 = 0;
+                let mut status_work_us: u128 = 0;
+                let mut status_window_messages: u64 = 0;
+                let mut status_window_blocks: u64 = 0;
+                let mut status_total_blocks: u64 = 0;
+                let mut status_last_applied_sequence: Option<u64> = None;
+                let mut status_window = std::time::Instant::now();
+                const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
                 const MAX_MESSAGE_BATCH: usize = 64;
                 loop {
                     let __r = std::time::Instant::now();
                     let Some(first) = messages_rx.recv().await else {
                         break;
                     };
-                    bench_recv_us += __r.elapsed().as_micros();
+                    status_recv_us += __r.elapsed().as_micros();
 
                     // A batch is a deterministic proof that another message is ready. It replaces
                     // the receiver's racy `is_empty()` hint: historical catch-up can overlap the
@@ -375,34 +405,49 @@ impl ArbLauncher {
                                 .record_driver_dequeue(msg.sequence_number, driver_dequeued_at);
                         }
                         let __w = std::time::Instant::now();
+                        let mut applied_blocks = 0u64;
+                        let mut last_applied_sequence = None;
                         driver
                             .advance_with_applied_overlap(
                                 &msg,
                                 index + 1 < batch_len,
                                 |sequence_number, applied| {
+                                    applied_blocks += 1;
+                                    last_applied_sequence = Some(sequence_number);
                                     if let Some(feed_latency) = feed_latency.as_ref() {
                                         feed_latency.record_canonical(sequence_number, applied);
                                     }
                                 },
                             )
                             .await?;
-                        bench_work_us += __w.elapsed().as_micros();
-                        bench_n += 1;
-                        if bench_n.is_multiple_of(1000) {
-                            let wall_ms = bench_wall.elapsed().as_millis().max(1);
+                        status_work_us += __w.elapsed().as_micros();
+                        status_window_messages += 1;
+                        status_window_blocks += applied_blocks;
+                        status_total_blocks += applied_blocks;
+                        if last_applied_sequence.is_some() {
+                            status_last_applied_sequence = last_applied_sequence;
+                        }
+                        if status_window.elapsed() >= STATUS_INTERVAL {
+                            let wall_ms = status_window.elapsed().as_millis().max(1);
                             tracing::info!(
-                                target: "arb-reth::bench",
-                                blocks = bench_n,
-                                blk_per_s = (1000u128 * 1000 / wall_ms) as u64,
-                                recv_ms = (bench_recv_us / 1000) as u64,
-                                work_ms = (bench_work_us / 1000) as u64,
-                                recv_pct = (100 * bench_recv_us
-                                    / (bench_recv_us + bench_work_us).max(1)) as u64,
-                                "bench: 1000-block window",
+                                target: "arb-reth::status",
+                                last_applied_sequence = ?status_last_applied_sequence,
+                                processed = status_total_blocks,
+                                input_messages = status_window_messages,
+                                window_blocks = status_window_blocks,
+                                blk_per_s =
+                                    (status_window_blocks as u128 * 1000 / wall_ms) as u64,
+                                source_wait_ms = (status_recv_us / 1000) as u64,
+                                processing_ms = (status_work_us / 1000) as u64,
+                                source_wait_pct = (100 * status_recv_us
+                                    / (status_recv_us + status_work_us).max(1)) as u64,
+                                "Arbitrum sync status",
                             );
-                            bench_recv_us = 0;
-                            bench_work_us = 0;
-                            bench_wall = std::time::Instant::now();
+                            status_recv_us = 0;
+                            status_work_us = 0;
+                            status_window_messages = 0;
+                            status_window_blocks = 0;
+                            status_window = std::time::Instant::now();
                         }
                     }
 
@@ -422,7 +467,7 @@ impl ArbLauncher {
         // from L1 derivation, so the beacon-engine handle is a stub (dangling receiver: engine_*
         // calls would return `EngineUnavailable`), and the auth/engine server is disabled, so
         // nothing ever reaches it.
-        let rpc_handle = if rpc_addr.is_some() {
+        let rpc_handle = if rpc_enabled {
             let (engine_tx, _engine_rx) = tokio::sync::mpsc::unbounded_channel();
             let beacon_engine_handle =
                 reth_engine_primitives::ConsensusEngineHandle::new(engine_tx);
@@ -430,12 +475,10 @@ impl ArbLauncher {
                 node: ctx.node_adapter().clone(),
                 config: ctx.node_config(),
                 beacon_engine_handle,
-                engine_events: reth_tokio_util::EventSender::default(),
+                engine_events,
                 jwt_secret: ctx.auth_jwt_secret()?,
             };
-            let handle = crate::addons::arb_add_ons()
-                .launch_add_ons(add_ons_ctx)
-                .await?;
+            let handle = add_ons.launch_add_ons(add_ons_ctx).await?;
             Some(handle.rpc_server_handles.rpc)
         } else {
             None
@@ -535,6 +578,14 @@ mod tests {
         let data_dir =
             maybe_path.unwrap_or_chain_default(chain_spec.chain(), config.datadir.clone());
 
+        // Persist pruning only in reth.toml. This exercises the same restart path as a datadir
+        // whose sender static files were pruned by an earlier run without repeating `--full`.
+        let mut reth_config = reth_config::Config::default();
+        reth_config.set_prune_config(prune_config);
+        reth_config
+            .save(&data_dir.config())
+            .expect("save test pruning config");
+
         let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
         let launcher = ArbLauncher {
@@ -542,10 +593,8 @@ mod tests {
             chain_id,
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
-            prune_config: Some(prune_config),
             messages: rx,
             feed_latency: None,
-            rpc_addr: None,
         };
 
         let handle = launcher
@@ -641,18 +690,17 @@ mod tests {
             ctx: LaunchContext::new(task_executor, data_dir),
             chain_id: crate::ARB_ONE_CHAIN_ID,
             genesis_block: 0,
-            tuning: ArbEngineTuning {
-                persistence_threshold: 128,
-                memory_block_buffer_target: 0,
-                persistence_backpressure_threshold: 512,
-                execution_cache_size: 256 * 1024 * 1024,
-                share_execution_cache_with_payload_builder: true,
-                share_sparse_trie_with_payload_builder: false,
-            },
-            prune_config: None,
+            tuning: ArbEngineTuning::from_tree_config(
+                reth_engine_primitives::TreeConfig::default()
+                    .with_persistence_backpressure_threshold(512)
+                    .with_persistence_threshold(128)
+                    .with_memory_block_buffer_target(0)
+                    .with_cross_block_cache_size(256 * 1024 * 1024)
+                    .with_share_execution_cache_with_payload_builder(true)
+                    .with_share_sparse_trie_with_payload_builder(false),
+            ),
             messages: rx,
             feed_latency: None,
-            rpc_addr: None,
         };
         let handle = launcher
             .launch_node(node_builder_with_components)

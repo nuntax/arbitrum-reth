@@ -3,7 +3,7 @@
 //! Dispatches clap subcommands into the per-command implementations in
 //! [`arb_reth_node::commands`]:
 //!
-//! - `node`             the standalone no-engine node (feed / L1-derivation block producer + RPC)
+//! - `node`             the standalone Arbitrum node (feed / L1-derivation block producer + RPC)
 //! - `snapshot import`  import a Nitro genesis-state stream into reth MDBX
 //! - `snapshot import-full`  convert a full-snapshot stream (blocks + history + state)
 //! - `snapshot read`    read hashed-state from a converted snapshot
@@ -18,7 +18,7 @@ use arb_reth_node::commands::{
     self,
     dump_blocks::DumpBlocksArgs,
     genesis::{GenesisVerifyArgs, GenesisVerifyExportArgs},
-    node::NodeArgs,
+    node::{ArbChainSpecParser, ArbNodeArgs},
     rewind::RewindArgs,
     snapshot::{
         SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs,
@@ -27,8 +27,18 @@ use arb_reth_node::commands::{
     snapshot_full::{SnapshotFinalizeArgs, SnapshotImportFullArgs},
 };
 use clap::{Args, Parser, Subcommand};
+use reth_cli_commands::node::NodeCommand;
 use reth_cli_runner::CliRunner;
-use reth_tracing::{RethTracer, Tracer};
+use reth_node_core::{
+    args::{DefaultEngineValues, DefaultLogArgs, LogArgs, OtlpInitStatus, TraceArgs},
+    version::version_metadata,
+};
+use reth_node_metrics::recorder::install_prometheus_recorder;
+use reth_tasks::RayonConfig;
+use reth_tracing::{
+    Layers,
+    tracing::{info, warn},
+};
 
 /// Stack-probe shim for x86_64: wasmer references `__rust_probestack` which recent
 /// `compiler-builtins` no longer exports; this satisfies the linker. No-op on aarch64.
@@ -41,17 +51,32 @@ use reth_tracing::{RethTracer, Tracer};
 pub unsafe extern "C" fn __rust_probestack() {}
 
 #[derive(Debug, Parser)]
-#[command(name = "arb-reth", about = "Standalone no-engine Arbitrum (ArbOS-on-reth) node")]
+#[command(
+    author,
+    name = version_metadata().name_client.as_ref(),
+    version = version_metadata().short_version.as_ref(),
+    long_version = version_metadata().long_version.as_ref(),
+    about = "Standalone Arbitrum node built on Reth",
+    long_about = None
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Reth logging configuration.
+    #[command(flatten)]
+    logs: LogArgs,
+
+    /// Reth OpenTelemetry tracing configuration.
+    #[command(flatten)]
+    traces: TraceArgs,
 }
 
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Run the standalone no-engine Arbitrum node.
-    Node(NodeArgs),
+    /// Run the standalone Arbitrum node.
+    Node(Box<NodeCommand<ArbChainSpecParser, ArbNodeArgs>>),
     /// Snapshot import/read tools.
     Snapshot(SnapshotCmd),
     /// Genesis verification tools.
@@ -99,8 +124,60 @@ enum GenesisSub {
 }
 
 fn main() -> eyre::Result<()> {
-    // Idiomatic reth tracing; guard is held for the process lifetime.
-    let _guard = RethTracer::new().init()?;
+    // Ethereum's per-payload and per-commit INFO logs are too noisy for Arbitrum's block cadence.
+    // Keep periodic progress, lifecycle events, warnings, and errors at INFO. Operators can still
+    // opt into either hot-path target with the native log-filter flags.
+    const ARB_NODE_LOG_FILTER: &str = "payload_builder=warn,reth_node_events::node=warn";
+    const ARB_NODE_FILE_LOG_FILTER: &str = "info,payload_builder=warn,reth_node_events::node=warn";
+    DefaultLogArgs::default()
+        .with_log_stdout_filter(ARB_NODE_LOG_FILTER.to_string())
+        .with_log_file_filter(ARB_NODE_FILE_LOG_FILTER.to_string())
+        .try_init()
+        .expect("arb-reth initializes log defaults before any CLI parsing");
+
+    // Use Reth's native engine flags while retaining Arbitrum's empirically sensible defaults.
+    // `try_init` must happen before clap evaluates the flag defaults.
+    DefaultEngineValues::default()
+        .with_persistence_threshold(2)
+        .with_persistence_backpressure_threshold(16)
+        .with_memory_block_buffer_target(0)
+        .with_cross_block_cache_size(256)
+        .with_share_execution_cache_with_payload_builder(true)
+        .with_share_sparse_trie_with_payload_builder(false)
+        .try_init()
+        .expect("arb-reth initializes engine defaults before any CLI parsing");
+
+    let mut cli = Cli::parse();
+    if matches!(&cli.command, Command::Node(_)) {
+        cli.logs.apply_node_defaults();
+    }
+    let runtime_config = match &cli.command {
+        Command::Node(command) => reth_tasks::RuntimeConfig::default().with_rayon(RayonConfig {
+            reserved_cpu_cores: command.engine.reserved_cpu_cores,
+            proof_storage_worker_threads: command.engine.storage_worker_count,
+            proof_account_worker_threads: command.engine.account_worker_count,
+            prewarming_threads: command.engine.prewarming_threads,
+            ..Default::default()
+        }),
+        _ => reth_tasks::RuntimeConfig::default(),
+    };
+    let runner = CliRunner::try_with_runtime_config(runtime_config)?;
+
+    let mut layers = Layers::new();
+    let otlp_status = runner.block_on(cli.traces.init_otlp_tracing(&mut layers))?;
+    let _guard = cli.logs.init_tracing_with_layers(layers, false)?;
+    match otlp_status {
+        OtlpInitStatus::Started(endpoint) => {
+            info!(target: "arb-reth", %endpoint, "OTLP trace export enabled");
+        }
+        OtlpInitStatus::NoFeature => {
+            warn!(target: "arb-reth", "OTLP tracing requested without the otlp feature");
+        }
+        OtlpInitStatus::Disabled => {}
+    }
+
+    // Install the native recorder before any Arbitrum or Reth metric handle is initialized.
+    install_prometheus_recorder();
 
     // rustls 0.23 carries both the aws-lc-rs and ring backends in our dep tree, so it can't pick a
     // process-default CryptoProvider on its own; the first wss:// feed connect (connect_async builds
@@ -108,12 +185,9 @@ fn main() -> eyre::Result<()> {
     // Install the aws-lc-rs provider once here. Err just means one is already installed, so ignore.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let cli = Cli::parse();
-
     match cli.command {
-        Command::Node(args) => {
-            let runner = CliRunner::try_default_runtime()?;
-            runner.run_command_until_exit(|ctx| commands::node::run(ctx, args))
+        Command::Node(command) => {
+            runner.run_command_until_exit(move |ctx| commands::node::run(ctx, *command))
         }
         Command::Snapshot(cmd) => match cmd.command {
             SnapshotSub::BuildPreimages(args) => commands::snapshot::build_preimages(args),

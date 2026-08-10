@@ -52,6 +52,7 @@ reth-stages = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc
 reth-storage-api = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872", features = ["db-api"] }
 reth-storage-overlay = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-tasks = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
+reth-tokio-util = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-trie-db = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-trie = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 

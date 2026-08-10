@@ -93,11 +93,15 @@ futures-util = "0.3"
 # aws-lc-rs provider once at startup (see bin/arb-reth.rs). Direct dep only for that install call.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
-# D.3b.4: bin/arb-reth (clap CLI, reth runtime/ctrl-c harness, tracing, node-core)
+# D.3b.4: bin/arb-reth (native Reth CLI, runtime/ctrl-c harness, tracing, node-core)
 clap = { version = "4", features = ["derive"] }
+reth-cli = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
+reth-cli-commands = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-cli-runner = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-tracing = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
-reth-node-core = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
+reth-node-core = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872", features = ["otlp"] }
+reth-node-metrics = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
+reth-node-events = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 reth-metrics = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
 
 # D.5: Arbitrum RPC converters (receipt/rpc converters), consumed by the canonical RpcAddOns wiring.
