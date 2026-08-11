@@ -27,7 +27,9 @@ async fn rpc_serves_eth_queries() {
     let task_executor = Runtime::test();
     // The driver dedups by sequence number, so the two messages must be sequential (a fresh
     // genesis DB has genesis_block 0, so the first digested message is index 1).
-    let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+    let (tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+    let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(1);
+    drop(l1_tx);
     let mut m1 = feed_msg.clone();
     m1.sequence_number = 1;
     let mut m2 = feed_msg.clone();
@@ -60,7 +62,8 @@ async fn rpc_serves_eth_queries() {
         genesis_block: 0,
         tuning: arb_reth_node::ArbEngineTuning::reth_defaults(),
         prune_config: None,
-        messages: rx,
+        feed_messages: feed_rx,
+        l1_messages: l1_rx,
         feed_latency: None,
         rpc_addr: Some(rpc_addr),
     };

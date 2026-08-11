@@ -571,8 +571,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
 
     let node_builder = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
-    // The held sender keeps the driver parked (and the node alive) until SIGTERM.
+    // The held senders keep the driver parked (and the node alive) until SIGTERM. Keep the
+    // live-feed backlog separate from authoritative L1 derivation so a relay reconnect cannot
+    // place the L1 gap-closer behind thousands of feed-ahead messages.
     let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
+    let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
     // Only live WebSocket messages carry an ingress timestamp. L1-derived and replay messages
     // still drive the same engine callback, but have no sample to record.
     let feed_latency = args.feed_url.as_ref().map(|_| FeedLatencyTracker::new());
@@ -593,7 +596,8 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             share_sparse_trie_with_payload_builder: args.share_sparse_trie_with_payload_builder,
         },
         prune_config,
-        messages: feed_rx,
+        feed_messages: feed_rx,
+        l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),
         rpc_addr,
     };
@@ -680,6 +684,12 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                 // start-sequence header on the websocket upgrade.
                 let request = match feed_url.as_str().into_client_request() {
                     Ok(mut req) => {
+                        // Nitro advertises feed-client protocol v2 during the upgrade. Some
+                        // public relays accept an unversioned connection but never stream it.
+                        req.headers_mut().insert(
+                            "Arbitrum-Feed-Client-Version",
+                            "2".parse().expect("feed client version is a valid header"),
+                        );
                         if let Ok(val) = next_seq.to_string().parse() {
                             req.headers_mut().insert("Arbitrum-Requested-Sequence-Number", val);
                         }
@@ -891,7 +901,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         let tip_provider = handle.provider.clone();
         let persisted_tip = move || tip_provider.last_block_number().unwrap_or(0);
 
-        let tx = feed_tx.clone();
+        let tx = l1_tx.clone();
         let fatal_tx = l1_fatal_tx;
         task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
             if let Err(e) =
@@ -912,8 +922,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         info!(target: "arb-reth", start_block, start_delayed, start_l2_block, db_tip, "L1-derivation catch-up started");
     }
 
-    // Hold feed_tx alive so the driver parks on the channel rather than exiting.
+    // Hold both senders alive so the driver parks on the channels rather than exiting.
     let _feed_tx = feed_tx;
+    let _l1_tx = l1_tx;
 
     // Park until the node exits normally, or until L1 derivation gives up. Returning `Err` here
     // produces a non-zero exit, so a supervisor can restart or alert. When derivation never

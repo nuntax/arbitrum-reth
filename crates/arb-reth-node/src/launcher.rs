@@ -91,14 +91,51 @@ pub struct ArbLauncher {
     /// an archive node. A configured mode is applied to both the provider factory and the
     /// engine-tree persistence pruner so static-file writes follow the same segment policy.
     pub prune_config: Option<reth_config::PruneConfig>,
-    /// Feed channel of sequencer messages. The driver infers the ArbOS version from the chain
-    /// tip, so no per-message version is carried.
-    pub messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    /// Live-feed and replay messages. These may be ahead of the local canonical cursor when the
+    /// relay's bounded backlog begins after the database tip.
+    pub feed_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    /// Authoritative L1-derived messages. These are kept separate from the live feed so a large
+    /// feed-ahead backlog cannot delay the message that closes a derivation gap.
+    pub l1_messages: tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
     /// Correlates live WebSocket feed messages with canonical in-memory state for Prometheus.
     /// `None` keeps replay and L1-only operation free of feed-latency instrumentation.
     pub feed_latency: Option<FeedLatencyTracker>,
     /// Optional HTTP bind address for the `eth_*` RPC server (`None` disables RPC).
     pub rpc_addr: Option<SocketAddr>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageSource {
+    L1,
+    Feed,
+}
+
+/// Receives the next message, preferring the authoritative L1 path whenever both sources are
+/// ready. This is only an ingress scheduling decision: the engine driver remains the single
+/// sequence-reconciliation point and still deduplicates both sources by message index.
+async fn recv_next_message(
+    feed_messages: &mut tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    l1_messages: &mut tokio::sync::mpsc::Receiver<BroadcastFeedMessage>,
+    feed_open: &mut bool,
+    l1_open: &mut bool,
+) -> Option<(MessageSource, BroadcastFeedMessage)> {
+    loop {
+        if !*feed_open && !*l1_open {
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+            message = l1_messages.recv(), if *l1_open => match message {
+                Some(message) => return Some((MessageSource::L1, message)),
+                None => *l1_open = false,
+            },
+            message = feed_messages.recv(), if *feed_open => match message {
+                Some(message) => return Some((MessageSource::Feed, message)),
+                None => *feed_open = false,
+            },
+        }
+    }
 }
 
 impl<N, DB, T, CB> LaunchNode<NodeBuilderWithComponents<T, CB, ()>> for ArbLauncher
@@ -198,7 +235,8 @@ impl ArbLauncher {
             genesis_block,
             tuning,
             prune_config,
-            messages,
+            feed_messages,
+            l1_messages,
             feed_latency,
             rpc_addr,
         } = self;
@@ -330,7 +368,8 @@ impl ArbLauncher {
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
-        let mut messages_rx = messages;
+        let mut feed_messages = feed_messages;
+        let mut l1_messages = l1_messages;
 
         task_executor.spawn_critical_task("arb-engine-driver", async move {
             let res: eyre::Result<()> = async {
@@ -342,9 +381,18 @@ impl ArbLauncher {
                 let mut bench_n: u64 = 0;
                 let mut bench_wall = std::time::Instant::now();
                 const MAX_MESSAGE_BATCH: usize = 64;
+                let mut feed_open = true;
+                let mut l1_open = true;
                 loop {
                     let __r = std::time::Instant::now();
-                    let Some(first) = messages_rx.recv().await else {
+                    let Some((source, first)) = recv_next_message(
+                        &mut feed_messages,
+                        &mut l1_messages,
+                        &mut feed_open,
+                        &mut l1_open,
+                    )
+                    .await
+                    else {
                         break;
                     };
                     bench_recv_us += __r.elapsed().as_micros();
@@ -357,10 +405,18 @@ impl ArbLauncher {
                     batch.push(first);
                     let mut source_closed = false;
                     while batch.len() < MAX_MESSAGE_BATCH {
-                        match messages_rx.try_recv() {
+                        let receiver = match source {
+                            MessageSource::L1 => &mut l1_messages,
+                            MessageSource::Feed => &mut feed_messages,
+                        };
+                        match receiver.try_recv() {
                             Ok(msg) => batch.push(msg),
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                match source {
+                                    MessageSource::L1 => l1_open = false,
+                                    MessageSource::Feed => feed_open = false,
+                                }
                                 source_closed = true;
                                 break;
                             }
@@ -370,7 +426,9 @@ impl ArbLauncher {
                     let batch_len = batch.len();
                     for (index, msg) in batch.into_iter().enumerate() {
                         let driver_dequeued_at = std::time::Instant::now();
-                        if let Some(feed_latency) = feed_latency.as_ref() {
+                        if source == MessageSource::Feed
+                            && let Some(feed_latency) = feed_latency.as_ref()
+                        {
                             feed_latency
                                 .record_driver_dequeue(msg.sequence_number, driver_dequeued_at);
                         }
@@ -406,7 +464,7 @@ impl ArbLauncher {
                         }
                     }
 
-                    if source_closed {
+                    if source_closed && !feed_open && !l1_open {
                         break;
                     }
                 }
@@ -466,6 +524,36 @@ mod tests {
 
     use crate::ArbNode;
 
+    #[tokio::test]
+    async fn l1_ingress_preempts_a_ready_feed_backlog() {
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let json = std::fs::read_to_string(fixtures_dir.join("deposit_message_only.json"))
+            .expect("read fixture");
+        let mut feed_message: BroadcastFeedMessage =
+            serde_json::from_str(&json).expect("parse feed fixture");
+        let mut l1_message = feed_message.clone();
+        feed_message.sequence_number = 2;
+        l1_message.sequence_number = 1;
+
+        let (feed_tx, mut feed_rx) = tokio::sync::mpsc::channel(4);
+        let (l1_tx, mut l1_rx) = tokio::sync::mpsc::channel(4);
+        feed_tx
+            .send(feed_message)
+            .await
+            .expect("queue feed message");
+        l1_tx.send(l1_message).await.expect("queue L1 message");
+
+        let mut feed_open = true;
+        let mut l1_open = true;
+        let (source, message) =
+            recv_next_message(&mut feed_rx, &mut l1_rx, &mut feed_open, &mut l1_open)
+                .await
+                .expect("one source must be ready");
+
+        assert_eq!(source, MessageSource::L1);
+        assert_eq!(message.sequence_number, 1);
+    }
+
     /// `ArbLauncher` boots over reth's `LaunchContext` with full pruning, then persists two
     /// consecutive batches. The first batch deletes transaction-sender static files; the second
     /// must not recreate them, because the provider factory receives the same prune modes.
@@ -501,7 +589,9 @@ mod tests {
         // The driver dedups by sequence number, so messages must be sequential (a fresh genesis
         // DB has genesis_block 0, so the first digested message is index 1). Four messages with a
         // persistence threshold of two guarantee a second save after sender pruning has run.
-        let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+        let (tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(1);
+        drop(l1_tx);
         for sequence_number in 1..=4 {
             let mut message = feed_msg.clone();
             message.sequence_number = sequence_number;
@@ -543,7 +633,8 @@ mod tests {
             genesis_block: 0,
             tuning: ArbEngineTuning::reth_defaults(),
             prune_config: Some(prune_config),
-            messages: rx,
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
             feed_latency: None,
             rpc_addr: None,
         };
@@ -622,7 +713,9 @@ mod tests {
         let single_deposit = U256::from(111_000_000_000_000_000u128);
 
         let task_executor = Runtime::test();
-        let (tx, rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
+        let (tx, feed_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(4096);
+        let (l1_tx, l1_rx) = tokio::sync::mpsc::channel::<BroadcastFeedMessage>(1);
+        drop(l1_tx);
         let datadir = reth_db::test_utils::tempdir_path();
         let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir);
         let maybe_path =
@@ -650,7 +743,8 @@ mod tests {
                 share_sparse_trie_with_payload_builder: false,
             },
             prune_config: None,
-            messages: rx,
+            feed_messages: feed_rx,
+            l1_messages: l1_rx,
             feed_latency: None,
             rpc_addr: None,
         };
