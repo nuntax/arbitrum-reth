@@ -16,7 +16,7 @@ revm = { workspace = true }
 # impls live inside arb-alloy behind the `reth` feature (orphan rule).
 arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", default-features = false, features = ["reth"] }
 
-reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872" }
+reth-evm = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0" }
 alloy-evm = { version = "0.38", default-features = false }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
 metrics = "0.24"
@@ -29,7 +29,7 @@ alloy-primitives = { version = "1", default-features = false }
 # rpc feature: TryIntoTxEnv and BuildPendingEnv impls for Arbitrum RPC types.
 arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", optional = true }
 alloy-rpc-types-eth = { version = "2.0", default-features = false, optional = true }
-reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "49e941db296fc441c4747dca23b0e2f66c0a5872", optional = true }
+reth-rpc-eth-api = { git = "https://github.com/nuntax/reth.git", rev = "547581ff58e62577ef880e986a1b870feaa1a1b0", optional = true }
 
 [features]
 rpc = ["arbitrum-alloy-rpc-types", "alloy-rpc-types-eth", "alloy-evm/rpc", "reth-rpc-eth-api"]
