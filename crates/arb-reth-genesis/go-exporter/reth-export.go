@@ -587,7 +587,7 @@ func writeShortBytes(w *bufio.Writer, b []byte) {
 
 // Stream framing. Sections appear in this order and each is self-terminating.
 const (
-	snapStreamMagic = "ARBSNAP1"
+	snapStreamMagic = "ARBSNAP2"
 
 	// Section tags live above the record tags on purpose. They shared a range in the first draft,
 	// which made a receipts record inside the blocks section indistinguishable from the start of

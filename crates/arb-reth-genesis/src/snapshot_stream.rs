@@ -924,6 +924,13 @@ mod tests {
         assert!(err.contains("does not hash to"), "{err}");
     }
 
+    #[test]
+    fn full_snapshot_exporter_magic_matches_importer() {
+        let exporter = include_str!("../go-exporter/reth-export.go");
+        assert!(exporter.contains(r#"snapStreamMagic = "ARBSNAP2""#));
+        assert!(!exporter.contains(r#"snapStreamMagic = "ARBSNAP1""#));
+    }
+
     /// An empty body must produce the empty trie root, which is what a header with no transactions
     /// commits to.
     #[test]
