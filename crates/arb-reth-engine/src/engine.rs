@@ -76,7 +76,10 @@ use reth_trie::{
 use revm::context_interface::ContextTr as _;
 
 use crate::native_payload::ArbPayloadJobGenerator;
-use crate::{ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator};
+use crate::{
+    ArbPayloadAttributes, ArbPayloadBuilder, ArbPayloadTypes, ArbPayloadValidator,
+    ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent,
+};
 
 /// The concrete sender type returned by [`EngineApiTreeHandler::spawn_new`] for `ArbNode`.
 type ToTree = crossbeam_channel::Sender<
@@ -135,6 +138,11 @@ impl Drop for EngineTerminationGuard {
 }
 
 /// Produce one block and retain a breakdown of the local block-production work.
+///
+/// The input components are deliberately separate because the payload builder acquires the state
+/// providers and optional state-root task independently. Keep this local seam flat rather than
+/// adding an allocation solely to satisfy Clippy.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn produce_with_timing<'a>(
     evm_config: &ArbEvmConfig,
     chain_id: u64,
@@ -143,6 +151,7 @@ pub(crate) fn produce_with_timing<'a>(
     exec_state_provider: Box<dyn StateProvider + 'a>,
     trie_state_provider: Box<dyn StateProvider + 'a>,
     mut state_root_task: Option<PayloadStateRootHandle>,
+    tx_log_stream: Option<&ArbTxLogBroadcaster>,
 ) -> eyre::Result<(
     BuiltPayloadExecutedBlock<ArbPrimitives>,
     ArbBlockProductionTiming,
@@ -293,24 +302,30 @@ pub(crate) fn produce_with_timing<'a>(
     let mut derived_transactions = Duration::ZERO;
     let mut derived_transaction_execution = Duration::ZERO;
     let mut derived_retry_scheduling = Duration::ZERO;
+    let mut transaction_index = 0;
     loop {
-        let (tx, sender_result, is_internal) = if let Some(t) = first.take() {
+        let (tx, sender_result, kind) = if let Some(t) = first.take() {
             let sender = t.sender();
-            (t, sender, true)
+            (t, sender, ArbTxExecutionKind::StartBlock)
         } else if let Some(t) = redeems.pop_front() {
             let sender = t.sender();
-            (t, sender, false)
+            (t, sender, ArbTxExecutionKind::ScheduledRetry)
         } else if let Some((t, sender)) = user_txs.pop_front() {
-            (t, sender, false)
+            (t, sender, ArbTxExecutionKind::User)
         } else {
             break;
         };
+        let is_internal = matches!(kind, ArbTxExecutionKind::StartBlock);
         let tx_ty = tx.ty();
         let sender: Address =
             sender_result.map_err(|e| eyre!("failed to determine sender for tx {tx_ty}: {e}"))?;
+        // Do not hash or clone logs at all unless a local IPC client is actually connected.
+        let tx_log_stream = tx_log_stream.filter(|stream| stream.has_subscribers());
+        let tx_hash = tx_log_stream.map(|_| tx.hash());
         let recovered = Recovered::new_unchecked(tx, sender);
         let mut tx_logs: Vec<Log> = Vec::new();
         let mut tx_success = false;
+        let mut tx_log_event = None;
         let tx_started_at = Instant::now();
         if let Err(e) = builder.execute_transaction_with_result_closure(recovered, |res| {
             tx_success = res.result.result.is_success();
@@ -322,6 +337,17 @@ pub(crate) fn produce_with_timing<'a>(
                     .filter(|log| is_redeem_scheduled_log(log))
                     .cloned(),
             );
+            if let Some(transaction_hash) = tx_hash {
+                tx_log_event = Some(ArbTxLogEvent {
+                    block_number: parent_header.number + 1,
+                    transaction_index,
+                    transaction_hash,
+                    kind,
+                    success: tx_success,
+                    gas_used: res.result.result.tx_gas_used(),
+                    logs: res.result.result.logs().to_vec(),
+                });
+            }
         }) {
             let tx_execution = tx_started_at.elapsed();
             if is_internal {
@@ -351,6 +377,10 @@ pub(crate) fn produce_with_timing<'a>(
             );
             continue;
         }
+        if let (Some(stream), Some(event)) = (tx_log_stream, tx_log_event) {
+            stream.publish(event);
+        }
+        transaction_index += 1;
         let mut retry_scheduling = Duration::ZERO;
         if tx_success && !tx_logs.is_empty() {
             // FIFO, drained before the next user tx, matching Nitro's cascading-redeem order.
@@ -1143,6 +1173,7 @@ where
         runtime: Runtime,
         tuning: ArbEngineTuning,
         prune_builder: Option<PrunerBuilder>,
+        tx_log_stream: Option<ArbTxLogBroadcaster>,
     ) -> eyre::Result<Self> {
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1193,7 +1224,15 @@ where
             runtime.clone(),
         );
 
-        let builder = ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id);
+        let builder = match tx_log_stream {
+            Some(stream) => ArbPayloadBuilder::with_tx_log_stream(
+                provider.clone(),
+                evm_config.clone(),
+                chain_id,
+                stream,
+            ),
+            None => ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id),
+        };
         let generator = ArbPayloadJobGenerator::new(provider.clone(), runtime.clone(), builder);
         let (service, payload_builder) = PayloadBuilderService::<_, _, ArbPayloadTypes>::new(
             generator,

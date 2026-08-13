@@ -81,7 +81,7 @@ tracing = "0.1"
 metrics = "0.24"
 
 # D.4: standalone launcher (tokio channels)
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
 
 # Live sequencer-feed follower (--feed-url): websocket source into the feed channel.

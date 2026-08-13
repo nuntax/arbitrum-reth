@@ -9,5 +9,6 @@ Use the release binary in the examples below. Replace paths and endpoints with v
 - [dump-blocks](commands/dump-blocks.md): inspect persisted blocks.
 - [chains](chains/README.md): chain-specific operator notes.
 - [observability](observability/README.md): Prometheus metrics for the execute and persist loop.
+- [MEV transaction-log IPC](mev-tx-log-ipc.md): low-latency, pre-canonical transaction logs.
 
 Every command exposes its complete flag list through `arb-reth <command> --help`.
