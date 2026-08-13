@@ -55,6 +55,7 @@ pub mod launcher;
 pub use launcher::{ArbLauncher, ArbNodeHandle};
 
 mod mev_tx_logs;
+mod mev_frontier_rpc;
 
 mod metrics;
 pub use metrics::FeedLatencyTracker;
@@ -76,7 +77,7 @@ pub use arb_reth_rpc::{ArbReceiptConverter, ArbRpcConverter};
 // `arb-reth-engine` crate; re-export for API stability.
 pub use arb_reth_engine::{
     ArbBuiltPayload, ArbEngineDriver, ArbEngineTuning, ArbExecutionData, ArbPayloadAttributes,
-    ArbPayloadTypes, ArbPayloadValidator,
+    ArbPayloadTypes, ArbPayloadValidator, ArbTxExecutionKind, ArbTxLogBroadcaster,
 };
 
 use alloy_consensus::Header;

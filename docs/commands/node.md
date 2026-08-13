@@ -59,9 +59,13 @@ gas used, and logs. They are deliberately pre-canonical: there is no block hash 
 state-root or engine-insertion failure can discard the enclosing block. See the [wire
 specification](../mev-tx-log-ipc.md) before implementing a consumer.
 
+Enabling the feed also installs `arb_simulateAtFrontier`. Version-2 feed frames carry the exact
+post-transaction `frontierId` accepted by this method, allowing a client to simulate against the
+same in-progress state that produced the observed logs.
+
 The stream is best effort. A slow client is disconnected rather than delaying execution; reconnect
-to resume from the current transaction. Nothing is allocated or serialized for this stream while no
-client is connected.
+to resume from the current transaction. Log payloads are allocated only while a client is
+connected. Frontier state deltas are retained whenever the feature is enabled.
 
 ## Execution cache
 

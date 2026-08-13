@@ -21,6 +21,8 @@ alloy-consensus = { version = "2.0", default-features = false }
 alloy-eips = { version = "2.0", default-features = false }
 alloy-rpc-types-eth = { version = "2.0", default-features = false }
 alloy-rpc-types-engine = { version = "2.0", default-features = false, features = ["serde"] }
+alloy-serde = "2.0"
+alloy-evm = "0.38"
 alloy-genesis = { version = "2", default-features = false }
 alloy-trie = { version = "0.9", default-features = false }
 eyre = "0.6.12"

@@ -140,8 +140,8 @@ async fn stream_client(mut stream: UnixStream, mut events: broadcast::Receiver<A
 }
 
 /// Version of the binary frame format documented in `docs/mev-tx-log-ipc.md`.
-const FRAME_VERSION: u8 = 1;
-const FIXED_BODY_LEN: usize = 64;
+const FRAME_VERSION: u8 = 2;
+const FIXED_BODY_LEN: usize = 96;
 const MAX_LOG_TOPICS: usize = 4;
 
 fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
@@ -176,6 +176,7 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
     encoded.extend_from_slice(&event.transaction_index.to_be_bytes());
     encoded.extend_from_slice(&event.gas_used.to_be_bytes());
     encoded.extend_from_slice(event.transaction_hash.as_slice());
+    encoded.extend_from_slice(event.frontier_id.as_slice());
     encoded.extend_from_slice(&log_count.to_be_bytes());
     for log in &event.logs {
         let topics = log.data.topics();
@@ -206,6 +207,7 @@ mod tests {
             transaction_hash: b256!(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
+            frontier_id: B256::repeat_byte(0xcc),
             kind: ArbTxExecutionKind::User,
             success: true,
             gas_used: 21_000,
@@ -234,11 +236,12 @@ mod tests {
             u64::from_be_bytes(encoded[24..32].try_into().unwrap()),
             21_000
         );
-        assert_eq!(u32::from_be_bytes(encoded[64..68].try_into().unwrap()), 1);
-        assert_eq!(&encoded[68..88], Address::repeat_byte(0x11).as_slice());
-        assert_eq!(encoded[88], 1);
-        assert_eq!(u32::from_be_bytes(encoded[89..93].try_into().unwrap()), 2);
-        assert_eq!(&encoded[125..127], [0x12, 0x34]);
+        assert_eq!(&encoded[64..96], B256::repeat_byte(0xcc).as_slice());
+        assert_eq!(u32::from_be_bytes(encoded[96..100].try_into().unwrap()), 1);
+        assert_eq!(&encoded[100..120], Address::repeat_byte(0x11).as_slice());
+        assert_eq!(encoded[120], 1);
+        assert_eq!(u32::from_be_bytes(encoded[121..125].try_into().unwrap()), 2);
+        assert_eq!(&encoded[157..159], [0x12, 0x34]);
     }
 
     #[test]
@@ -257,6 +260,7 @@ mod tests {
             block_number: 42,
             transaction_index: 3,
             transaction_hash: B256::ZERO,
+            frontier_id: B256::repeat_byte(0xcc),
             kind: ArbTxExecutionKind::User,
             success: true,
             gas_used: 21_000,
@@ -280,6 +284,7 @@ mod tests {
             block_number: 42,
             transaction_index: 3,
             transaction_hash: B256::ZERO,
+            frontier_id: B256::repeat_byte(0xcc),
             kind: ArbTxExecutionKind::User,
             success: true,
             gas_used: 21_000,
