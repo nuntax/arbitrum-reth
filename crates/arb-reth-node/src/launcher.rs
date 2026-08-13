@@ -354,6 +354,9 @@ impl ArbLauncher {
         // `arb_evm_config` (hoisted from the RPC block below): also drives the engine tree.
         let arb_evm_config: arb_reth_evm::ArbEvmConfig =
             ctx.node_adapter().components.evm_config().clone();
+        let frontier_store = tx_log_stream
+            .as_ref()
+            .map(ArbTxLogBroadcaster::frontier_store);
 
         // Stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
         // sequencer feed through it. Persistence to MDBX is async (tree background service).
@@ -495,9 +498,23 @@ impl ArbLauncher {
                 engine_events: reth_tokio_util::EventSender::default(),
                 jwt_secret: ctx.auth_jwt_secret()?,
             };
-            let handle = crate::addons::arb_add_ons()
-                .launch_add_ons(add_ons_ctx)
-                .await?;
+            let mut add_ons = crate::addons::arb_add_ons();
+            if let Some(frontier_store) = frontier_store {
+                let frontier_provider = provider.clone();
+                let frontier_evm_config = arb_evm_config.clone();
+                let frontier_gas_cap = ctx.node_config().rpc.rpc_gas_cap;
+                add_ons = add_ons.extend_rpc_modules(move |rpc| {
+                    let module = crate::mev_frontier_rpc::module(
+                        frontier_store,
+                        frontier_provider,
+                        frontier_evm_config,
+                        frontier_gas_cap,
+                    )?;
+                    rpc.modules.merge_configured(module)?;
+                    Ok(())
+                });
+            }
+            let handle = add_ons.launch_add_ons(add_ons_ctx).await?;
             Some(handle.rpc_server_handles.rpc)
         } else {
             None

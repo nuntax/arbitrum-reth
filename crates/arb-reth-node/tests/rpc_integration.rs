@@ -11,7 +11,7 @@ use reth_chainspec::MAINNET;
 use reth_node_builder::{LaunchNode, NodeBuilder, NodeConfig};
 use reth_tasks::Runtime;
 
-use arb_reth_node::{ArbLauncher, ArbNode};
+use arb_reth_node::{ArbLauncher, ArbNode, ArbTxExecutionKind, ArbTxLogBroadcaster};
 
 /// `eth_*` JSON-RPC is live after node launch. Boots `ArbLauncher` with RPC on an
 /// ephemeral port, feeds two deposits, and verifies `eth_getBlockByNumber` and
@@ -56,6 +56,8 @@ async fn rpc_serves_eth_queries() {
     let node_builder_with_components = NodeBuilder::new(config).with_database(db).node(ArbNode);
 
     let rpc_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+    let tx_log_stream = ArbTxLogBroadcaster::new();
+    let mut tx_events = tx_log_stream.subscribe();
     let launcher = ArbLauncher {
         ctx: reth_node_builder::LaunchContext::new(task_executor.clone(), data_dir),
         chain_id: arb_reth_node::ARB_ONE_CHAIN_ID,
@@ -66,7 +68,7 @@ async fn rpc_serves_eth_queries() {
         l1_messages: l1_rx,
         feed_latency: None,
         rpc_addr: Some(rpc_addr),
-        tx_log_stream: None,
+        tx_log_stream: Some(tx_log_stream),
     };
 
     let handle = launcher
@@ -80,6 +82,41 @@ async fn rpc_serves_eth_queries() {
     let client = jsonrpsee::http_client::HttpClientBuilder::default()
         .build(&http_url)
         .expect("build http client");
+
+    // The custom frontier method sees the exact state directly after the first deposit, before
+    // that provisional block has a root or the second feed message has become canonical.
+    let first_deposit = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let event = tx_events.recv().await.expect("transaction event");
+            if event.block_number == 1 && event.kind == ArbTxExecutionKind::User {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("first deposit frontier");
+    let simulation: serde_json::Value = client
+        .request(
+            "arb_simulateAtFrontier",
+            jsonrpsee::rpc_params![serde_json::json!({
+                "frontierId": first_deposit.frontier_id,
+                "transaction": {
+                    "from": "0x3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e",
+                    "to": "0x0000000000000000000000000000000000000042",
+                    "value": "0x1",
+                    "gas": "0xf4240"
+                }
+            })],
+        )
+        .await
+        .expect("frontier simulation should succeed against the deposit delta");
+    assert_eq!(
+        simulation["frontierId"],
+        serde_json::json!(first_deposit.frontier_id)
+    );
+    assert_eq!(simulation["blockNumber"], "0x1");
+    assert_eq!(simulation["status"], "success");
+    assert_eq!(simulation["gasUsedForL1"], "0x0");
 
     // The engine tree canonicalizes + persists asynchronously, so wait (bounded) until the
     // node has produced both feed blocks before querying `latest`. This is a robustness wait,

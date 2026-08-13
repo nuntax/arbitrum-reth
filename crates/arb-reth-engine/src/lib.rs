@@ -32,7 +32,10 @@ mod tx_log_stream;
 pub use engine::{ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, wait_for_head};
 pub use engine_spike::ArbPayloadValidator;
 pub use native_payload::ArbPayloadBuilder;
-pub use tx_log_stream::{ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent};
+pub use tx_log_stream::{
+    ArbExecutionFrontier, ArbExecutionFrontierStore, ArbTxExecutionKind, ArbTxLogBroadcaster,
+    ArbTxLogEvent,
+};
 
 /// An executed Arbitrum payload produced by the local payload builder.
 #[derive(Debug, Clone)]
