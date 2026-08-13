@@ -138,6 +138,11 @@ impl Drop for EngineTerminationGuard {
 }
 
 /// Produce one block and retain a breakdown of the local block-production work.
+///
+/// The input components are deliberately separate because the payload builder acquires the state
+/// providers and optional state-root task independently. Keep this local seam flat rather than
+/// adding an allocation solely to satisfy Clippy.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn produce_with_timing<'a>(
     evm_config: &ArbEvmConfig,
     chain_id: u64,
