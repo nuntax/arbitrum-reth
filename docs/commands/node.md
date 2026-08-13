@@ -53,10 +53,11 @@ Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [ob
 ## MEV transaction-log IPC
 
 `--mev-tx-log-ipc /run/arb-reth/mev-logs.sock` opens a local Unix socket. Each connected client
-receives newline-delimited JSON after every included ArbOS transaction finishes EVM execution.
+receives one compact binary frame after every included ArbOS transaction finishes EVM execution.
 Events include the provisional block number, transaction index and hash, transaction kind, status,
 gas used, and logs. They are deliberately pre-canonical: there is no block hash yet, and a later
-state-root or engine-insertion failure can discard the enclosing block.
+state-root or engine-insertion failure can discard the enclosing block. See the [wire
+specification](../mev-tx-log-ipc.md) before implementing a consumer.
 
 The stream is best effort. A slow client is disconnected rather than delaying execution; reconnect
 to resume from the current transaction. Nothing is allocated or serialized for this stream while no

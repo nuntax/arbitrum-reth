@@ -1,8 +1,8 @@
 //! Best-effort local IPC for per-transaction ArbOS execution logs.
 //!
-//! The socket uses newline-delimited JSON. It is intentionally separate from RPC: callers receive
-//! a transaction as soon as its EVM execution completes, before receipt/state-root hashing and
-//! before the enclosing block becomes canonical.
+//! The socket uses a compact, length-delimited binary frame. It is intentionally separate from
+//! RPC: callers receive a transaction as soon as its EVM execution completes, before receipt/
+//! state-root hashing and before the enclosing block becomes canonical.
 
 use std::{
     fs,
@@ -10,10 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::B256;
 use arb_reth_engine::{ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent};
 use eyre::{Context, Result, bail};
-use serde::Serialize;
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
@@ -129,7 +128,7 @@ async fn stream_client(mut stream: UnixStream, mut events: broadcast::Receiver<A
                 reth_tracing::tracing::warn!(
                     target: "arb-reth::mev",
                     %error,
-                    "failed to serialize MEV transaction-log event"
+                    "failed to encode MEV transaction-log event"
                 );
                 continue;
             }
@@ -140,62 +139,60 @@ async fn stream_client(mut stream: UnixStream, mut events: broadcast::Receiver<A
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WireEvent<'a> {
-    event: &'static str,
-    block_number: u64,
-    transaction_index: u64,
-    transaction_hash: B256,
-    kind: &'static str,
-    success: bool,
-    gas_used: u64,
-    logs: Vec<WireLog<'a>>,
-}
+/// Version of the binary frame format documented in `docs/mev-tx-log-ipc.md`.
+const FRAME_VERSION: u8 = 1;
+const FIXED_BODY_LEN: usize = 64;
 
-#[derive(Serialize)]
-struct WireLog<'a> {
-    address: Address,
-    topics: &'a [B256],
-    data: &'a Bytes,
-}
+fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
+    let mut body_len = FIXED_BODY_LEN;
+    for log in &event.logs {
+        let topics = log.data.topics();
+        if topics.len() > u8::MAX as usize {
+            bail!("MEV transaction-log event has too many log topics")
+        }
+        body_len = body_len
+            .checked_add(25 + topics.len() * B256::len_bytes() + log.data.data.len())
+            .ok_or_else(|| eyre::eyre!("MEV transaction-log frame length overflow"))?;
+    }
+    let frame_len = u32::try_from(body_len)
+        .map_err(|_| eyre::eyre!("MEV transaction-log frame exceeds 4 GiB"))?;
 
-fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>, serde_json::Error> {
-    let event = WireEvent {
-        event: "transactionLogs",
-        block_number: event.block_number,
-        transaction_index: event.transaction_index,
-        transaction_hash: event.transaction_hash,
-        kind: match event.kind {
-            ArbTxExecutionKind::StartBlock => "startBlock",
-            ArbTxExecutionKind::User => "user",
-            ArbTxExecutionKind::ScheduledRetry => "scheduledRetry",
-        },
-        success: event.success,
-        gas_used: event.gas_used,
-        logs: event
-            .logs
-            .iter()
-            .map(|log| WireLog {
-                address: log.address,
-                topics: log.data.topics(),
-                data: &log.data.data,
-            })
-            .collect(),
-    };
-    let mut encoded = serde_json::to_vec(&event)?;
-    encoded.push(b'\n');
+    let mut encoded = Vec::with_capacity(4 + body_len);
+    encoded.extend_from_slice(&frame_len.to_be_bytes());
+    encoded.push(FRAME_VERSION);
+    encoded.push(match event.kind {
+        ArbTxExecutionKind::StartBlock => 0,
+        ArbTxExecutionKind::User => 1,
+        ArbTxExecutionKind::ScheduledRetry => 2,
+    });
+    encoded.push(u8::from(event.success));
+    encoded.push(0); // Reserved for future flags.
+    encoded.extend_from_slice(&event.block_number.to_be_bytes());
+    encoded.extend_from_slice(&event.transaction_index.to_be_bytes());
+    encoded.extend_from_slice(&event.gas_used.to_be_bytes());
+    encoded.extend_from_slice(event.transaction_hash.as_slice());
+    encoded.extend_from_slice(&(event.logs.len() as u32).to_be_bytes());
+    for log in &event.logs {
+        let topics = log.data.topics();
+        encoded.extend_from_slice(log.address.as_slice());
+        encoded.push(topics.len() as u8);
+        encoded.extend_from_slice(&(log.data.data.len() as u32).to_be_bytes());
+        for topic in topics {
+            encoded.extend_from_slice(topic.as_slice());
+        }
+        encoded.extend_from_slice(&log.data.data);
+    }
     Ok(encoded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Log, LogData, b256};
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use alloy_primitives::{Address, Bytes, Log, LogData, b256};
+    use tokio::io::AsyncReadExt;
 
     #[test]
-    fn encodes_one_newline_delimited_transaction_event() {
+    fn encodes_one_binary_transaction_event() {
         let event = ArbTxLogEvent {
             block_number: 42,
             transaction_index: 3,
@@ -216,14 +213,25 @@ mod tests {
             }],
         };
 
-        let encoded = encode_event(&event).expect("event serializes");
-        assert_eq!(encoded.last(), Some(&b'\n'));
-        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("valid JSON");
-        assert_eq!(value["event"], "transactionLogs");
-        assert_eq!(value["blockNumber"], 42);
-        assert_eq!(value["transactionIndex"], 3);
-        assert_eq!(value["kind"], "user");
-        assert_eq!(value["logs"][0]["data"], "0x1234");
+        let encoded = encode_event(&event).expect("event encodes");
+        assert_eq!(
+            u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize,
+            encoded.len() - 4
+        );
+        assert_eq!(encoded[4], FRAME_VERSION);
+        assert_eq!(encoded[5], 1); // user
+        assert_eq!(encoded[6], 1); // success
+        assert_eq!(u64::from_be_bytes(encoded[8..16].try_into().unwrap()), 42);
+        assert_eq!(u64::from_be_bytes(encoded[16..24].try_into().unwrap()), 3);
+        assert_eq!(
+            u64::from_be_bytes(encoded[24..32].try_into().unwrap()),
+            21_000
+        );
+        assert_eq!(u32::from_be_bytes(encoded[64..68].try_into().unwrap()), 1);
+        assert_eq!(&encoded[68..88], Address::repeat_byte(0x11).as_slice());
+        assert_eq!(encoded[88], 1);
+        assert_eq!(u32::from_be_bytes(encoded[89..93].try_into().unwrap()), 2);
+        assert_eq!(&encoded[125..127], [0x12, 0x34]);
     }
 
     #[test]
@@ -253,14 +261,16 @@ mod tests {
             logs: Vec::new(),
         });
 
-        let mut line = Vec::new();
-        BufReader::new(reader)
-            .read_until(b'\n', &mut line)
+        let mut length = [0; 4];
+        let mut reader = reader;
+        reader
+            .read_exact(&mut length)
             .await
-            .expect("read event");
-        let value: serde_json::Value = serde_json::from_slice(&line).expect("valid JSON");
-        assert_eq!(value["blockNumber"], 42);
-        assert_eq!(value["transactionIndex"], 3);
+            .expect("read frame length");
+        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+        reader.read_exact(&mut body).await.expect("read frame");
+        assert_eq!(body[4..12], 42u64.to_be_bytes());
+        assert_eq!(body[12..20], 3u64.to_be_bytes());
 
         drop(broadcaster);
         client.await.expect("client task exits");
