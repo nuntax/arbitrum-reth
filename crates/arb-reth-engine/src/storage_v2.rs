@@ -7,11 +7,12 @@
 
 use std::{
     sync::{Arc, OnceLock, mpsc},
-    thread::JoinHandle,
-    time::Instant,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use alloy_consensus::Header;
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{
     Address, B256, U256, keccak256,
     map::{B256Map, HashSet},
@@ -27,7 +28,7 @@ use reth_db_api::{
     tables,
     transaction::DbTx,
 };
-use reth_engine_tree::persistence::{PersistenceAction, PersistenceHandle};
+use reth_engine_tree::persistence::{PersistenceAction, PersistenceHandle, PersistenceResult};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::BuiltPayloadExecutedBlock;
 use reth_provider::{
@@ -48,6 +49,49 @@ use reth_trie::{
 
 /// Joins the persistence proxy after the engine-tree request sender has been dropped.
 pub(crate) struct PersistenceProxyGuard(Option<JoinHandle<()>>);
+
+/// The durable persistence frontiers confirmed by Reth's persistence service.
+///
+/// Reth determines these while it still owns the write transaction. Retaining them avoids
+/// reopening a static-file header immediately after a commit, before its index is necessarily
+/// visible to a new read-only provider.
+#[derive(Debug, Default)]
+struct PersistenceFrontiers {
+    last_block: Option<BlockNumHash>,
+    last_state_trie_block: Option<BlockNumHash>,
+}
+
+impl PersistenceFrontiers {
+    fn update(&mut self, result: &PersistenceResult) {
+        self.last_block = Some(result.last_block);
+        self.last_state_trie_block = Some(result.last_state_trie_block);
+    }
+
+    fn state_trie_parent(
+        &self,
+        prev_db_tip: u64,
+        prev_partial_state_trie: u64,
+    ) -> eyre::Result<B256> {
+        let last_block = self.last_block.ok_or_else(|| {
+            eyre!("persistence frontier cache is incomplete: missing database tip")
+        })?;
+        let last_state_trie_block = self.last_state_trie_block.ok_or_else(|| {
+            eyre!("persistence frontier cache is incomplete: missing state/trie tip")
+        })?;
+
+        if (last_block.number, last_state_trie_block.number)
+            != (prev_db_tip, prev_partial_state_trie)
+        {
+            return Err(eyre!(
+                "persistence input frontiers ({prev_db_tip}, {prev_partial_state_trie}) do not match confirmed frontiers ({}, {})",
+                last_block.number,
+                last_state_trie_block.number,
+            ));
+        }
+
+        Ok(last_state_trie_block.hash)
+    }
+}
 
 impl Drop for PersistenceProxyGuard {
     fn drop(&mut self) {
@@ -80,22 +124,25 @@ where
     let (sender, receiver) = mpsc::channel();
     let handle = spawn_os_thread("arb-storage-v2-persistence", move || {
         let mut preimages = None;
+        let mut frontiers = PersistenceFrontiers::default();
         while let Ok(action) = receiver.recv() {
             match action {
                 PersistenceAction::SaveBlocks(input, response) => {
-                    let input = match prepare_storage_v2_batch(&factory, input, &mut preimages) {
-                        Ok(input) => input,
-                        Err(err) => {
-                            tracing::error!(
-                                target: "arb-reth::persistence",
-                                %err,
-                                "failed to prepare Storage V2 persistence batch",
-                            );
-                            // Dropping the response sender makes the engine tree surface the
-                            // failure instead of persisting an unwind-unsafe batch.
-                            break;
-                        }
-                    };
+                    let input =
+                        match prepare_storage_v2_batch(&factory, input, &mut preimages, &frontiers)
+                        {
+                            Ok(input) => input,
+                            Err(err) => {
+                                tracing::error!(
+                                    target: "arb-reth::persistence",
+                                    %err,
+                                    "failed to prepare Storage V2 persistence batch",
+                                );
+                                // Dropping the response sender makes the engine tree surface the
+                                // failure instead of persisting an unwind-unsafe batch.
+                                break;
+                            }
+                        };
 
                     let (delegate_tx, delegate_rx) = crossbeam_channel::bounded(1);
                     if delegate.save_blocks(input, delegate_tx).is_err() {
@@ -104,6 +151,7 @@ where
                     let Ok(result) = delegate_rx.recv() else {
                         break;
                     };
+                    frontiers.update(&result);
                     let _ = response.send(result);
                 }
                 PersistenceAction::RemoveBlocksAbove(block, response) => {
@@ -114,6 +162,7 @@ where
                     let Ok(result) = delegate_rx.recv() else {
                         break;
                     };
+                    frontiers.update(&result);
                     let _ = response.send(result);
                 }
                 action => {
@@ -135,6 +184,7 @@ fn prepare_storage_v2_batch<N>(
     factory: &ProviderFactory<N>,
     input: SaveBlocksInput<ArbPrimitives>,
     preimages: &mut Option<SlotPreimages>,
+    frontiers: &PersistenceFrontiers,
 ) -> eyre::Result<SaveBlocksInput<ArbPrimitives>>
 where
     N: ProviderNodeTypes<Primitives = ArbPrimitives>,
@@ -161,7 +211,13 @@ where
         return Ok(input);
     }
 
-    validate_persistence_batch(&provider, &blocks, prev_db_tip, prev_partial_state_trie)?;
+    validate_persistence_batch(
+        factory,
+        frontiers,
+        &blocks,
+        prev_db_tip,
+        prev_partial_state_trie,
+    )?;
     let legacy = legacy_block_flags(&provider, &blocks)?;
     if !legacy.iter().any(|legacy| *legacy) {
         return Ok(input);
@@ -325,12 +381,72 @@ fn record_storage_v2_metrics(
     metrics.injected_slots.record(injected_slots as f64);
 }
 
-fn validate_persistence_batch<P>(
-    provider: &P,
+const BOOTSTRAP_FRONTIER_READ_ATTEMPTS: usize = 2;
+
+fn validate_persistence_batch<N>(
+    factory: &ProviderFactory<N>,
+    frontiers: &PersistenceFrontiers,
     blocks: &[ExecutedBlock<ArbPrimitives>],
     prev_db_tip: u64,
     prev_partial_state_trie: u64,
 ) -> eyre::Result<()>
+where
+    N: ProviderNodeTypes<Primitives = ArbPrimitives>,
+    <ProviderFactory<N> as DatabaseProviderFactory>::Provider:
+        BlockNumReader + HeaderProvider<Header = Header> + StageCheckpointReader,
+{
+    let expected_parent = if frontiers.last_state_trie_block.is_some() {
+        frontiers.state_trie_parent(prev_db_tip, prev_partial_state_trie)?
+    } else {
+        read_bootstrap_persistence_frontier(factory, prev_db_tip, prev_partial_state_trie)?
+    };
+
+    validate_persistence_blocks(blocks, prev_partial_state_trie, expected_parent)
+}
+
+fn read_bootstrap_persistence_frontier<N>(
+    factory: &ProviderFactory<N>,
+    prev_db_tip: u64,
+    prev_partial_state_trie: u64,
+) -> eyre::Result<B256>
+where
+    N: ProviderNodeTypes<Primitives = ArbPrimitives>,
+    <ProviderFactory<N> as DatabaseProviderFactory>::Provider:
+        BlockNumReader + HeaderProvider<Header = Header> + StageCheckpointReader,
+{
+    let mut last_error = None;
+    for attempt in 1..=BOOTSTRAP_FRONTIER_READ_ATTEMPTS {
+        let result = factory
+            .database_provider_ro()
+            .map_err(eyre::Report::from)
+            .and_then(|provider| {
+                read_durable_persistence_frontier(&provider, prev_db_tip, prev_partial_state_trie)
+            });
+        match result {
+            Ok(parent) => return Ok(parent),
+            Err(err) if attempt < BOOTSTRAP_FRONTIER_READ_ATTEMPTS => {
+                tracing::warn!(
+                    target: "arb-reth::persistence",
+                    attempt,
+                    max_attempts = BOOTSTRAP_FRONTIER_READ_ATTEMPTS,
+                    %err,
+                    "retrying Storage V2 persistence frontier bootstrap",
+                );
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_error.expect("bootstrap frontier loop returns on the final attempt"))
+}
+
+fn read_durable_persistence_frontier<P>(
+    provider: &P,
+    prev_db_tip: u64,
+    prev_partial_state_trie: u64,
+) -> eyre::Result<B256>
 where
     P: BlockNumReader + HeaderProvider<Header = Header> + StageCheckpointReader,
 {
@@ -355,13 +471,20 @@ where
             "persistence input frontiers ({prev_db_tip}, {prev_partial_state_trie}) do not match Finish checkpoint ({checkpoint_db_tip}, {checkpoint_state_trie_tip})"
         ));
     }
+    provider
+        .sealed_header(prev_partial_state_trie)?
+        .ok_or_else(|| eyre!("missing state/trie frontier header {prev_partial_state_trie}"))
+        .map(|header| header.hash())
+}
+
+fn validate_persistence_blocks(
+    blocks: &[ExecutedBlock<ArbPrimitives>],
+    prev_partial_state_trie: u64,
+    mut expected_parent: B256,
+) -> eyre::Result<()> {
     let mut expected_number = prev_partial_state_trie
         .checked_add(1)
         .ok_or_else(|| eyre!("durable block number overflow"))?;
-    let mut expected_parent = provider
-        .sealed_header(prev_partial_state_trie)?
-        .ok_or_else(|| eyre!("missing state/trie frontier header {prev_partial_state_trie}"))?
-        .hash();
 
     for block in blocks {
         if block.block_number() != expected_number {
@@ -740,6 +863,42 @@ mod tests {
                 Arc::new(trie_updates.into_sorted()),
             ),
         )
+    }
+
+    #[test]
+    fn cached_persistence_frontier_avoids_a_durable_header_read() -> eyre::Result<()> {
+        let factory =
+            create_test_provider_factory_with_node_types::<TestArbNode>(test_chain_spec());
+        init_genesis_with_settings(&factory, StorageSettings::v2())?;
+
+        // The database intentionally remains at genesis. A correct cached-frontier path must not
+        // inspect it while validating the next batch, because its static-file header may still be
+        // temporarily unavailable immediately after the preceding persistence commit.
+        let parent = b256!("0101010101010101010101010101010101010101010101010101010101010101");
+        let frontiers = PersistenceFrontiers {
+            last_block: Some(BlockNumHash::new(1, parent)),
+            last_state_trie_block: Some(BlockNumHash::new(1, parent)),
+        };
+        let block = executed_block(
+            arb_header(2, parent, B256::ZERO),
+            BundleState::default(),
+            HashedPostState::default(),
+            TrieUpdates::default(),
+        );
+
+        validate_persistence_batch(&factory, &frontiers, &[block], 1, 1)
+    }
+
+    #[test]
+    fn cached_persistence_frontier_rejects_a_real_frontier_mismatch() {
+        let hash = b256!("0101010101010101010101010101010101010101010101010101010101010101");
+        let frontiers = PersistenceFrontiers {
+            last_block: Some(BlockNumHash::new(1, hash)),
+            last_state_trie_block: Some(BlockNumHash::new(1, hash)),
+        };
+
+        let err = frontiers.state_trie_parent(2, 1).unwrap_err();
+        assert!(err.to_string().contains("do not match confirmed frontiers"));
     }
 
     #[test]
