@@ -125,6 +125,7 @@ mod tests {
             Runtime::test(),
             tuning,
             None,
+            None,
         )
         .expect("spawn native payload driver");
 
