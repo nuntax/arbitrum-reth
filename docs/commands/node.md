@@ -50,6 +50,18 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 Pass `--metrics 127.0.0.1:9001` to serve reth's Prometheus endpoint. See the [observability guide](../observability/README.md) for feed latency, engine-tree, persistence, and Prometheus scrape details.
 
+## MEV transaction-log IPC
+
+`--mev-tx-log-ipc /run/arb-reth/mev-logs.sock` opens a local Unix socket. Each connected client
+receives newline-delimited JSON after every included ArbOS transaction finishes EVM execution.
+Events include the provisional block number, transaction index and hash, transaction kind, status,
+gas used, and logs. They are deliberately pre-canonical: there is no block hash yet, and a later
+state-root or engine-insertion failure can discard the enclosing block.
+
+The stream is best effort. A slow client is disconnected rather than delaying execution; reconnect
+to resume from the current transaction. Nothing is allocated or serialized for this stream while no
+client is connected.
+
 ## Execution cache
 
 - `--engine.cross-block-cache-size <MiB>` controls Reth's cross-block account, storage, and

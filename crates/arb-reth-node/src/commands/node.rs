@@ -32,6 +32,7 @@ use crate::{
     ARB_ONE_CHAIN_ID, ArbNode, L1ResumeLog, arb_chain_spec, arbos_init_from_chain_config_json,
     arbos_init_from_parsed,
 };
+use crate::mev_tx_logs::MevTxLogIpc;
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_reth_l1::{DelayedInboxReader, SequencerInboxReader};
@@ -76,6 +77,12 @@ pub struct NodeArgs {
     /// Enable the reth Prometheus endpoint at this address.
     #[arg(long = "metrics", alias = "metrics.prometheus", value_name = "ADDR")]
     metrics: Option<SocketAddr>,
+
+    /// Path to a local Unix socket that receives one newline-delimited JSON event immediately
+    /// after each ArbOS transaction executes. This is a best-effort, pre-canonical stream: an
+    /// enclosing block can still fail during root calculation or engine insertion.
+    #[arg(long = "mev-tx-log-ipc", value_name = "PATH")]
+    mev_tx_log_ipc: Option<PathBuf>,
 
     /// Engine-tree persistence threshold: persist once the canonical tip is this many blocks
     /// ahead of the last persisted block (larger = bigger, less frequent commit batches).
@@ -414,6 +421,11 @@ async fn derive_genesis_from_l1(
 
 pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
+    let mev_tx_log_ipc = args
+        .mev_tx_log_ipc
+        .as_ref()
+        .map(|path| MevTxLogIpc::bind(path.clone()))
+        .transpose()?;
 
     // --chain-info plus --genesis boots an Orbit chain. The pair supplies both the chain spec and
     // prealloc state, plus the L1 rollup deployment. Accepting either file alone would silently
@@ -600,6 +612,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),
         rpc_addr,
+        tx_log_stream: mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster),
     };
 
     let handle = launcher.launch_node(node_builder).await?;
@@ -609,6 +622,14 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
         None => {
             info!(target: "arb-reth", "arb-reth node started (RPC disabled; pass --http to enable)")
         }
+    }
+
+    if let Some(ipc) = mev_tx_log_ipc {
+        let path = ipc.path().to_owned();
+        task_executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
+            ipc.serve(shutdown).await;
+        });
+        info!(target: "arb-reth::mev", path = %path.display(), "MEV transaction-log IPC listening");
     }
 
     if let Some(feed_path) = args.replay_feed {

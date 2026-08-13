@@ -30,7 +30,9 @@ use tokio::sync::oneshot;
 
 use metrics::{Counter, Histogram};
 
-use crate::{ArbBuiltPayload, ArbPayloadAttributes, engine::produce_with_timing};
+use crate::{
+    ArbBuiltPayload, ArbPayloadAttributes, ArbTxLogBroadcaster, engine::produce_with_timing,
+};
 
 /// Stable worker name for the serial ArbOS payload builder.
 const ARB_PAYLOAD_BUILDER_THREAD: &str = "arb-payload-builder";
@@ -41,6 +43,7 @@ pub struct ArbPayloadBuilder<P> {
     provider: P,
     evm_config: ArbEvmConfig,
     chain_id: u64,
+    tx_log_stream: Option<ArbTxLogBroadcaster>,
 }
 
 impl<P> ArbPayloadBuilder<P> {
@@ -50,6 +53,22 @@ impl<P> ArbPayloadBuilder<P> {
             provider,
             evm_config,
             chain_id,
+            tx_log_stream: None,
+        }
+    }
+
+    /// Creates a builder that emits best-effort execution observations to local consumers.
+    pub const fn with_tx_log_stream(
+        provider: P,
+        evm_config: ArbEvmConfig,
+        chain_id: u64,
+        tx_log_stream: ArbTxLogBroadcaster,
+    ) -> Self {
+        Self {
+            provider,
+            evm_config,
+            chain_id,
+            tx_log_stream: Some(tx_log_stream),
         }
     }
 
@@ -116,6 +135,7 @@ impl<P> ArbPayloadBuilder<P> {
             execution_state,
             trie_state,
             args.state_root_handle,
+            self.tx_log_stream.as_ref(),
         )
         .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
         timing.parent_state = parent_state;

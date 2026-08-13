@@ -66,6 +66,7 @@ async fn rpc_serves_eth_queries() {
         l1_messages: l1_rx,
         feed_latency: None,
         rpc_addr: Some(rpc_addr),
+        tx_log_stream: None,
     };
 
     let handle = launcher

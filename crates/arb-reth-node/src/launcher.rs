@@ -44,7 +44,7 @@ use tokio::sync::oneshot;
 
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
 
-use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning};
+use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning, ArbTxLogBroadcaster};
 
 /// Handle returned by `ArbLauncher` after the node has been launched.
 ///
@@ -102,6 +102,8 @@ pub struct ArbLauncher {
     pub feed_latency: Option<FeedLatencyTracker>,
     /// Optional HTTP bind address for the `eth_*` RPC server (`None` disables RPC).
     pub rpc_addr: Option<SocketAddr>,
+    /// Optional best-effort publisher for per-transaction execution logs.
+    pub tx_log_stream: Option<ArbTxLogBroadcaster>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +241,7 @@ impl ArbLauncher {
             l1_messages,
             feed_latency,
             rpc_addr,
+            tx_log_stream,
         } = self;
 
         let NodeBuilderWithComponents {
@@ -365,6 +368,7 @@ impl ArbLauncher {
             task_executor.clone(),
             tuning,
             prune_config.map(reth_prune::PrunerBuilder::new),
+            tx_log_stream,
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
@@ -637,6 +641,7 @@ mod tests {
             l1_messages: l1_rx,
             feed_latency: None,
             rpc_addr: None,
+            tx_log_stream: None,
         };
 
         let handle = launcher
@@ -747,6 +752,7 @@ mod tests {
             l1_messages: l1_rx,
             feed_latency: None,
             rpc_addr: None,
+            tx_log_stream: None,
         };
         let handle = launcher
             .launch_node(node_builder_with_components)
