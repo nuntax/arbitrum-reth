@@ -142,16 +142,21 @@ async fn stream_client(mut stream: UnixStream, mut events: broadcast::Receiver<A
 /// Version of the binary frame format documented in `docs/mev-tx-log-ipc.md`.
 const FRAME_VERSION: u8 = 1;
 const FIXED_BODY_LEN: usize = 64;
+const MAX_LOG_TOPICS: usize = 4;
 
 fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
+    let log_count = u32::try_from(event.logs.len())
+        .map_err(|_| eyre::eyre!("MEV transaction-log event has too many logs"))?;
     let mut body_len = FIXED_BODY_LEN;
     for log in &event.logs {
         let topics = log.data.topics();
-        if topics.len() > u8::MAX as usize {
+        if topics.len() > MAX_LOG_TOPICS {
             bail!("MEV transaction-log event has too many log topics")
         }
+        let data_len = u32::try_from(log.data.data.len())
+            .map_err(|_| eyre::eyre!("MEV transaction-log log data exceeds 4 GiB"))?;
         body_len = body_len
-            .checked_add(25 + topics.len() * B256::len_bytes() + log.data.data.len())
+            .checked_add(25 + topics.len() * B256::len_bytes() + data_len as usize)
             .ok_or_else(|| eyre::eyre!("MEV transaction-log frame length overflow"))?;
     }
     let frame_len = u32::try_from(body_len)
@@ -171,12 +176,14 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
     encoded.extend_from_slice(&event.transaction_index.to_be_bytes());
     encoded.extend_from_slice(&event.gas_used.to_be_bytes());
     encoded.extend_from_slice(event.transaction_hash.as_slice());
-    encoded.extend_from_slice(&(event.logs.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(&log_count.to_be_bytes());
     for log in &event.logs {
         let topics = log.data.topics();
         encoded.extend_from_slice(log.address.as_slice());
         encoded.push(topics.len() as u8);
-        encoded.extend_from_slice(&(log.data.data.len() as u32).to_be_bytes());
+        let data_len = u32::try_from(log.data.data.len())
+            .expect("validated while calculating MEV transaction-log frame length");
+        encoded.extend_from_slice(&data_len.to_be_bytes());
         for topic in topics {
             encoded.extend_from_slice(topic.as_slice());
         }
@@ -242,6 +249,24 @@ mod tests {
 
         assert!(remove_stale_socket(&path).is_err());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn rejects_more_than_four_topics() {
+        let event = ArbTxLogEvent {
+            block_number: 42,
+            transaction_index: 3,
+            transaction_hash: B256::ZERO,
+            kind: ArbTxExecutionKind::User,
+            success: true,
+            gas_used: 21_000,
+            logs: vec![Log {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(vec![B256::ZERO; 5], Bytes::new()),
+            }],
+        };
+
+        assert!(encode_event(&event).is_err());
     }
 
     #[tokio::test]
