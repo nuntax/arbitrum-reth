@@ -29,6 +29,8 @@ extern crate alloc;
 
 pub mod commands;
 
+mod feed;
+
 pub mod genesis;
 pub use genesis::{
     arb_chain_spec, arb_chain_spec_with_alloc, arb_chain_spec_with_header,

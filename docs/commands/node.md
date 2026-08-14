@@ -44,6 +44,30 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 `--feed-url` connects to a live sequencer relay. A relay is a tip source, not a history source, so use L1 derivation or a snapshot to catch up first. L1 derivation and the feed can run together; messages already applied through one source are reconciled by sequence number.
 
+Repeat `--feed-url` to race different relays. `--feed-connections N` opens `N` independent
+WebSockets to every supplied relay. The first decoded copy of a sequence is sent to the engine;
+duplicates are discarded by a bounded coordinator before they can delay execution. For example:
+
+```sh
+arb-reth node \
+  --feed-url wss://relay-a.example/feed \
+  --feed-url wss://relay-b.example/feed \
+  --feed-connections 3 \
+  ...
+```
+
+This creates six sockets. The first socket starts immediately and subsequent handshakes are
+staggered by one second. Each socket reconnects independently with bounded exponential backoff.
+HTTP 429 responses use a separate 30-second to five-minute backoff so an excessive connection
+count does not hammer the relay. The reconnect cursor advances only across a contiguous observed
+sequence prefix, so a faster connection cannot make reconnecting peers skip a gap.
+
+Start with two or three connections per relay and use the source metrics to verify that additional
+connections still win messages often enough to justify their bandwidth. The node accepts at most
+64 total feed connections, but a relay may enforce a much lower per-IP limit. Excess sockets stay
+on the rate-limit backoff and do not affect established connections. Endpoint paths, query strings,
+and credentials are excluded from logs and metric labels.
+
 `--no-l1-derive` makes the feed the only producer. It still needs `--l1-rpc` to bootstrap chain information, and it is appropriate only for a datadir that is already at the feed's retained range.
 
 ## Metrics

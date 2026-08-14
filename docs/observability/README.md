@@ -25,6 +25,23 @@ Use the phase metrics to locate the delay:
   nested diagnostics inside `engine_handoff_seconds`. Do not add them to the outer phases.
 - `reth_arb_reth_feed_tracking_dropped_total` should remain zero during normal operation.
 
+With parallel feed connections, the bounded `endpoint` and `connection` labels identify the
+zero-based command-line endpoint and its socket. They never contain the URL itself:
+
+- `reth_arb_reth_feed_source_connected` is `1` while that socket is established.
+- `source_connection_attempts_total`, `source_connections_total`, `source_disconnects_total`, and
+  `source_errors_total` describe connection health.
+- `source_messages_total` counts decoded messages, while `source_wins_total` counts messages for
+  which that socket supplied the first copy accepted by the coordinator.
+- `source_duplicates_total` counts valid sequences another socket won first. `source_stale_total`
+  counts messages older than the reconnect cursor.
+- `source_duplicate_lag_seconds` measures how much later a losing copy became ready than the
+  winner. `source_coordinator_delay_seconds` measures the added first-wins coordinator hop.
+
+Compare the increase in wins and the duplicate-lag tail when selecting a connection count. A
+connection that remains healthy but almost never wins is consuming bandwidth without improving
+the node's feed latency.
+
 ## ArbOS transaction execution
 
 The executor exports these bounded-label series for each consensus transaction family (`legacy`,
