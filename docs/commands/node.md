@@ -44,9 +44,10 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 `--feed-url` connects to a live sequencer relay. A relay is a tip source, not a history source, so use L1 derivation or a snapshot to catch up first. L1 derivation and the feed can run together; messages already applied through one source are reconciled by sequence number.
 
-Repeat `--feed-url` to race different relays. `--feed-connections N` opens `N` independent
-WebSockets to every supplied relay. The first decoded copy of a sequence is sent to the engine;
-duplicates are discarded by a bounded coordinator before they can delay execution. For example:
+Repeat `--feed-url` to race different relays. `--feed-connections N` opens `N` OS-selected
+WebSockets to every supplied relay. With no connection or source option, the default is one such
+ordinary socket. The first decoded copy of a sequence is sent to the engine; duplicates are
+discarded by a bounded coordinator before they can delay execution. For example:
 
 ```sh
 arb-reth node \
@@ -61,6 +62,27 @@ staggered by one second. Each socket reconnects independently with bounded expon
 HTTP 429 responses use a separate 30-second to five-minute backoff so an excessive connection
 count does not hammer the relay. The reconnect cursor advances only across a contiguous observed
 sequence prefix, so a faster connection cannot make reconnecting peers skip a gap.
+
+For distinct network identities, repeat `--feed-source IP=COUNT`. Each declaration opens that many
+connections **per relay**, binding each TCP socket to the named local address before DNS-selected
+connection and TLS/WebSocket handshakes. If any source is declared and `--feed-connections` is
+omitted, there is no hidden OS-selected lane. Supplying both intentionally combines the unbound and
+source-bound groups. Duplicate IP declarations, zero counts and more than 64 expanded sockets are
+refused at startup.
+
+```sh
+arb-reth node \
+  --feed-url wss://relay.example/feed \
+  --feed-source 192.0.2.10=3 \
+  --feed-source 192.0.2.11=2 \
+  --feed-connections 1 \
+  ...
+```
+
+That example opens three sockets from `192.0.2.10`, two from `192.0.2.11`, and one ordinary
+OS-selected socket. On EC2, the declared addresses are private ENI addresses; map each to an EIP
+when distinct public source identities are required. Merely assigning secondary addresses without
+binding leaves ordinary sockets on the primary address.
 
 Start with two or three connections per relay and use the source metrics to verify that additional
 connections still win messages often enough to justify their bandwidth. The node accepts at most

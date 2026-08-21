@@ -188,10 +188,16 @@ pub struct NodeArgs {
     #[arg(long = "feed-url", value_name = "URL", action = clap::ArgAction::Append)]
     feed_urls: Vec<String>,
 
-    /// Independent WebSocket connections opened to each `--feed-url`. Racing multiple connections
-    /// can reduce tail latency when relay delivery or the network path varies per connection.
-    #[arg(long = "feed-connections", value_name = "COUNT", default_value_t = 1)]
-    feed_connections: usize,
+    /// OS-selected WebSocket connections opened to each `--feed-url`. When neither this option nor
+    /// `--feed-source` is supplied, one ordinary connection is opened. When any source declaration
+    /// is present, omission means zero unbound connections rather than one hidden primary-IP lane.
+    #[arg(long = "feed-connections", value_name = "COUNT")]
+    feed_connections: Option<usize>,
+
+    /// Source-bound connections per relay, as `IP=COUNT`. Repeat for every available local IP.
+    /// These declarations may be combined with explicit OS-selected `--feed-connections`.
+    #[arg(long = "feed-source", value_name = "IP=COUNT", action = clap::ArgAction::Append)]
+    feed_sources: Vec<feed::FeedSourceSpec>,
 
     /// Skip the L1-derivation catch-up loop, making `--feed-url` the sole block source. Genesis is
     /// still bootstrapped from `--l1-rpc` (chain id, spec, initial L1 base fee). Use this to follow a
@@ -426,7 +432,8 @@ async fn derive_genesis_from_l1(
 
 pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
     let task_executor = ctx.task_executor;
-    let feed_sources = feed::expand_feed_sources(&args.feed_urls, args.feed_connections)?;
+    let feed_sources =
+        feed::expand_feed_sources(&args.feed_urls, args.feed_connections, &args.feed_sources)?;
     if args.no_l1_derive && feed_sources.is_empty() {
         return Err(eyre::eyre!("--no-l1-derive requires at least one --feed-url"));
     }
@@ -1013,6 +1020,29 @@ mod tests {
                 "wss://relay-b.example/feed"
             ]
         );
-        assert_eq!(args.feed_connections, 3);
+        assert_eq!(args.feed_connections, Some(3));
+        assert!(args.feed_sources.is_empty());
+    }
+
+    #[test]
+    fn cli_accepts_counted_feed_sources_without_an_implicit_unbound_lane() {
+        let args = NodeArgs::try_parse_from([
+            "arb-reth",
+            "--feed-url",
+            "wss://relay.example/feed",
+            "--feed-source",
+            "192.0.2.10=3",
+            "--feed-source",
+            "192.0.2.11=2",
+        ])
+        .unwrap();
+
+        assert_eq!(args.feed_connections, None);
+        assert_eq!(
+            args.feed_sources[0].local_ip,
+            "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(args.feed_sources[0].connections, 3);
+        assert_eq!(args.feed_sources[1].connections, 2);
     }
 }

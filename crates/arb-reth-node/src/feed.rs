@@ -9,19 +9,28 @@ use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use eyre::{Result, ensure, eyre};
 use metrics::{Counter, Gauge, Histogram};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::{
-    Error as WebSocketError, Message,
-    client::IntoClientRequest,
-    http::{HeaderValue, Request, StatusCode},
+use tokio::{
+    net::{TcpSocket, TcpStream},
+    sync::mpsc,
+};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+    tungstenite::{
+        Error as WebSocketError, Message,
+        client::IntoClientRequest,
+        handshake::client::Response,
+        http::{HeaderValue, Request, StatusCode},
+    },
 };
 
 const FEED_CLIENT_VERSION_HEADER: &str = "arbitrum-feed-client-version";
@@ -34,6 +43,36 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(8);
 const INITIAL_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(300);
 
+/// Counted source-address declaration accepted by `--feed-source IP=COUNT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FeedSourceSpec {
+    pub(crate) local_ip: IpAddr,
+    pub(crate) connections: usize,
+}
+
+impl FromStr for FeedSourceSpec {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (ip, count) = raw
+            .rsplit_once('=')
+            .ok_or_else(|| "expected IP=COUNT".to_string())?;
+        let local_ip = ip
+            .parse()
+            .map_err(|err| format!("invalid source IP {ip:?}: {err}"))?;
+        let connections = count
+            .parse::<usize>()
+            .map_err(|err| format!("invalid connection count {count:?}: {err}"))?;
+        if connections == 0 {
+            return Err("source connection count must be at least 1".to_string());
+        }
+        Ok(Self {
+            local_ip,
+            connections,
+        })
+    }
+}
+
 /// One independently raced WebSocket connection.
 #[derive(Clone)]
 pub(crate) struct FeedSource {
@@ -42,6 +81,7 @@ pub(crate) struct FeedSource {
     connection: usize,
     url: String,
     display_endpoint: String,
+    local_ip: Option<IpAddr>,
 }
 
 impl fmt::Debug for FeedSource {
@@ -50,6 +90,7 @@ impl fmt::Debug for FeedSource {
             .field("endpoint", &self.endpoint)
             .field("connection", &self.connection)
             .field("display_endpoint", &self.display_endpoint)
+            .field("local_ip", &self.local_ip)
             .finish_non_exhaustive()
     }
 }
@@ -57,11 +98,37 @@ impl fmt::Debug for FeedSource {
 /// Validate the configured endpoints and expand each into independently raced connections.
 pub(crate) fn expand_feed_sources(
     urls: &[String],
-    connections_per_endpoint: usize,
+    unbound_connections_per_endpoint: Option<usize>,
+    source_specs: &[FeedSourceSpec],
 ) -> Result<Vec<FeedSource>> {
     ensure!(
+        !urls.is_empty() || (unbound_connections_per_endpoint.is_none() && source_specs.is_empty()),
+        "feed connections or sources require at least one --feed-url"
+    );
+    if urls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let unbound_connections =
+        unbound_connections_per_endpoint.unwrap_or(usize::from(source_specs.is_empty()));
+    let mut declared_ips = BTreeSet::new();
+    let mut bound_connections = 0usize;
+    for spec in source_specs {
+        ensure!(
+            declared_ips.insert(spec.local_ip),
+            "--feed-source declares {} more than once; combine its counts",
+            spec.local_ip
+        );
+        bound_connections = bound_connections
+            .checked_add(spec.connections)
+            .ok_or_else(|| eyre!("sequencer feed connection count overflow"))?;
+    }
+    let connections_per_endpoint = unbound_connections
+        .checked_add(bound_connections)
+        .ok_or_else(|| eyre!("sequencer feed connection count overflow"))?;
+    ensure!(
         connections_per_endpoint > 0,
-        "--feed-connections must be at least 1"
+        "each --feed-url needs at least one unbound or source-bound connection"
     );
     let total = urls
         .len()
@@ -87,14 +154,30 @@ pub(crate) fn expand_feed_sources(
             Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
             None => format!("{}://{host}", parsed.scheme()),
         };
-        for connection in 0..connections_per_endpoint {
+        let mut connection = 0usize;
+        for _ in 0..unbound_connections {
             sources.push(FeedSource {
                 ordinal: sources.len(),
                 endpoint,
                 connection,
                 url: raw_url.clone(),
                 display_endpoint: display_endpoint.clone(),
+                local_ip: None,
             });
+            connection = connection.saturating_add(1);
+        }
+        for spec in source_specs {
+            for _ in 0..spec.connections {
+                sources.push(FeedSource {
+                    ordinal: sources.len(),
+                    endpoint,
+                    connection,
+                    url: raw_url.clone(),
+                    display_endpoint: display_endpoint.clone(),
+                    local_ip: Some(spec.local_ip),
+                });
+                connection = connection.saturating_add(1);
+            }
         }
     }
     Ok(sources)
@@ -126,12 +209,16 @@ impl FeedSourceMetrics {
     fn new(source: &FeedSource) -> Self {
         let endpoint = source.endpoint.to_string();
         let connection = source.connection.to_string();
+        let local_ip = source
+            .local_ip
+            .map_or_else(|| "os-selected".to_string(), |ip| ip.to_string());
         macro_rules! metric {
             ($macro:ident, $name:literal) => {
                 metrics::$macro!(
                     $name,
                     "endpoint" => endpoint.clone(),
-                    "connection" => connection.clone()
+                    "connection" => connection.clone(),
+                    "local_ip" => local_ip.clone()
                 )
             };
         }
@@ -282,7 +369,7 @@ pub(crate) async fn follow(
         metrics.connection_attempts.increment(1);
         let mut pushed = 0usize;
         let mut rate_limited = false;
-        match tokio_tungstenite::connect_async(request).await {
+        match connect_source(&source, request).await {
             Ok((mut websocket, _)) => {
                 metrics.connected.set(1.0);
                 metrics.connections.increment(1);
@@ -291,6 +378,7 @@ pub(crate) async fn follow(
                     endpoint = source.endpoint,
                     connection = source.connection,
                     relay = %source.display_endpoint,
+                    local_ip = ?source.local_ip,
                     from_seq = requested_sequence,
                     "feed: connected to sequencer feed"
                 );
@@ -388,6 +476,80 @@ pub(crate) async fn follow(
     }
 }
 
+type FeedWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Connect one feed lane, optionally binding its TCP socket before DNS-selected connection and
+/// TLS/WebSocket handshakes.
+///
+/// Merely assigning secondary addresses to an EC2 interface does not diversify the path: ordinary
+/// source selection keeps every socket on the primary address. Binding here makes each declared
+/// private-address/EIP mapping an actual network lane without an extra proxy on the ingress path.
+async fn connect_source(
+    source: &FeedSource,
+    request: Request<()>,
+) -> Result<(FeedWebSocket, Response), WebSocketError> {
+    let Some(local_ip) = source.local_ip else {
+        return tokio_tungstenite::connect_async(request).await;
+    };
+
+    let parsed = url::Url::parse(&source.url).map_err(|err| {
+        WebSocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid validated feed URL: {err}"),
+        ))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        WebSocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "validated feed URL has no host",
+        ))
+    })?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        WebSocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "validated feed URL has no known port",
+        ))
+    })?;
+    let remotes = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(WebSocketError::Io)?;
+    let mut compatible = 0usize;
+    let mut last_error = None;
+    let mut stream = None;
+    for remote in remotes.filter(|remote| remote.is_ipv4() == local_ip.is_ipv4()) {
+        compatible = compatible.saturating_add(1);
+        let socket = if local_ip.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+        .map_err(WebSocketError::Io)?;
+        socket
+            .bind(SocketAddr::new(local_ip, 0))
+            .map_err(WebSocketError::Io)?;
+        match socket.connect(remote).await {
+            Ok(connected) => {
+                connected.set_nodelay(true).map_err(WebSocketError::Io)?;
+                stream = Some(connected);
+                break;
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+    let stream = stream.ok_or_else(|| {
+        WebSocketError::Io(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "feed DNS returned {compatible} addresses compatible with local source {local_ip}"
+                ),
+            )
+        }))
+    })?;
+
+    client_async_tls_with_config(request, stream, None, None).await
+}
+
 fn feed_request(url: &str, requested_sequence: u64) -> Result<Request<()>> {
     let mut request = url
         .into_client_request()
@@ -441,7 +603,8 @@ mod tests {
                 "wss://first.example/feed?token=secret".to_string(),
                 "ws://127.0.0.1:9642/private".to_string(),
             ],
-            2,
+            Some(2),
+            &[],
         )
         .unwrap();
 
@@ -456,9 +619,61 @@ mod tests {
 
     #[test]
     fn rejects_invalid_or_excessive_source_sets() {
-        assert!(expand_feed_sources(&["https://example.com".into()], 1).is_err());
-        assert!(expand_feed_sources(&["wss://example.com".into()], 0).is_err());
-        assert!(expand_feed_sources(&["wss://example.com".into()], 65).is_err());
+        assert!(expand_feed_sources(&["https://example.com".into()], Some(1), &[]).is_err());
+        assert!(expand_feed_sources(&["wss://example.com".into()], Some(0), &[]).is_err());
+        assert!(expand_feed_sources(&["wss://example.com".into()], Some(65), &[]).is_err());
+        assert!(expand_feed_sources(&[], Some(1), &[]).is_err());
+        assert!(
+            expand_feed_sources(
+                &["wss://example.com".into()],
+                None,
+                &[
+                    "192.0.2.1=1".parse().unwrap(),
+                    "192.0.2.1=2".parse().unwrap(),
+                ],
+            )
+            .is_err()
+        );
+        assert!("192.0.2.1=0".parse::<FeedSourceSpec>().is_err());
+    }
+
+    #[test]
+    fn expands_counted_sources_without_a_hidden_default_lane() {
+        let sources = expand_feed_sources(
+            &["wss://example.com/feed".into()],
+            None,
+            &[
+                "192.0.2.10=2".parse().unwrap(),
+                "192.0.2.11=1".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].local_ip, Some("192.0.2.10".parse().unwrap()));
+        assert_eq!(sources[1].local_ip, Some("192.0.2.10".parse().unwrap()));
+        assert_eq!(sources[2].local_ip, Some("192.0.2.11".parse().unwrap()));
+    }
+
+    #[test]
+    fn default_and_mixed_connection_groups_are_explicit() {
+        let default = expand_feed_sources(&["wss://example.com/feed".into()], None, &[]).unwrap();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].local_ip, None);
+
+        let mixed = expand_feed_sources(
+            &["wss://example.com/feed".into()],
+            Some(2),
+            &["192.0.2.10=3".parse().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(mixed.len(), 5);
+        assert!(mixed[..2].iter().all(|source| source.local_ip.is_none()));
+        assert!(
+            mixed[2..]
+                .iter()
+                .all(|source| source.local_ip == Some("192.0.2.10".parse().unwrap()))
+        );
     }
 
     #[test]
@@ -499,8 +714,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_bound_socket_reaches_the_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            peer.ip()
+        });
+        let source = FeedSource {
+            ordinal: 0,
+            endpoint: 0,
+            connection: 0,
+            url: format!("ws://{address}"),
+            display_endpoint: format!("ws://{address}"),
+            // macOS does not treat the whole 127/8 range as configured by default, so use the
+            // portable loopback address here. The EC2 deployment check covers distinct ENI
+            // addresses; this test exercises the explicit bind + WebSocket handshake path.
+            local_ip: Some("127.0.0.1".parse().unwrap()),
+        };
+        let request = feed_request(&source.url, 42).unwrap();
+
+        let (_websocket, _response) = connect_source(&source, request).await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn coordinator_forwards_only_the_first_copy_without_reordering_sources() {
-        let sources = expand_feed_sources(&["wss://example.com/feed".into()], 2).unwrap();
+        let sources =
+            expand_feed_sources(&["wss://example.com/feed".into()], Some(2), &[]).unwrap();
         let metrics = [
             Arc::new(FeedSourceMetrics::new(&sources[0])),
             Arc::new(FeedSourceMetrics::new(&sources[1])),
