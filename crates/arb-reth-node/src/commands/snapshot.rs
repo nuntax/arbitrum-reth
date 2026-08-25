@@ -88,6 +88,7 @@ use reth_trie_db::{
 // Boot-wiring: write head header + checkpoints so ProviderFactory opens at the block.
 use alloy_consensus::Header;
 use alloy_rlp::Decodable;
+use arb_reth_sync::resume::RESUME_FILE_NAME;
 use arb_revm::ArbSpecId;
 use arbitrum_alloy_consensus::header::ArbHeaderInfo;
 use reth_provider::{
@@ -637,6 +638,16 @@ pub(crate) fn validate_snapshot_import_for_launch(
 }
 
 pub(crate) fn ensure_fresh_import_target(out: &Path) -> eyre::Result<()> {
+    let resume_path = out.join(RESUME_FILE_NAME);
+    for path in [resume_path.clone(), resume_path.with_extension("json.tmp")] {
+        if path.exists() {
+            eyre::bail!(
+                "snapshot import requires a fresh target; stale L1 resume metadata exists at {}",
+                path.display()
+            );
+        }
+    }
+
     let import_manifest = out.join(SNAPSHOT_IMPORT_MANIFEST_FILE);
     if import_manifest.exists() {
         eyre::bail!(
@@ -1633,6 +1644,18 @@ mod tests {
         let temp = tempfile::tempdir()?;
         std::fs::create_dir_all(temp.path().join("db/preimage"))?;
         ensure_fresh_import_target(temp.path())?;
+
+        let resume_path = temp.path().join(RESUME_FILE_NAME);
+        std::fs::write(&resume_path, b"stale checkpoint")?;
+        let error = ensure_fresh_import_target(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("stale L1 resume metadata"));
+        std::fs::remove_file(&resume_path)?;
+
+        let resume_tmp_path = resume_path.with_extension("json.tmp");
+        std::fs::write(&resume_tmp_path, b"interrupted checkpoint write")?;
+        let error = ensure_fresh_import_target(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("stale L1 resume metadata"));
+        std::fs::remove_file(resume_tmp_path)?;
 
         std::fs::create_dir(temp.path().join("db/.preimage.tmp"))?;
         assert!(find_staging_preimage_dir(&temp.path().join("db"))?.is_some());
