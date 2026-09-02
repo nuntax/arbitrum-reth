@@ -65,8 +65,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn engine_tree_tier1_replay_v2_hashed_sparse() {
         let factory = storage_v2_factory();
-        let mut tuning = ArbEngineTuning::reth_defaults();
-        tuning.share_sparse_trie_with_payload_builder = true;
+        let tuning = ArbEngineTuning::from_tree_config(
+            ArbEngineTuning::reth_defaults()
+                .to_tree_config()
+                .with_share_sparse_trie_with_payload_builder(true),
+        );
         drive_replay_native(factory, 412346, tuning).await;
     }
 

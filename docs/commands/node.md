@@ -111,6 +111,9 @@ HTTP and WebSocket are separate native Reth servers. Enable each explicitly with
 disabled because ArbOS derives blocks locally rather than accepting beacon-client engine commands.
 Reth's local IPC server follows its normal native default; pass `--ipcdisable` when it is not wanted.
 
+`--rpc.gascap` limits gas for `eth_call` and call tracing. Use `--rpc.gascap max` to remove Reth's
+default 50 million gas RPC cap. This does not change consensus block execution.
+
 ## MEV transaction-log IPC
 
 `--mev-tx-log-ipc /run/arb-reth/mev-logs.sock` opens a local Unix socket. Each connected client

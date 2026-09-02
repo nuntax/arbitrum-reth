@@ -20,7 +20,9 @@ use futures_util::StreamExt;
 use reth_chain_state::CanonicalInMemoryState;
 use reth_db::{Database, database_metrics::DatabaseMetrics};
 use reth_evm::ConfigureEvm;
-use reth_node_api::{AddOnsContext, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter};
+use reth_node_api::{
+    AddOnsContext, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter,
+};
 use reth_node_builder::hooks::NodeHooks;
 use reth_node_builder::{
     AddOns, LaunchContext, LaunchNode, Node, NodeAdapter, NodeBuilderWithComponents,
@@ -246,7 +248,7 @@ impl ArbLauncher {
                 AddOns {
                     hooks,
                     exexs: _,
-                    add_ons,
+                    add_ons: _,
                 },
             config,
         } = target;

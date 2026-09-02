@@ -1122,6 +1122,8 @@ mod tests {
             "--ws",
             "--ws.port",
             "8548",
+            "--rpc.gascap",
+            "max",
             "--db.sync-mode",
             "safe-no-sync",
             "--engine.persistence-threshold",
@@ -1143,6 +1145,7 @@ mod tests {
         assert_eq!(command.engine.memory_block_buffer_target, Some(64));
         assert_eq!(command.engine.persistence_backpressure_threshold(), 512);
         assert_eq!(command.db.sync_mode, Some(SyncMode::SafeNoSync));
+        assert_eq!(command.rpc.rpc_gas_cap, u64::MAX);
         assert!(command.pruning.full);
         assert_eq!(
             command.ext.chain_config,
