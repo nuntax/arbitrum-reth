@@ -139,8 +139,8 @@ connected. Frontier state deltas are retained whenever the feature is enabled.
 
 ## Payload execution
 
-- `--engine.share-execution-cache-with-payload-builder <true|false>` shares Reth's cross-block account,
-  storage, and bytecode cache with the serial Arbitrum payload builder. It defaults to `true`.
+- `--engine.share-execution-cache-with-payload-builder` shares Reth's cross-block account, storage,
+  and bytecode cache with the serial Arbitrum payload builder. It defaults to enabled.
 - `--engine.share-sparse-trie-with-payload-builder` lets Reth compute the state root concurrently with
   ArbOS execution. It is opt-in and requires useful state-root worker parallelism.
 

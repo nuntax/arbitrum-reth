@@ -21,12 +21,11 @@ use arb_reth_node::commands::{
     node::{ArbChainSpecParser, ArbNodeArgs},
     rewind::RewindArgs,
     snapshot::{
-        SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs,
-        SnapshotRepairHistoryArgs,
+        SnapshotBuildPreimagesArgs, SnapshotImportArgs, SnapshotReadArgs, SnapshotRepairHistoryArgs,
     },
     snapshot_full::{SnapshotFinalizeArgs, SnapshotImportFullArgs},
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use reth_cli_commands::node::NodeCommand;
 use reth_cli_runner::CliRunner;
 use reth_node_core::{
@@ -123,6 +122,30 @@ enum GenesisSub {
     VerifyExport(GenesisVerifyExportArgs),
 }
 
+const CLI_MIGRATION_NOTE: &str = "note: the arb-reth node CLI migrated to Reth's native layout; see https://github.com/nuntax/arbitrum-reth/blob/main/docs/cli-migration.md";
+
+fn migration_note(error: &clap::Error) -> Option<&'static str> {
+    matches!(
+        error.kind(),
+        ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument
+    )
+    .then_some(CLI_MIGRATION_NOTE)
+}
+
+fn parse_cli() -> Cli {
+    Cli::try_parse().unwrap_or_else(|error| {
+        let note = migration_note(&error);
+        let exit_code = error.exit_code();
+        if let Err(print_error) = error.print() {
+            eprintln!("{print_error}");
+        }
+        if let Some(note) = note {
+            eprintln!("\n{note}");
+        }
+        std::process::exit(exit_code);
+    })
+}
+
 fn main() -> eyre::Result<()> {
     // Ethereum's per-payload and per-commit INFO logs are too noisy for Arbitrum's block cadence.
     // Keep periodic progress, lifecycle events, warnings, and errors at INFO. Operators can still
@@ -147,7 +170,7 @@ fn main() -> eyre::Result<()> {
         .try_init()
         .expect("arb-reth initializes engine defaults before any CLI parsing");
 
-    let mut cli = Cli::parse();
+    let mut cli = parse_cli();
     if matches!(&cli.command, Command::Node(_)) {
         cli.logs.apply_node_defaults();
     }
@@ -203,5 +226,38 @@ fn main() -> eyre::Result<()> {
         },
         Command::Rewind(args) => commands::rewind::run(args),
         Command::DumpBlocks(args) => commands::dump_blocks::run(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_subcommand_points_to_cli_migration() {
+        let error = Cli::try_parse_from(["arb-reth", "run"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+        assert_eq!(migration_note(&error), Some(CLI_MIGRATION_NOTE));
+    }
+
+    #[test]
+    fn unknown_argument_points_to_cli_migration() {
+        let error =
+            Cli::try_parse_from(["arb-reth", "node", "--persistence-threshold", "2"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        assert_eq!(migration_note(&error), Some(CLI_MIGRATION_NOTE));
+    }
+
+    #[test]
+    fn other_cli_errors_do_not_point_to_migration() {
+        let error = Cli::try_parse_from(["arb-reth"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(migration_note(&error), None);
     }
 }
