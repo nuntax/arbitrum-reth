@@ -83,6 +83,28 @@ pub struct RewindArgs {
     /// Report what would happen without modifying the database or the resume log.
     #[arg(long)]
     dry_run: bool,
+
+    /// Permit a rewind with no retained L1 derivation boundary at or below the target. The next
+    /// node start must re-derive from Nitro genesis before it can produce a new block.
+    #[arg(long)]
+    allow_genesis_rescan: bool,
+}
+
+fn resume_checkpoint_for_rewind(
+    log: Option<&L1ResumeLog>,
+    new_tip: u64,
+    genesis_block: u64,
+    allow_genesis_rescan: bool,
+) -> eyre::Result<Option<crate::L1ResumeCheckpoint>> {
+    let checkpoint = log.and_then(|log| log.resume_for(new_tip));
+    if checkpoint.is_none() && new_tip != genesis_block && !allow_genesis_rescan {
+        return Err(eyre::eyre!(
+            "no L1 resume boundary exists at or below rewind target {new_tip}; refusing to unwind \
+             because the next sync would have to re-derive from Nitro genesis; pass \
+             --allow-genesis-rescan to accept that recovery cost"
+        ));
+    }
+    Ok(checkpoint)
 }
 
 pub fn run(args: RewindArgs) -> eyre::Result<()> {
@@ -127,6 +149,24 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
     if !db_path.exists() {
         return Err(eyre::eyre!("no database at {} (is --datadir correct?)", db_path.display()));
     }
+    if new_tip < genesis_num {
+        return Err(eyre::eyre!(
+            "new tip {new_tip} is below the imported genesis block {genesis_num}; \
+             reset the datadir instead (arb-reset-db.sh)"
+        ));
+    }
+
+    // Refuse an unrecoverable rewind before opening or repairing any database layer. An arbitrary
+    // L2 header carries the delayed cursor but not the matching L1 batch-delivery boundary, so the
+    // missing checkpoint cannot be reconstructed safely from the target header alone.
+    let log_path = L1ResumeLog::path_in(&args.datadir);
+    let mut log = L1ResumeLog::load(&log_path);
+    let surviving = resume_checkpoint_for_rewind(
+        log.as_ref(),
+        new_tip,
+        genesis_num,
+        args.allow_genesis_rescan,
+    )?;
 
     // Correct the genesis-import changeset-segment layout before opening the DB (so no reth code,
     // `check_consistency` in particular, touches the mis-seeded files first). The snapshot import
@@ -183,29 +223,23 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
             "new tip {new_tip} is not below the current tip {current_tip}; nothing to rewind"
         ));
     }
-    if new_tip < genesis_num {
-        return Err(eyre::eyre!(
-            "new tip {new_tip} is below the imported genesis block {genesis_num}; \
-             reset the datadir instead (arb-reset-db.sh)"
-        ));
-    }
-
     // Truncate the resume log to a boundary at or below the new tip, so the next start resumes
-    // derivation from there. Preview it first; without a surviving boundary the caller must supply
-    // --l1-start-block on the next run (or reset).
-    let log_path = L1ResumeLog::path_in(&args.datadir);
-    let mut log = L1ResumeLog::load(&log_path);
-    let surviving = log.as_ref().and_then(|l| l.checkpoints.iter().rev().find(|cp| cp.l2_block <= new_tip).copied());
+    // derivation from there. The preflight above only permits a missing boundary when rewinding to
+    // genesis or when the operator explicitly accepted a genesis rescan.
     match &surviving {
         Some(cp) => info!(
             target: "arb-rewind",
             l1_block = cp.l1_block, delayed = cp.delayed_count, l2_block = cp.l2_block,
             "resume log will keep this boundary; next sync re-derives from it up to the new tip",
         ),
+        None if new_tip == genesis_num => info!(
+            target: "arb-rewind",
+            "rewinding to imported genesis; the next sync will derive from Nitro genesis",
+        ),
         None => info!(
             target: "arb-rewind",
-            "no resume-log boundary at or below {new_tip}; the next sync will re-derive from Nitro \
-             genesis and skip already-present blocks (derivation-only up to the new tip)",
+            "no resume-log boundary at or below {new_tip}; --allow-genesis-rescan was supplied, so \
+             the next sync will re-derive from Nitro genesis and skip already-present blocks",
         ),
     }
 
@@ -271,7 +305,7 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
         log.truncate_to(new_tip);
         if log.checkpoints.is_empty() {
             // Nothing survives: remove the stale log so the next start doesn't refuse on an
-            // all-above-tip log; the operator resumes via --l1-start-block or reset.
+            // all-above-tip log; the node resumes from genesis as accepted during preflight.
             let _ = std::fs::remove_file(&log_path);
         } else {
             log.save(&log_path).map_err(|e| eyre::eyre!("rewrite resume log: {e}"))?;
@@ -371,4 +405,39 @@ fn migrate_changeset_layout(static_files: &Path, genesis: u64) -> eyre::Result<(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checkpoint(l1_block: u64, l2_block: u64) -> crate::L1ResumeCheckpoint {
+        crate::L1ResumeCheckpoint {
+            l1_block,
+            delayed_count: 0,
+            l2_block,
+        }
+    }
+
+    #[test]
+    fn rewind_requires_a_safe_resume_boundary() {
+        let mut log = L1ResumeLog::default();
+        log.record(checkpoint(1_000, 10_000));
+        log.record(checkpoint(2_000, 20_000));
+
+        assert_eq!(
+            resume_checkpoint_for_rewind(Some(&log), 15_000, 0, false).unwrap(),
+            Some(checkpoint(1_000, 10_000))
+        );
+
+        let error = resume_checkpoint_for_rewind(Some(&log), 5_000, 0, false).unwrap_err();
+        assert!(error.to_string().contains("refusing to unwind"));
+        assert!(error.to_string().contains("--allow-genesis-rescan"));
+        assert!(resume_checkpoint_for_rewind(None, 5_000, 0, false).is_err());
+        assert_eq!(
+            resume_checkpoint_for_rewind(Some(&log), 5_000, 0, true).unwrap(),
+            None
+        );
+        assert_eq!(resume_checkpoint_for_rewind(None, 0, 0, false).unwrap(), None);
+    }
 }
