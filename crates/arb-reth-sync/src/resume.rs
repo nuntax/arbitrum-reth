@@ -10,10 +10,12 @@
 //! resumes derivation from there (the file-based equivalent of Nitro's `arbitrumdata` mapping,
 //! for the common single-writer case).
 //!
-//! ## Why a bounded history, not one checkpoint
+//! ## Why dense recent history plus sparse historical history
 //!
-//! The file keeps the last [`MAX_CHECKPOINTS`] boundaries, not just the newest one, so a consumer
-//! can pick the newest boundary at or below a given L2 block. Two cases need that:
+//! The file keeps the latest [`RECENT_CHECKPOINTS`] boundaries at full resolution. Older entries
+//! are compacted to the earliest boundary in each [`HISTORICAL_CHECKPOINT_L2_INTERVAL`]-block L2
+//! bucket. A consumer can therefore pick a boundary at or below an arbitrarily old L2 block
+//! without retaining every derivation window. Two cases need that:
 //!
 //! * **Rewind** (`arb-rewind`) unwinds the DB to some block `N-1` after a divergence; it truncates
 //!   the log to boundaries `<= N-1` so the next start resumes from a batch boundary at or below the
@@ -36,10 +38,15 @@ use serde::{Deserialize, Serialize};
 /// File name (under the data directory) of the L1-derivation resume log.
 pub const RESUME_FILE_NAME: &str = "arb-l1-resume.json";
 
-/// How many recent boundaries the log retains. Each is one derivation window (up to
-/// `batch_window` L1 blocks), so this bounds how far back a rewind can resume from without a
-/// re-scan from genesis. Generous: the file is a few KB even when full.
-pub const MAX_CHECKPOINTS: usize = 128;
+/// How many recent derivation boundaries remain at full resolution.
+pub const RECENT_CHECKPOINTS: usize = 128;
+
+/// L2 span represented by one compacted historical checkpoint.
+///
+/// The earliest boundary in each bucket is retained. It is therefore safe to resume any target
+/// in that bucket from the retained boundary, re-deriving at most roughly this many existing L2
+/// blocks before reaching the target again.
+pub const HISTORICAL_CHECKPOINT_L2_INTERVAL: u64 = 100_000;
 
 /// A durable L1-derivation resume point, recorded at a batch/window boundary.
 ///
@@ -58,10 +65,11 @@ pub struct L1ResumeCheckpoint {
     pub l2_block: u64,
 }
 
-/// A bounded, ascending log of recent [`L1ResumeCheckpoint`]s, persisted as `arb-l1-resume.json`.
+/// An ascending log of recent and compacted historical [`L1ResumeCheckpoint`]s, persisted as
+/// `arb-l1-resume.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct L1ResumeLog {
-    /// Boundaries in ascending `l2_block` order, newest last, capped at [`MAX_CHECKPOINTS`].
+    /// Boundaries in ascending `l2_block` order, with compacted history followed by a dense tail.
     pub checkpoints: Vec<L1ResumeCheckpoint>,
 }
 
@@ -100,20 +108,40 @@ impl L1ResumeLog {
         self.checkpoints.iter().rev().find(|cp| cp.l2_block <= l2_block).copied()
     }
 
-    /// Append a boundary, keeping the log ascending, deduplicated by `l2_block`, and capped at
-    /// [`MAX_CHECKPOINTS`] (oldest dropped). Boundaries arrive in ascending order during sync; a
-    /// repeat `l2_block` (an empty window that only advanced `l1_block`) replaces the prior entry so
-    /// the newest `l1_block` wins.
+    /// Append a boundary, keeping the log ascending and deduplicated by `l2_block`. Boundaries
+    /// arrive in ascending order during sync; a repeat `l2_block` (an empty window that only
+    /// advanced `l1_block`) replaces the prior entry so the newest `l1_block` wins.
+    ///
+    /// The recent tail remains dense. Older entries retain the earliest boundary in each fixed L2
+    /// bucket so a deep rewind always has a safe starting point before its target.
     pub fn record(&mut self, cp: L1ResumeCheckpoint) {
         if self.checkpoints.last().is_some_and(|last| last.l2_block == cp.l2_block) {
             *self.checkpoints.last_mut().unwrap() = cp;
         } else {
             self.checkpoints.push(cp);
         }
-        let len = self.checkpoints.len();
-        if len > MAX_CHECKPOINTS {
-            self.checkpoints.drain(0..len - MAX_CHECKPOINTS);
+        self.compact_history();
+    }
+
+    fn compact_history(&mut self) {
+        let Some(recent_start) = self.checkpoints.len().checked_sub(RECENT_CHECKPOINTS) else {
+            return;
+        };
+        if recent_start == 0 {
+            return;
         }
+
+        let mut compacted = Vec::with_capacity(self.checkpoints.len());
+        let mut last_bucket = None;
+        for checkpoint in self.checkpoints[..recent_start].iter().copied() {
+            let bucket = checkpoint.l2_block / HISTORICAL_CHECKPOINT_L2_INTERVAL;
+            if last_bucket != Some(bucket) {
+                compacted.push(checkpoint);
+                last_bucket = Some(bucket);
+            }
+        }
+        compacted.extend_from_slice(&self.checkpoints[recent_start..]);
+        self.checkpoints = compacted;
     }
 
     /// Drop every boundary above `l2_block` (used by rewind after unwinding the DB to a new tip).
@@ -157,20 +185,32 @@ mod tests {
     }
 
     #[test]
-    fn record_dedupes_empty_windows_and_caps_length() {
+    fn record_dedupes_empty_windows() {
         let mut log = L1ResumeLog::default();
         log.record(cp(100, 10));
         // Empty windows: same l2, advancing l1, so the newest l1 must win, no duplicate l2 entry.
         log.record(cp(200, 10));
         log.record(cp(300, 10));
         assert_eq!(log.checkpoints, vec![cp(300, 10)]);
+    }
 
+    #[test]
+    fn record_retains_sparse_history_and_dense_recent_tail() {
         let mut log = L1ResumeLog::default();
-        for i in 0..(MAX_CHECKPOINTS as u64 + 50) {
-            log.record(cp(i, i));
+        for l2 in (0..1_000_000).step_by(1_000) {
+            log.record(cp(l2 + 10, l2));
         }
-        assert_eq!(log.checkpoints.len(), MAX_CHECKPOINTS, "capped");
-        assert_eq!(log.checkpoints.first().copied(), Some(cp(50, 50)), "oldest dropped");
+
+        // Old buckets retain their earliest boundary instead of being discarded.
+        assert_eq!(log.resume_for(150_050), Some(cp(100_010, 100_000)));
+        assert_eq!(log.resume_for(550_050), Some(cp(500_010, 500_000)));
+
+        // The newest 128 entries remain available at their original resolution.
+        assert_eq!(log.resume_for(950_050), Some(cp(950_010, 950_000)));
+        assert_eq!(log.checkpoints.last().copied(), Some(cp(999_010, 999_000)));
+
+        // Ten historical buckets plus the dense tail is tiny compared with every input boundary.
+        assert!(log.checkpoints.len() <= 10 + RECENT_CHECKPOINTS);
     }
 
     #[test]
