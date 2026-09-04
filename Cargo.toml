@@ -69,8 +69,14 @@ incremental = false
 [workspace.dependencies]
 # Keep the ArbOS implementation revision in one place. Individual crates opt into it with
 # `arb-revm.workspace = true`; only the EVM integration enables the Stylus runtime.
-arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "f5b7ad8aa9304dfcf32ad7ce6e23129b0bae4980" }
+arb-revm = { git = "https://github.com/nuntax/arbitrum-revm", rev = "988d146333f31e570a55e96665f0ad13e3d88908" }
 # Pinned to revm 42 to unify with arb_revm workspace.
-revm = { version = "42.0.1", features = ["optional_priority_fee_check", "optional_balance_check", "optional_no_base_fee", "optional_eip7623", "optional_eip3541"] }
+revm = { version = "42.0.1", features = [
+    "optional_priority_fee_check",
+    "optional_balance_check",
+    "optional_no_base_fee",
+    "optional_eip7623",
+    "optional_eip3541",
+] }
 alloy-rlp = "0.3.12"
 serde_json = "1.0.145"
