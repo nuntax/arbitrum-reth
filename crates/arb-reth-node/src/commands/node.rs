@@ -292,6 +292,24 @@ fn genesis_delayed_messages_read(chain_spec: &ChainSpec, l2_genesis_block: u64) 
     (header.number == l2_genesis_block).then(|| u64::from_be_bytes(header.nonce.0))
 }
 
+/// Resolves the delayed-message cursor for derivation from the L2 genesis block.
+///
+/// The genesis header nonce is authoritative when it is available. An explicit cursor may confirm
+/// that value, but must not silently replace it and derive a different chain.
+fn resolve_genesis_delayed_cursor(
+    configured: Option<u64>,
+    from_header: Option<u64>,
+) -> eyre::Result<u64> {
+    match (configured, from_header) {
+        (Some(configured), Some(from_header)) if configured != from_header => Err(eyre::eyre!(
+            "--l1-start-delayed is {configured}, but the L2 genesis header requires {from_header}"
+        )),
+        (Some(configured), _) => Ok(configured),
+        (None, Some(from_header)) => Ok(from_header),
+        (None, None) => Ok(0),
+    }
+}
+
 /// Returns the delayed-message cursor stored in a persisted L2 header's nonce.
 fn header_delayed_messages_read<P>(provider: &P, block: u64) -> eyre::Result<Option<u64>>
 where
@@ -884,7 +902,7 @@ async fn launch(
                 })?;
             // The genesis header nonce is Nitro's cumulative delayed-messages-read count. It is
             // normally 1 because block 0 consumes the Initialize message.
-            let delayed = args.l1_start_delayed.or(genesis_delayed).unwrap_or(0);
+            let delayed = resolve_genesis_delayed_cursor(args.l1_start_delayed, genesis_delayed)?;
             info!(target: "arb-reth", batch = 0, l1_block = block, delayed, "L1 resume point: genesis (batch 0)");
             (block, delayed, l2_genesis_block)
         };
@@ -988,15 +1006,23 @@ mod tests {
             crate::orbit_chain_from_files(ROBINHOOD_CHAIN_INFO, ROBINHOOD_GENESIS)
                 .expect("build Robinhood chain spec");
 
+        let from_header = genesis_delayed_messages_read(&spec, init.genesis_block_number);
+        assert_eq!(from_header, Some(1));
+        assert_eq!(resolve_genesis_delayed_cursor(None, from_header).unwrap(), 1);
         assert_eq!(
-            genesis_delayed_messages_read(&spec, init.genesis_block_number),
-            Some(1)
+            resolve_genesis_delayed_cursor(Some(0), from_header)
+                .expect_err("a conflicting cursor must not derive a different chain")
+                .to_string(),
+            "--l1-start-delayed is 0, but the L2 genesis header requires 1"
         );
+        assert_eq!(resolve_genesis_delayed_cursor(Some(1), from_header).unwrap(), 1);
         assert_eq!(
             genesis_delayed_messages_read(&spec, init.genesis_block_number + 1),
             None,
             "a snapshot head must not be mistaken for the actual L2 genesis"
         );
+        assert_eq!(resolve_genesis_delayed_cursor(Some(7), None).unwrap(), 7);
+        assert_eq!(resolve_genesis_delayed_cursor(None, None).unwrap(), 0);
     }
 
     #[test]
