@@ -11,7 +11,9 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use arb_reth_engine::{ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent};
+use arb_reth_engine::{
+    ArbTxExecutionKind, ArbTxLogBroadcaster, ArbTxLogEvent, EXECUTION_FRONTIER_VERSION,
+};
 use eyre::{Context, Result, bail};
 use tokio::{
     io::AsyncWriteExt,
@@ -140,8 +142,8 @@ async fn stream_client(mut stream: UnixStream, mut events: broadcast::Receiver<A
 }
 
 /// Version of the binary frame format documented in `docs/mev-tx-log-ipc.md`.
-const FRAME_VERSION: u8 = 2;
-const FIXED_BODY_LEN: usize = 96;
+const FRAME_VERSION: u8 = EXECUTION_FRONTIER_VERSION;
+pub(crate) const FIXED_BODY_LEN: usize = 160;
 const MAX_LOG_TOPICS: usize = 4;
 
 fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
@@ -178,6 +180,8 @@ fn encode_event(event: &ArbTxLogEvent) -> Result<Vec<u8>> {
     encoded.extend_from_slice(event.transaction_hash.as_slice());
     encoded.extend_from_slice(event.frontier_id.as_slice());
     encoded.extend_from_slice(&log_count.to_be_bytes());
+    encoded.extend_from_slice(event.parent_hash.as_slice());
+    encoded.extend_from_slice(event.attempt_id.as_slice());
     for log in &event.logs {
         let topics = log.data.topics();
         encoded.extend_from_slice(log.address.as_slice());
@@ -208,6 +212,8 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
             frontier_id: B256::repeat_byte(0xcc),
+            parent_hash: B256::repeat_byte(0xdd),
+            attempt_id: B256::repeat_byte(0xee),
             kind: ArbTxExecutionKind::User,
             success: true,
             gas_used: 21_000,
@@ -238,10 +244,12 @@ mod tests {
         );
         assert_eq!(&encoded[64..96], B256::repeat_byte(0xcc).as_slice());
         assert_eq!(u32::from_be_bytes(encoded[96..100].try_into().unwrap()), 1);
-        assert_eq!(&encoded[100..120], Address::repeat_byte(0x11).as_slice());
-        assert_eq!(encoded[120], 1);
-        assert_eq!(u32::from_be_bytes(encoded[121..125].try_into().unwrap()), 2);
-        assert_eq!(&encoded[157..159], [0x12, 0x34]);
+        assert_eq!(&encoded[100..132], B256::repeat_byte(0xdd).as_slice());
+        assert_eq!(&encoded[132..164], B256::repeat_byte(0xee).as_slice());
+        assert_eq!(&encoded[164..184], Address::repeat_byte(0x11).as_slice());
+        assert_eq!(encoded[184], 1);
+        assert_eq!(u32::from_be_bytes(encoded[185..189].try_into().unwrap()), 2);
+        assert_eq!(&encoded[221..223], [0x12, 0x34]);
     }
 
     #[test]
@@ -261,6 +269,8 @@ mod tests {
             transaction_index: 3,
             transaction_hash: B256::ZERO,
             frontier_id: B256::repeat_byte(0xcc),
+            parent_hash: B256::repeat_byte(0xdd),
+            attempt_id: B256::repeat_byte(0xee),
             kind: ArbTxExecutionKind::User,
             success: true,
             gas_used: 21_000,
@@ -285,6 +295,8 @@ mod tests {
             transaction_index: 3,
             transaction_hash: B256::ZERO,
             frontier_id: B256::repeat_byte(0xcc),
+            parent_hash: B256::repeat_byte(0xdd),
+            attempt_id: B256::repeat_byte(0xee),
             kind: ArbTxExecutionKind::User,
             success: true,
             gas_used: 21_000,
@@ -301,6 +313,10 @@ mod tests {
         reader.read_exact(&mut body).await.expect("read frame");
         assert_eq!(body[4..12], 42u64.to_be_bytes());
         assert_eq!(body[12..20], 3u64.to_be_bytes());
+        assert_eq!(body.len(), 160);
+        assert_eq!(body[0], 3);
+        assert_eq!(&body[96..128], B256::repeat_byte(0xdd).as_slice());
+        assert_eq!(&body[128..160], B256::repeat_byte(0xee).as_slice());
 
         drop(broadcaster);
         client.await.expect("client task exits");

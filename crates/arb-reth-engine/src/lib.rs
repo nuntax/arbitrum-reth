@@ -34,7 +34,8 @@ pub use engine_spike::ArbPayloadValidator;
 pub use native_payload::ArbPayloadBuilder;
 pub use tx_log_stream::{
     ArbExecutionFrontier, ArbExecutionFrontierStore, ArbTxExecutionKind, ArbTxLogBroadcaster,
-    ArbTxLogEvent,
+    ArbTxLogEvent, EXECUTION_FRONTIER_ID_FORMULA, EXECUTION_FRONTIER_ID_SCHEME,
+    EXECUTION_FRONTIER_VERSION, execution_frontier_id,
 };
 
 /// An executed Arbitrum payload produced by the local payload builder.

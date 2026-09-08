@@ -159,6 +159,9 @@ pub(crate) fn produce_with_timing<'a>(
     BuiltPayloadExecutedBlock<ArbPrimitives>,
     ArbBlockProductionTiming,
 )> {
+    if let Some(stream) = tx_log_stream {
+        stream.invalidate_frontiers();
+    }
     let started_at = Instant::now();
     let parent_header = parent.header();
     let arbos_version =
@@ -299,14 +302,16 @@ pub(crate) fn produce_with_timing<'a>(
     // Anchor exact MEV simulations after pre-execution changes. Each committed transaction adds
     // only its own state delta to a persistent chain; frontiers do not clone cumulative block
     // state and therefore remain cheap enough for the transaction-by-transaction feed.
-    let mut frontier_block = tx_log_stream.map(|stream| {
-        let evm_env = EvmEnv::new(
-            builder.evm().cfg_env().clone(),
-            builder.evm().block().clone(),
-        );
-        let pre_execution_state = builder.evm_mut().db_mut().cache.clone();
-        stream.begin_frontier_block(parent.hash(), evm_env, pre_execution_state)
-    });
+    let mut frontier_block = tx_log_stream
+        .map(|stream| {
+            let evm_env = EvmEnv::new(
+                builder.evm().cfg_env().clone(),
+                builder.evm().block().clone(),
+            );
+            let pre_execution_state = builder.evm_mut().db_mut().cache.clone();
+            stream.begin_frontier_block(parent.hash(), evm_env, pre_execution_state)
+        })
+        .transpose()?;
 
     let execution_setup = phase_started_at.elapsed();
     let phase_started_at = Instant::now();
@@ -398,7 +403,10 @@ pub(crate) fn produce_with_timing<'a>(
                 transaction_hash,
                 update,
                 builder.evm().ctx().chain.clone(),
-            ),
+            )?,
+            _ if tx_log_stream.is_some() => {
+                eyre::bail!("included transaction lacks execution frontier state");
+            }
             _ => B256::ZERO,
         };
         if let (Some(stream), Some(transaction_hash), Some(logs)) =
@@ -409,6 +417,11 @@ pub(crate) fn produce_with_timing<'a>(
                 transaction_index,
                 transaction_hash,
                 frontier_id,
+                parent_hash: parent.hash(),
+                attempt_id: frontier_block
+                    .as_ref()
+                    .expect("stream has frontier tracking")
+                    .attempt_id(),
                 kind,
                 success: tx_success,
                 gas_used: tx_gas_used,
@@ -540,6 +553,9 @@ pub(crate) fn produce_with_timing<'a>(
         state: bundle,
     });
 
+    if let Some(frontier) = &mut frontier_block {
+        frontier.complete();
+    }
     // BuiltPayloadExecutedBlock wants unsorted hashed_state / trie_updates.
     Ok((
         BuiltPayloadExecutedBlock {
@@ -1936,6 +1952,46 @@ mod termination_tests {
         };
         // The guard intentionally drops the acknowledgement receiver after requesting shutdown.
         assert!(tx.send(()).is_err());
+    }
+
+    #[test]
+    fn frontier_entry_failure_revokes_previous_completed_attempt() {
+        use alloy_primitives::U256;
+        use reth_provider::test_utils::MockEthProvider;
+        use revm_database::CacheState;
+        let parent = SealedHeader::seal_slow(Header {
+            number: 41,
+            ..Default::default()
+        });
+        let stream = ArbTxLogBroadcaster::new();
+        let mut env: EvmEnv<arb_revm::ArbSpecId, arb_reth_evm::ArbBlockEnv> = EvmEnv::default();
+        env.block_env.inner.number = U256::from(42);
+        let mut block = stream
+            .begin_frontier_block(parent.hash(), env, CacheState::default())
+            .unwrap();
+        let id = block
+            .advance(42, 0, B256::ZERO, Default::default(), Default::default())
+            .unwrap();
+        block.complete();
+        drop(block);
+        let held = stream.frontier_store().get(id).unwrap();
+        let result = produce_with_timing(
+            &ArbEvmConfig::new(4663),
+            4663,
+            &parent,
+            &BroadcastFeedMessage::default(),
+            Box::new(MockEthProvider::<ArbPrimitives>::new()),
+            Box::new(MockEthProvider::<ArbPrimitives>::new()),
+            None,
+            Some(&stream),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("digest_message failed")
+        );
+        assert!(!stream.frontier_store().is_current(&held));
     }
 }
 

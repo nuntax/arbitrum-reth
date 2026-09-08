@@ -79,6 +79,10 @@ impl<P> ArbPayloadBuilder<P> {
     where
         P: StateProviderFactory,
     {
+        // State-provider acquisition can fail before produce_with_timing is entered.
+        if let Some(stream) = &self.tx_log_stream {
+            stream.invalidate_frontiers();
+        }
         let parent = args.config.parent_header;
         let parent_hash = parent.hash();
         let supplied_cache = args.execution_cache;
