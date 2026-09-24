@@ -54,6 +54,10 @@ Use `--l1-start-block` and `--l1-start-delayed` only when the supplied values de
 
 `--feed-url` connects to a live sequencer relay. A relay is a tip source, not a history source, so use L1 derivation or a snapshot to catch up first. L1 derivation and the feed can run together; messages already applied through one source are reconciled by sequence number.
 
+The feed client offers WebSocket `permessage-deflate` and decodes compressed frames automatically.
+This is required by Robinhood Chain's compression-only feed and also works with relays that send
+uncompressed frames.
+
 Repeat `--feed-url` to race different relays. `--feed-connections N` opens `N` OS-selected
 WebSockets to every supplied relay. With no connection or source option, the default is one such
 ordinary socket. The first decoded copy of a sequence is sent to the engine; duplicates are

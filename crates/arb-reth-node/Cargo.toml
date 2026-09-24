@@ -86,13 +86,18 @@ metrics = "0.24"
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
 
-# Live sequencer-feed follower (--feed-url): websocket source into the feed channel.
-# ws:// (testnode) needs "connect"; wss:// (mainnet relay) needs the rustls TLS root feature.
+# Live sequencer-feed follower (--feed-url). Ratchet negotiates permessage-deflate;
+# tokio-tungstenite supplies the plain/TLS stream wrapper for both socket types.
 tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-webpki-roots"] }
+ratchet_rs = { version = "1.2", features = ["deflate"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+bytes = "1"
+http = "1"
 futures-util = "0.3"
 # rustls 0.23 has both aws-lc-rs and ring backends compiled in (transitively), so it cannot
-# auto-select a process-default CryptoProvider; a wss:// connect_async then panics. We install the
-# aws-lc-rs provider once at startup (see bin/arb-reth.rs). Direct dep only for that install call.
+# auto-select a process-default CryptoProvider; a wss:// TLS handshake then panics. We install
+# the aws-lc-rs provider once at startup (see bin/arb-reth.rs).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
 # D.3b.4: bin/arb-reth (native Reth CLI, runtime/ctrl-c harness, tracing, node-core)

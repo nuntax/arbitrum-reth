@@ -6,8 +6,13 @@
 
 use crate::metrics::FeedLatencyTracker;
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
+use bytes::BytesMut;
 use eyre::{Result, ensure, eyre};
 use metrics::{Counter, Gauge, Histogram};
+use ratchet_rs::{
+    HttpError, Message, WebSocket, WebSocketClientBuilder,
+    deflate::{Deflate, DeflateExtProvider},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -23,15 +28,11 @@ use tokio::{
     net::{TcpSocket, TcpStream},
     sync::mpsc,
 };
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-    tungstenite::{
-        Error as WebSocketError, Message,
-        client::IntoClientRequest,
-        handshake::client::Response,
-        http::{HeaderValue, Request, StatusCode},
-    },
+use tokio_rustls::{
+    TlsConnector,
+    rustls::{ClientConfig, RootCertStore, pki_types::ServerName},
 };
+use tokio_tungstenite::MaybeTlsStream;
 
 const FEED_CLIENT_VERSION_HEADER: &str = "arbitrum-feed-client-version";
 const REQUESTED_SEQUENCE_HEADER: &str = "arbitrum-requested-sequence-number";
@@ -342,8 +343,6 @@ pub(crate) async fn follow(
     ingress: mpsc::Sender<FeedIngress>,
     resume_sequence: Arc<AtomicU64>,
 ) {
-    use futures_util::StreamExt;
-
     let metrics = Arc::new(FeedSourceMetrics::new(&source));
     let mut consecutive_failures = 0u32;
     // Spread the initial handshake burst. Several public relays rate-limit simultaneous upgrades
@@ -370,7 +369,7 @@ pub(crate) async fn follow(
         let mut pushed = 0usize;
         let mut rate_limited = false;
         match connect_source(&source, request).await {
-            Ok((mut websocket, _)) => {
+            Ok(mut websocket) => {
                 metrics.connected.set(1.0);
                 metrics.connections.increment(1);
                 reth_tracing::tracing::info!(
@@ -383,17 +382,20 @@ pub(crate) async fn follow(
                     "feed: connected to sequencer feed"
                 );
 
-                while let Some(frame) = websocket.next().await {
+                let mut frame_buffer = BytesMut::new();
+                loop {
                     let frame_received_at = Instant::now();
-                    let text = match frame {
-                        Ok(Message::Text(text)) => text.as_str().to_owned(),
-                        Ok(Message::Binary(bytes)) => match core::str::from_utf8(bytes.as_ref()) {
-                            Ok(text) => text.to_owned(),
-                            Err(_) => {
-                                metrics.errors.increment(1);
-                                continue;
+                    let text = match websocket.read(&mut frame_buffer).await {
+                        Ok(Message::Text | Message::Binary) => {
+                            match core::str::from_utf8(&frame_buffer) {
+                                Ok(text) => text.to_owned(),
+                                Err(_) => {
+                                    metrics.errors.increment(1);
+                                    frame_buffer.clear();
+                                    continue;
+                                }
                             }
-                        },
+                        }
                         Ok(Message::Close(_)) => break,
                         Ok(_) => continue,
                         Err(err) => {
@@ -408,6 +410,7 @@ pub(crate) async fn follow(
                             break;
                         }
                     };
+                    frame_buffer.clear();
 
                     let root = match serde_json::from_str::<Root>(&text) {
                         Ok(root) => root,
@@ -476,7 +479,7 @@ pub(crate) async fn follow(
     }
 }
 
-type FeedWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type FeedWebSocket = WebSocket<MaybeTlsStream<TcpStream>, Deflate>;
 
 /// Connect one feed lane, optionally binding its TCP socket before DNS-selected connection and
 /// TLS/WebSocket handshakes.
@@ -484,52 +487,35 @@ type FeedWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Merely assigning secondary addresses to an EC2 interface does not diversify the path: ordinary
 /// source selection keeps every socket on the primary address. Binding here makes each declared
 /// private-address/EIP mapping an actual network lane without an extra proxy on the ingress path.
-async fn connect_source(
-    source: &FeedSource,
-    request: Request<()>,
-) -> Result<(FeedWebSocket, Response), WebSocketError> {
-    let Some(local_ip) = source.local_ip else {
-        return tokio_tungstenite::connect_async(request).await;
-    };
-
-    let parsed = url::Url::parse(&source.url).map_err(|err| {
-        WebSocketError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid validated feed URL: {err}"),
-        ))
-    })?;
-    let host = parsed.host_str().ok_or_else(|| {
-        WebSocketError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "validated feed URL has no host",
-        ))
-    })?;
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        WebSocketError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "validated feed URL has no known port",
-        ))
-    })?;
-    let remotes = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(WebSocketError::Io)?;
+async fn connect_source(source: &FeedSource, request: http::Request<()>) -> Result<FeedWebSocket> {
+    let parsed = url::Url::parse(&source.url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| eyre!("validated feed URL has no host"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| eyre!("validated feed URL has no known port"))?;
+    let remotes = tokio::net::lookup_host((host, port)).await?;
     let mut compatible = 0usize;
     let mut last_error = None;
     let mut stream = None;
-    for remote in remotes.filter(|remote| remote.is_ipv4() == local_ip.is_ipv4()) {
+    for remote in remotes.filter(|remote| {
+        source
+            .local_ip
+            .is_none_or(|ip| remote.is_ipv4() == ip.is_ipv4())
+    }) {
         compatible = compatible.saturating_add(1);
-        let socket = if local_ip.is_ipv4() {
+        let socket = if remote.is_ipv4() {
             TcpSocket::new_v4()
         } else {
             TcpSocket::new_v6()
+        }?;
+        if let Some(local_ip) = source.local_ip {
+            socket.bind(SocketAddr::new(local_ip, 0))?;
         }
-        .map_err(WebSocketError::Io)?;
-        socket
-            .bind(SocketAddr::new(local_ip, 0))
-            .map_err(WebSocketError::Io)?;
         match socket.connect(remote).await {
             Ok(connected) => {
-                connected.set_nodelay(true).map_err(WebSocketError::Io)?;
+                connected.set_nodelay(true)?;
                 stream = Some(connected);
                 break;
             }
@@ -537,33 +523,39 @@ async fn connect_source(
         }
     }
     let stream = stream.ok_or_else(|| {
-        WebSocketError::Io(last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                format!(
-                    "feed DNS returned {compatible} addresses compatible with local source {local_ip}"
-                ),
+        last_error.map(eyre::Report::from).unwrap_or_else(|| {
+            eyre!(
+                "feed DNS returned {compatible} addresses compatible with source {:?}",
+                source.local_ip
             )
-        }))
+        })
     })?;
-
-    client_async_tls_with_config(request, stream, None, None).await
+    let stream = if parsed.scheme() == "wss" {
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from(host.to_owned())?;
+        let tls = TlsConnector::from(Arc::new(config))
+            .connect(server_name, stream)
+            .await?;
+        MaybeTlsStream::Rustls(tls)
+    } else {
+        MaybeTlsStream::Plain(stream)
+    };
+    Ok(WebSocketClientBuilder::default()
+        .extension(DeflateExtProvider::default())
+        .subscribe(stream, request)
+        .await?
+        .into_websocket())
 }
 
-fn feed_request(url: &str, requested_sequence: u64) -> Result<Request<()>> {
-    let mut request = url
-        .into_client_request()
-        .map_err(|err| eyre!("build WebSocket request: {err}"))?;
-    request.headers_mut().insert(
-        FEED_CLIENT_VERSION_HEADER,
-        HeaderValue::from_static(FEED_CLIENT_VERSION),
-    );
-    request.headers_mut().insert(
-        REQUESTED_SEQUENCE_HEADER,
-        HeaderValue::from_str(&requested_sequence.to_string())
-            .expect("a u64 is always a valid HTTP header value"),
-    );
-    Ok(request)
+fn feed_request(url: &str, requested_sequence: u64) -> Result<http::Request<()>> {
+    Ok(http::Request::builder()
+        .uri(url)
+        .header(FEED_CLIENT_VERSION_HEADER, FEED_CLIENT_VERSION)
+        .header(REQUESTED_SEQUENCE_HEADER, requested_sequence.to_string())
+        .body(())?)
 }
 
 fn initial_connect_delay(ordinal: usize) -> Duration {
@@ -572,8 +564,13 @@ fn initial_connect_delay(ordinal: usize) -> Duration {
     Duration::from_secs((ordinal as u64).min(10))
 }
 
-fn is_rate_limited(err: &WebSocketError) -> bool {
-    matches!(err, WebSocketError::Http(response) if response.status() == StatusCode::TOO_MANY_REQUESTS)
+fn is_rate_limited(err: &eyre::Report) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<HttpError>(),
+            Some(HttpError::Status(429))
+        )
+    })
 }
 
 fn reconnect_delay(failures: u32, ordinal: usize, rate_limited: bool) -> Duration {
@@ -719,7 +716,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            let _websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _websocket = ratchet_rs::WebSocketServerBuilder::default()
+                .accept(stream)
+                .await
+                .unwrap();
             peer.ip()
         });
         let source = FeedSource {
@@ -735,11 +735,71 @@ mod tests {
         };
         let request = feed_request(&source.url, 42).unwrap();
 
-        let (_websocket, _response) = connect_source(&source, request).await.unwrap();
+        let _websocket = connect_source(&source, request).await.unwrap();
         assert_eq!(
             server.await.unwrap(),
             "127.0.0.1".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn compressed_feed_frame_is_decoded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = ratchet_rs::WebSocketServerBuilder::default()
+                .extension(DeflateExtProvider::default())
+                .accept(stream)
+                .await
+                .unwrap()
+                .into_websocket();
+            websocket.write_text(r#"{"messages":[]}"#).await.unwrap();
+        });
+        let source = FeedSource {
+            ordinal: 0,
+            endpoint: 0,
+            connection: 0,
+            url: format!("ws://{address}"),
+            display_endpoint: format!("ws://{address}"),
+            local_ip: None,
+        };
+        let request = feed_request(&source.url, 42).unwrap();
+        let mut websocket = connect_source(&source, request).await.unwrap();
+        let mut buffer = BytesMut::new();
+        assert_eq!(websocket.read(&mut buffer).await.unwrap(), Message::Text);
+        assert_eq!(&buffer[..], br#"{"messages":[]}"#);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn uncompressed_feed_frame_is_decoded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // This relay does not offer permessage-deflate in its handshake.
+            let mut websocket = ratchet_rs::WebSocketServerBuilder::default()
+                .accept(stream)
+                .await
+                .unwrap()
+                .into_websocket();
+            websocket.write_text(r#"{"messages":[]}"#).await.unwrap();
+        });
+        let source = FeedSource {
+            ordinal: 0,
+            endpoint: 0,
+            connection: 0,
+            url: format!("ws://{address}"),
+            display_endpoint: format!("ws://{address}"),
+            local_ip: None,
+        };
+        let request = feed_request(&source.url, 42).unwrap();
+        let mut websocket = connect_source(&source, request).await.unwrap();
+        let mut buffer = BytesMut::new();
+        assert_eq!(websocket.read(&mut buffer).await.unwrap(), Message::Text);
+        assert_eq!(&buffer[..], br#"{"messages":[]}"#);
+        server.await.unwrap();
     }
 
     #[tokio::test]
