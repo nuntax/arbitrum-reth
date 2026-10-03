@@ -13,9 +13,10 @@
 use alloy_evm::Database;
 use alloy_evm::env::BlockEnvironment;
 use alloy_evm::precompiles::PrecompilesMap;
-use arb_revm::ArbSpecId;
 use arb_revm::arb_journal::ArbCall;
 use arb_revm::precompiles::{ArbPrecompilesEnum, arb_eth_precompiles};
+use arb_revm::transaction::ArbTxTr;
+use arb_revm::{ArbChainContext, ArbSpecId};
 use revm::context::{Cfg, Context, Journal, Transaction};
 use revm::handler::PrecompileProvider;
 use revm::interpreter::{CallInputs, InterpreterResult};
@@ -63,12 +64,15 @@ impl ArbPrecompilesMap {
 // Mirrors alloy-evm's own `PrecompileProvider for PrecompilesMap` impl header (generic over the
 // context type params, journal fixed to revm's `Journal<DB>`), so this provider slots into the
 // same `ArbContext<DB>` the node EVM runs on.
-impl<BlockEnv, TxEnv, CfgEnv, DB, Chain>
-    PrecompileProvider<Context<BlockEnv, TxEnv, CfgEnv, DB, Journal<DB>, Chain>>
+// The transaction must carry Arbitrum retry metadata and the chain context must be ArbOS's: ArbOS
+// precompiles read the current retryable (`ArbRetryableTx.getCurrentRedeemer`, the self-modifying
+// guard) and the open EVM frames' callers (`ArbSys` aliasing), exactly as Nitro's TxProcessor does.
+impl<BlockEnv, TxEnv, CfgEnv, DB>
+    PrecompileProvider<Context<BlockEnv, TxEnv, CfgEnv, DB, Journal<DB>, ArbChainContext>>
     for ArbPrecompilesMap
 where
     BlockEnv: BlockEnvironment,
-    TxEnv: Transaction,
+    TxEnv: Transaction + ArbTxTr,
     CfgEnv: Cfg,
     DB: Database,
 {
@@ -82,7 +86,7 @@ where
 
     fn run(
         &mut self,
-        context: &mut Context<BlockEnv, TxEnv, CfgEnv, DB, Journal<DB>, Chain>,
+        context: &mut Context<BlockEnv, TxEnv, CfgEnv, DB, Journal<DB>, ArbChainContext>,
         inputs: &CallInputs,
     ) -> Result<Option<Self::Output>, String> {
         if let Some(arb) = ArbPrecompilesEnum::from_address(&inputs.bytecode_address) {
@@ -110,7 +114,7 @@ where
     fn contains(&self, address: &Address) -> bool {
         ArbPrecompilesEnum::from_address(address).is_some()
             || <PrecompilesMap as PrecompileProvider<
-                Context<BlockEnv, TxEnv, CfgEnv, DB, Journal<DB>, Chain>,
+                Context<BlockEnv, TxEnv, CfgEnv, DB, Journal<DB>, ArbChainContext>,
             >>::contains(&self.inner, address)
     }
 }
