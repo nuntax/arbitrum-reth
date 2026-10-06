@@ -9,7 +9,8 @@
 //!
 //! It reuses reth's `remove_block_and_execution_above` (the exact storage-v2 unwind the engine
 //! tree runs on a reorg), so blocks, receipts, state, hashed state, trie, history indices, and
-//! stage checkpoints are all rolled back consistently.
+//! stage checkpoints are rolled back consistently. It also mirrors `PruneStage::unwind` so prune
+//! checkpoints cannot remain above the new tip.
 //!
 //! Note: this does not fix the STF bug that caused the divergence. Re-syncing past `N` with the
 //! same binary will diverge again at `N`. Rewind is for after you have a fix (or to re-derive a
@@ -38,7 +39,10 @@ use reth_node_types::NodeTypesWithDBAdapter;
 use reth_provider::{
     providers::{RocksDBProvider, StaticFileProvider},
     BlockExecutionWriter, BlockNumReader, DatabaseProviderFactory, DBProvider, ProviderFactory,
-    StorageSettingsCache,
+    ProviderResult, StorageSettingsCache,
+};
+use reth_storage_api::{
+    BlockBodyIndicesProvider, PruneCheckpointReader, PruneCheckpointWriter,
 };
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
@@ -105,6 +109,29 @@ fn resume_checkpoint_for_rewind(
         ));
     }
     Ok(checkpoint)
+}
+
+/// Rewinds prune progress to the new chain tip, matching Reth's `PruneStage::unwind` bookkeeping.
+///
+/// Pruned data cannot be recovered by an unwind. Moving a checkpoint back to the new tip records
+/// that conservative boundary while allowing newly derived history above the tip to be read.
+fn rewind_prune_checkpoints<P>(provider: &P, new_tip: u64) -> ProviderResult<usize>
+where
+    P: BlockBodyIndicesProvider + PruneCheckpointReader + PruneCheckpointWriter,
+{
+    let last_tx = provider.block_body_indices(new_tip)?.map(|indices| indices.last_tx_num());
+    let mut updated = 0;
+
+    for (segment, mut checkpoint) in provider.get_prune_checkpoints()? {
+        if checkpoint.block_number.is_some_and(|block| block > new_tip) {
+            checkpoint.block_number = Some(new_tip);
+            checkpoint.tx_number = last_tx;
+            provider.save_prune_checkpoint(segment, checkpoint)?;
+            updated += 1;
+        }
+    }
+
+    Ok(updated)
 }
 
 pub fn run(args: RewindArgs) -> eyre::Result<()> {
@@ -298,7 +325,13 @@ pub fn run(args: RewindArgs) -> eyre::Result<()> {
     info!(target: "arb-rewind", removing_above = new_tip, "unwinding database (this may take a while)");
     let provider_rw = factory.database_provider_rw()?;
     provider_rw.remove_block_and_execution_above(new_tip)?;
+    let rewound_prune_checkpoints = rewind_prune_checkpoints(&provider_rw, new_tip)?;
     provider_rw.commit().map_err(|e| eyre::eyre!("commit unwind: {e}"))?;
+    info!(
+        target: "arb-rewind",
+        rewound_prune_checkpoints,
+        "rewound prune checkpoints above the new tip",
+    );
 
     // Now truncate the resume log to match (only after the DB unwind committed).
     if let Some(log) = log.as_mut() {
@@ -410,6 +443,9 @@ fn migrate_changeset_layout(static_files: &Path, genesis: u64) -> eyre::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reth_db_api::{models::StoredBlockBodyIndices, tables, transaction::DbTxMut};
+    use reth_provider::test_utils::create_test_provider_factory_with_node_types;
+    use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
 
     fn checkpoint(l1_block: u64, l2_block: u64) -> crate::L1ResumeCheckpoint {
         crate::L1ResumeCheckpoint {
@@ -439,5 +475,69 @@ mod tests {
             None
         );
         assert_eq!(resume_checkpoint_for_rewind(None, 0, 0, false).unwrap(), None);
+    }
+
+    #[test]
+    fn rewind_lowers_prune_checkpoints_above_the_new_tip() {
+        const NEW_TIP: u64 = 50;
+        const FIRST_TX: u64 = 70;
+        const TX_COUNT: u64 = 3;
+
+        let factory = create_test_provider_factory_with_node_types::<ArbNode>(Arc::new(
+            ChainSpec::default(),
+        ));
+        let mut provider = factory.database_provider_rw().unwrap();
+        provider
+            .tx_mut()
+            .put::<tables::BlockBodyIndices>(
+                NEW_TIP,
+                StoredBlockBodyIndices { first_tx_num: FIRST_TX, tx_count: TX_COUNT },
+            )
+            .unwrap();
+
+        let above_tip = PruneCheckpoint {
+            block_number: Some(100),
+            tx_number: Some(200),
+            prune_mode: PruneMode::before_inclusive(100),
+        };
+        let below_tip = PruneCheckpoint {
+            block_number: Some(40),
+            tx_number: Some(60),
+            prune_mode: PruneMode::before_inclusive(40),
+        };
+        provider
+            .save_prune_checkpoint(PruneSegment::AccountHistory, above_tip)
+            .unwrap();
+        provider
+            .save_prune_checkpoint(PruneSegment::Receipts, above_tip)
+            .unwrap();
+        provider
+            .save_prune_checkpoint(PruneSegment::StorageHistory, below_tip)
+            .unwrap();
+
+        assert_eq!(rewind_prune_checkpoints(&provider, NEW_TIP).unwrap(), 2);
+
+        let expected = PruneCheckpoint {
+            block_number: Some(NEW_TIP),
+            tx_number: Some(FIRST_TX + TX_COUNT - 1),
+            prune_mode: above_tip.prune_mode,
+        };
+        assert_eq!(
+            provider
+                .get_prune_checkpoint(PruneSegment::AccountHistory)
+                .unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            provider.get_prune_checkpoint(PruneSegment::Receipts).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            provider
+                .get_prune_checkpoint(PruneSegment::StorageHistory)
+                .unwrap(),
+            Some(below_tip),
+            "a checkpoint already below the new tip must not move forward"
+        );
     }
 }
