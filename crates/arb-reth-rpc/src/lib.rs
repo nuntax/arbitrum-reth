@@ -39,19 +39,18 @@ impl<Provider> ArbReceiptConverter<Provider> {
 }
 
 impl<Provider: HeaderProvider<Header = Header>> ArbReceiptConverter<Provider> {
-    /// The L1 block number a block observed, which Nitro reports on every receipt.
+    /// Decode the L1 block number and receipt-pricing flag from the persisted header.
     ///
     /// It is not on the receipt: Nitro encodes it in the header (`extra_data` + `mix_hash`), so
     /// read the header back. `None` for a block we cannot find or one that is not an Arbitrum
     /// block, matching how the rest of the converter degrades.
-    fn l1_block_number(&self, block_hash: B256) -> Result<Option<u64>, EthApiError> {
+    fn header_info(&self, block_hash: B256) -> Result<Option<ArbHeaderInfo>, EthApiError> {
         let Some(header) = self.provider.header(block_hash)? else {
             return Ok(None);
         };
         Ok(ArbHeaderInfo::decode_header(&header)
             .ok()
-            .filter(ArbHeaderInfo::is_arbitrum)
-            .map(|info| info.l1_block_number))
+            .filter(ArbHeaderInfo::is_arbitrum))
     }
 }
 
@@ -72,20 +71,22 @@ where
     ) -> Result<Vec<Self::RpcReceipt>, Self::Error> {
         // Every receipt in one call comes from the same block in practice (eth_getBlockReceipts),
         // so memoize the header lookup on the block hash rather than repeating it per receipt.
-        let mut memo: Option<(B256, Option<u64>)> = None;
+        let mut memo: Option<(B256, Option<(u64, bool)>)> = None;
         inputs
             .into_iter()
             .map(|input| {
                 let block_hash = input.meta.block_hash;
-                let l1_block_number = match memo {
-                    Some((hash, l1)) if hash == block_hash => l1,
+                let info = match memo {
+                    Some((hash, info)) if hash == block_hash => info,
                     _ => {
-                        let l1 = self.l1_block_number(block_hash)?;
-                        memo = Some((block_hash, l1));
-                        l1
+                        let info = self
+                            .header_info(block_hash)?
+                            .map(|info| (info.l1_block_number, info.collect_tips));
+                        memo = Some((block_hash, info));
+                        info
                     }
                 };
-                build_arb_receipt(input, l1_block_number)
+                build_arb_receipt(input, info.map(|i| i.0), info.is_some_and(|i| i.1))
             })
             .collect()
     }
@@ -195,6 +196,7 @@ fn map_arb_receipt_envelope(
 fn build_arb_receipt<N>(
     input: ConvertReceiptInput<'_, N>,
     l1_block_number: Option<u64>,
+    collect_tips: bool,
 ) -> Result<ArbTransactionReceipt, EthApiError>
 where
     N: NodePrimitives<Receipt = ArbReceiptEnvelope<Log>>,
@@ -202,9 +204,9 @@ where
     // Use a Cell to capture gas_used_for_l1 from within the mapping closure.
     let gas_cell = std::cell::Cell::new(0u64);
 
-    // Arbitrum has no priority fee: the sequencer charges the base fee and refunds the difference,
-    // so what a transaction actually paid per gas is the block's base fee. reth derives the field
-    // with Ethereum's tip formula, which returns the transaction's max fee instead.
+    // Nitro receipt.go DeriveFields uses the serialized block CollectTips bit.
+    // build_receipt already uses the envelope's effective price (including zero
+    // for internal/deposit txs); override it with base fee only when tips are off.
     let base_fee = input.meta.base_fee;
 
     let mut core = build_receipt::<N, _>(input, None, |envelope, next_log_index, meta| {
@@ -212,9 +214,7 @@ where
         gas_cell.set(g);
         rpc_envelope
     });
-    if let Some(base_fee) = base_fee {
-        core.effective_gas_price = base_fee as u128;
-    }
+    core.effective_gas_price = receipt_gas_price(base_fee, core.effective_gas_price, collect_tips);
 
     Ok(ArbTransactionReceipt {
         inner: core,
@@ -230,3 +230,33 @@ pub type ArbRpcConverter<Provider> = RpcConverter<
     ArbEvmConfig,
     ArbReceiptConverter<Provider>,
 >;
+
+// Keep the no-tip branch identical to the existing RPC behavior.
+fn receipt_gas_price(base_fee: Option<u64>, envelope_price: u128, collect_tips: bool) -> u128 {
+    if collect_tips {
+        envelope_price
+    } else {
+        base_fee.map(u128::from).unwrap_or(envelope_price)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::receipt_gas_price;
+
+    #[test]
+    fn receipt_prices_follow_nitro_collect_tips_bit() {
+        assert_eq!(
+            receipt_gas_price(Some(20_000_000), 21_100_220, true),
+            21_100_220
+        );
+        assert_eq!(
+            receipt_gas_price(Some(20_000_000), 21_100_220, false),
+            20_000_000
+        );
+        // Internal/deposit envelopes have a zero effective price; only collecting
+        // blocks preserve it. Non-collecting blocks continue reporting base fee.
+        assert_eq!(receipt_gas_price(Some(20_000_000), 0, true), 0);
+        assert_eq!(receipt_gas_price(Some(20_000_000), 0, false), 20_000_000);
+    }
+}
