@@ -1,4 +1,7 @@
 # arbitrum-reth
+# Unmaintained 
+Since I don't have an arbitrum box anymore, development has stopped. I would hand this off to someone who is willing to maintain it.
+Either way, OCL is working on an arbitrum reth version themselves. In the meantime you can probably try syncing this, and point an agent to any state divergence you run into if you critically rely on lower latency than nitro.
 
 `arbitrum-reth` is an Arbitrum execution and derivation node built on [reth](https://github.com/paradigmxyz/reth). It reads Arbitrum inputs from L1, executes ArbOS state transitions through `arbitrum-revm`, and writes the resulting L2 chain to a reth database.
 
